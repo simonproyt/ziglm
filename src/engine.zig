@@ -17,6 +17,8 @@ const ModelBuffers = model_mod.ModelBuffers;
 const KVCache = @import("kv_cache.zig").KVCache;
 const Sampler = @import("sampler.zig").Sampler;
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
+const Image = @import("image.zig").Image;
+const VisionEncoder = @import("vision.zig").VisionEncoder;
 
 pub const ModelFormat = enum {
     gguf,
@@ -253,6 +255,66 @@ pub const Engine = struct {
         );
     }
 
+    pub fn encodeImage(self: *Engine, image_path: []const u8) ![]f32 {
+        var img = try Image.loadFromFile(self.allocator, image_path);
+        defer img.deinit();
+
+        if (self.model.vision_encoder) |*v_enc| {
+            return v_enc.encodeImage(self.allocator, &img, self.thread_pool);
+        } else {
+            const enc = VisionEncoder.init(self.allocator, null, null, null);
+            return enc.encodeImage(self.allocator, &img, self.thread_pool);
+        }
+    }
+
+    pub fn prefillMultimodal(
+        self: *Engine,
+        tokens: []const u32,
+        image_embeddings: ?[]const f32,
+        image_patch_count: usize,
+    ) ![]const f32 {
+        if (tokens.len == 0 and image_patch_count == 0) return error.EmptyPrompt;
+        const total_len = tokens.len + image_patch_count;
+        if (total_len > self.max_seq_len) return error.PromptExceedsContext;
+
+        const dim = self.model.params.embedding_length;
+        var last_logits: []const f32 = undefined;
+        var pos: usize = 0;
+
+        if (image_embeddings) |emb| {
+            for (0..image_patch_count) |p| {
+                const patch_emb = emb[p * dim .. (p + 1) * dim];
+                const is_last = (pos == total_len - 1);
+                last_logits = try self.model.forwardWithEmbedding(
+                    patch_emb,
+                    258880,
+                    pos,
+                    self.kv_cache,
+                    self.buffers,
+                    self.thread_pool,
+                    is_last,
+                );
+                pos += 1;
+            }
+        }
+
+        for (tokens) |tok| {
+            const is_last = (pos == total_len - 1);
+            last_logits = try self.model.forwardWithEmbedding(
+                null,
+                tok,
+                pos,
+                self.kv_cache,
+                self.buffers,
+                self.thread_pool,
+                is_last,
+            );
+            pos += 1;
+        }
+
+        return last_logits;
+    }
+
     pub fn generate(
         self: *Engine,
         prompt: []const u8,
@@ -260,15 +322,34 @@ pub const Engine = struct {
         callback_ctx: ?*anyopaque,
         callback: ?TokenCallback,
     ) !GenerationStats {
+        return self.generateWithImage(prompt, null, options, callback_ctx, callback);
+    }
+
+    pub fn generateWithImage(
+        self: *Engine,
+        prompt: []const u8,
+        image_path: ?[]const u8,
+        options: GenerationOptions,
+        callback_ctx: ?*anyopaque,
+        callback: ?TokenCallback,
+    ) !GenerationStats {
         var stats = GenerationStats{};
         const t_start = getTimestampNs();
+
+        var image_embeddings: ?[]f32 = null;
+        var image_patches: usize = 0;
+        if (image_path) |img_p| {
+            image_embeddings = try self.encodeImage(img_p);
+            image_patches = image_embeddings.?.len / self.model.params.embedding_length;
+        }
+        defer if (image_embeddings) |emb| self.allocator.free(emb);
 
         // 1. Tokenize prompt
         const prompt_tokens = try self.tokenizer.encode(self.allocator, prompt, true);
         defer self.allocator.free(prompt_tokens);
 
-        stats.prompt_tokens = prompt_tokens.len;
-        if (prompt_tokens.len == 0) return stats;
+        stats.prompt_tokens = prompt_tokens.len + image_patches;
+        if (stats.prompt_tokens == 0) return stats;
 
         var history: std.ArrayList(u32) = .empty;
         defer history.deinit(self.allocator);
@@ -278,7 +359,7 @@ pub const Engine = struct {
 
         // 2. Prefill phase
         const t_prefill_start = getTimestampNs();
-        var logits = try self.prefill(prompt_tokens);
+        var logits = try self.prefillMultimodal(prompt_tokens, image_embeddings, image_patches);
         const t_prefill_end = getTimestampNs();
         stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
 
@@ -294,7 +375,7 @@ pub const Engine = struct {
 
         // 3. Autoregressive Generation phase
         const t_gen_start = getTimestampNs();
-        var cur_pos = prompt_tokens.len;
+        var cur_pos = prompt_tokens.len + image_patches;
         var completion_count: usize = 0;
 
         var prev_token = self.sampler.sample(logits, history.items, options.sampler);

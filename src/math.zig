@@ -27,20 +27,38 @@ pub fn dotF32F32(a: []const f32, b: []const f32) f32 {
     const n = a.len;
     const Vec = @Vector(8, f32);
     const vec_len = 8;
-    const n_vec = n / vec_len;
+    const n_unroll = n / 32;
 
-    var sum_vec: Vec = @splat(0.0);
+    var sum0: Vec = @splat(0.0);
+    var sum1: Vec = @splat(0.0);
+    var sum2: Vec = @splat(0.0);
+    var sum3: Vec = @splat(0.0);
+
     var i: usize = 0;
+    while (i < n_unroll * 32) : (i += 32) {
+        const va0: Vec = a[i..][0..8].*;
+        const vb0: Vec = b[i..][0..8].*;
+        const va1: Vec = a[i + 8 ..][0..8].*;
+        const vb1: Vec = b[i + 8 ..][0..8].*;
+        const va2: Vec = a[i + 16 ..][0..8].*;
+        const vb2: Vec = b[i + 16 ..][0..8].*;
+        const va3: Vec = a[i + 24 ..][0..8].*;
+        const vb3: Vec = b[i + 24 ..][0..8].*;
 
-    while (i < n_vec * vec_len) : (i += vec_len) {
-        const va: Vec = a[i..][0..vec_len].*;
-        const vb: Vec = b[i..][0..vec_len].*;
-        sum_vec += va * vb;
+        sum0 += va0 * vb0;
+        sum1 += va1 * vb1;
+        sum2 += va2 * vb2;
+        sum3 += va3 * vb3;
     }
 
-    var total = @reduce(.Add, sum_vec);
+    while (i + vec_len <= n) : (i += vec_len) {
+        const va: Vec = a[i..][0..vec_len].*;
+        const vb: Vec = b[i..][0..vec_len].*;
+        sum0 += va * vb;
+    }
 
-    // Scalar tail
+    var total = @reduce(.Add, (sum0 + sum1) + (sum2 + sum3));
+
     while (i < n) : (i += 1) {
         total += a[i] * b[i];
     }
@@ -51,25 +69,37 @@ pub fn dotF32F32(a: []const f32, b: []const f32) f32 {
 pub fn dotF16F32(a_bytes: []const u8, b: []const f32, n: usize) f32 {
     if (@intFromPtr(a_bytes.ptr) % @alignOf(f16) == 0) {
         const a: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, a_bytes[0 .. n * @sizeOf(f16)]));
-        var total: f32 = 0.0;
         const Vec = @Vector(8, f32);
+        const Vec16 = @Vector(8, f16);
         const vec_len = 8;
-        const n_vec = n / vec_len;
+        const n_unroll = n / 16;
 
-        var sum_vec: Vec = @splat(0.0);
+        var sum0: Vec = @splat(0.0);
+        var sum1: Vec = @splat(0.0);
         var i: usize = 0;
 
-        while (i < n_vec * vec_len) : (i += vec_len) {
-            var af32: [8]f32 = undefined;
-            inline for (0..8) |k| {
-                af32[k] = quant.f16ToF32(a[i + k]);
-            }
-            const va: Vec = af32;
-            const vb: Vec = b[i..][0..vec_len].*;
-            sum_vec += va * vb;
+        while (i < n_unroll * 16) : (i += 16) {
+            const raw0: Vec16 = a[i..][0..8].*;
+            const raw1: Vec16 = a[i + 8 ..][0..8].*;
+
+            const va0: Vec = @floatCast(raw0);
+            const va1: Vec = @floatCast(raw1);
+
+            const vb0: Vec = b[i..][0..8].*;
+            const vb1: Vec = b[i + 8 ..][0..8].*;
+
+            sum0 += va0 * vb0;
+            sum1 += va1 * vb1;
         }
 
-        total = @reduce(.Add, sum_vec);
+        while (i + vec_len <= n) : (i += vec_len) {
+            const raw: Vec16 = a[i..][0..8].*;
+            const va: Vec = @floatCast(raw);
+            const vb: Vec = b[i..][0..8].*;
+            sum0 += va * vb;
+        }
+
+        var total = @reduce(.Add, sum0 + sum1);
 
         while (i < n) : (i += 1) {
             total += quant.f16ToF32(a[i]) * b[i];
@@ -90,25 +120,41 @@ pub fn dotF16F32(a_bytes: []const u8, b: []const f32, n: usize) f32 {
 pub fn dotBf16F32(a_bytes: []const u8, b: []const f32, n: usize) f32 {
     if (@intFromPtr(a_bytes.ptr) % @alignOf(u16) == 0) {
         const a: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, a_bytes[0 .. n * @sizeOf(u16)]));
-        var total: f32 = 0.0;
         const Vec = @Vector(8, f32);
+        const VecU = @Vector(8, u32);
         const vec_len = 8;
-        const n_vec = n / vec_len;
+        const n_unroll = n / 16;
 
-        var sum_vec: Vec = @splat(0.0);
+        var sum0: Vec = @splat(0.0);
+        var sum1: Vec = @splat(0.0);
         var i: usize = 0;
 
-        while (i < n_vec * vec_len) : (i += vec_len) {
-            var af32: [8]f32 = undefined;
-            inline for (0..8) |k| {
-                af32[k] = quant.bf16ToF32(a[i + k]);
-            }
-            const va: Vec = af32;
-            const vb: Vec = b[i..][0..vec_len].*;
-            sum_vec += va * vb;
+        while (i < n_unroll * 16) : (i += 16) {
+            const raw0: @Vector(8, u16) = a[i..][0..8].*;
+            const raw1: @Vector(8, u16) = a[i + 8 ..][0..8].*;
+
+            const val0: VecU = @as(VecU, raw0) << @as(VecU, @splat(16));
+            const val1: VecU = @as(VecU, raw1) << @as(VecU, @splat(16));
+
+            const va0: Vec = @bitCast(val0);
+            const va1: Vec = @bitCast(val1);
+
+            const vb0: Vec = b[i..][0..8].*;
+            const vb1: Vec = b[i + 8 ..][0..8].*;
+
+            sum0 += va0 * vb0;
+            sum1 += va1 * vb1;
         }
 
-        total = @reduce(.Add, sum_vec);
+        while (i + vec_len <= n) : (i += vec_len) {
+            const raw: @Vector(8, u16) = a[i..][0..8].*;
+            const val: VecU = @as(VecU, raw) << @as(VecU, @splat(16));
+            const va: Vec = @bitCast(val);
+            const vb: Vec = b[i..][0..8].*;
+            sum0 += va * vb;
+        }
+
+        var total = @reduce(.Add, sum0 + sum1);
 
         while (i < n) : (i += 1) {
             total += quant.bf16ToF32(a[i]) * b[i];

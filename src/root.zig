@@ -13,6 +13,8 @@ pub const engine = @import("engine.zig");
 pub const server = @import("server.zig");
 pub const synthetic = @import("synthetic.zig");
 pub const cli = @import("cli.zig");
+pub const image = @import("image.zig");
+pub const vision = @import("vision.zig");
 
 // Direct public exports for ergonomic library usage
 pub const Engine = engine.Engine;
@@ -27,6 +29,8 @@ pub const Server = server.Server;
 pub const GGMLType = types.GGMLType;
 pub const GenerationOptions = types.GenerationOptions;
 pub const GenerationStats = types.GenerationStats;
+pub const Image = image.Image;
+pub const VisionEncoder = vision.VisionEncoder;
 
 test {
     _ = types;
@@ -42,4 +46,6 @@ test {
     _ = server;
     _ = synthetic;
     _ = cli;
+    _ = image;
+    _ = vision;
 }

@@ -10,6 +10,7 @@ const KVCache = @import("kv_cache.zig").KVCache;
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const math = @import("math.zig");
 const quant = @import("quant.zig");
+const VisionEncoder = @import("vision.zig").VisionEncoder;
 
 pub const LayerWeights = struct {
     // Layernorms
@@ -125,6 +126,7 @@ pub const TransformerModel = struct {
     output_norm: []const f32,
     output: ?Tensor = null,
     layers: []LayerWeights,
+    vision_encoder: ?VisionEncoder = null,
 
     fn loadNorm(allocator: std.mem.Allocator, t_opt: ?Tensor, len: usize) !?[]const f32 {
         if (t_opt) |t| {
@@ -295,6 +297,15 @@ pub const TransformerModel = struct {
             self.layers[i] = layer;
         }
 
+        const patch_proj = gguf.getTensor("v.patch_embedder.input_proj.weight") orelse gguf.getTensor("vision.patch_embedder.input_proj.weight");
+        const pos_emb = gguf.getTensor("v.patch_embedder.position_embedding_table") orelse gguf.getTensor("vision.patch_embedder.position_embedding_table");
+        const emb_proj = gguf.getTensor("v.embedding_projection.weight") orelse gguf.getTensor("vision.embedding_projection.weight");
+
+        self.vision_encoder = if (patch_proj != null or emb_proj != null)
+            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj)
+        else
+            null;
+
         return self;
     }
 
@@ -430,6 +441,15 @@ pub const TransformerModel = struct {
             self.layers[i] = layer;
         }
 
+        const patch_proj = st.getTensor("model.vision_tower.patch_embedder.input_proj.weight") orelse st.getTensor("vision_tower.patch_embedder.input_proj.weight");
+        const pos_emb = st.getTensor("model.vision_tower.patch_embedder.position_embedding_table") orelse st.getTensor("vision_tower.patch_embedder.position_embedding_table");
+        const emb_proj = st.getTensor("model.embed_vision.embedding_projection.weight") orelse st.getTensor("embed_vision.embedding_projection.weight");
+
+        self.vision_encoder = if (patch_proj != null or emb_proj != null)
+            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj)
+        else
+            null;
+
         return self;
     }
 
@@ -458,26 +478,50 @@ pub const TransformerModel = struct {
         pool: ?*ThreadPool,
         compute_logits: bool,
     ) ![]const f32 {
+        return self.forwardWithEmbedding(null, token_id, pos, kv_cache, bufs, pool, compute_logits);
+    }
+
+    pub fn forwardWithEmbedding(
+        self: *const TransformerModel,
+        custom_embedding: ?[]const f32,
+        token_id: u32,
+        pos: usize,
+        kv_cache: *KVCache,
+        bufs: *ModelBuffers,
+        pool: ?*ThreadPool,
+        compute_logits: bool,
+    ) ![]const f32 {
         const p = &self.params;
         const dim = p.embedding_length;
 
-        // 1. Embedding lookup
-        if (token_id >= p.vocab_size) return error.TokenOutOfBounds;
-        const embd_row = self.token_embd.getRow(token_id);
-        quant.dequantizeRow(self.token_embd.type, embd_row, bufs.x, dim);
+        if (custom_embedding) |emb| {
+            @memcpy(bufs.x[0..@min(dim, emb.len)], emb[0..@min(dim, emb.len)]);
+            if (emb.len < dim) {
+                @memset(bufs.x[emb.len..dim], 0.0);
+            }
+        } else {
+            // 1. Embedding lookup
+            if (token_id >= p.vocab_size) return error.TokenOutOfBounds;
+            const embd_row = self.token_embd.getRow(token_id);
+            quant.dequantizeRow(self.token_embd.type, embd_row, bufs.x, dim);
 
-        // Gemma embedding scaling
-        if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4) {
-            const scale = @sqrt(@as(f32, @floatFromInt(dim)));
-            for (bufs.x) |*v| v.* *= scale;
+            // Gemma embedding scaling
+            if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4) {
+                const scale = @sqrt(@as(f32, @floatFromInt(dim)));
+                for (bufs.x) |*v| v.* *= scale;
+            }
         }
 
         // Per-layer embedding precomputation (Token identity + Context-aware projection)
         if (self.embed_tokens_per_layer) |ple_tab| {
             const ple_dim: usize = 256;
             const total_ple_dim = self.layers.len * ple_dim;
-            const ple_row = ple_tab.getRow(token_id);
-            quant.dequantizeRow(ple_tab.type, ple_row, bufs.ctx_ple_buf[0..total_ple_dim], total_ple_dim);
+            if (token_id < p.vocab_size) {
+                const ple_row = ple_tab.getRow(token_id);
+                quant.dequantizeRow(ple_tab.type, ple_row, bufs.ctx_ple_buf[0..total_ple_dim], total_ple_dim);
+            } else {
+                @memset(bufs.ctx_ple_buf[0..total_ple_dim], 0.0);
+            }
             const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
             for (bufs.ctx_ple_buf[0..total_ple_dim]) |*v| v.* *= token_scale;
 

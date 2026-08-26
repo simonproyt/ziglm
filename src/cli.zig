@@ -33,6 +33,7 @@ pub fn printUsage() void {
         \\        --min-p <float>     Min-P sampling (default: 0.05)
         \\    -n, --max-tokens <int>  Maximum tokens to generate (default: 256)
         \\    -j, --threads <int>     Number of worker threads (default: CPU cores)
+        \\        --image <path>      Path to input image (BMP, PPM) for multimodal vision
         \\        --port <int>        HTTP server port (default: 8080)
         \\        --seed <int>        Random seed for reproducibility (default: 42)
         \\        --system <text>     System prompt for chat mode
@@ -59,6 +60,7 @@ pub const CliArgs = struct {
     min_p: f32 = 0.05,
     max_tokens: usize = 256,
     threads: ?usize = null,
+    image_path: ?[]const u8 = null,
     port: u16 = 8080,
     seed: u64 = 42,
     sample_out: []const u8 = "sample_model.gguf",
@@ -95,6 +97,8 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
             if (arg_it.next()) |v| args.threads = std.fmt.parseInt(usize, v, 10) catch null;
         } else if (std.mem.eql(u8, arg, "--greedy")) {
             args.temperature = 0.0;
+        } else if (std.mem.eql(u8, arg, "--image")) {
+            args.image_path = arg_it.next();
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (arg_it.next()) |v| args.port = std.fmt.parseInt(u16, v, 10) catch 8080;
         } else if (std.mem.eql(u8, arg, "--seed")) {
@@ -244,7 +248,11 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
             },
         };
 
-        const stats = try engine.generate(args.prompt, options, null, printTokenStdout);
+        if (args.image_path) |img| {
+            std.debug.print("Processing multimodal image: {s} ...\n", .{img});
+        }
+
+        const stats = try engine.generateWithImage(args.prompt, args.image_path, options, null, printTokenStdout);
 
         std.debug.print("\n\n────────────────────────────────────────\n", .{});
         std.debug.print("⚡ Prefill:    {d:.1} tok/s ({d} tokens in {d:.1} ms)\n", .{
