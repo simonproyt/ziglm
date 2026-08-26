@@ -217,9 +217,13 @@ pub const VisionEncoder = struct {
                         const out_h = attn_ctx[p1 * self.hidden_size + h * self.head_dim .. p1 * self.hidden_size + (h + 1) * self.head_dim];
                         for (0..num_patches) |p2| {
                             const weight = scores[p2];
+                            const v_weight: @Vector(8, f32) = @splat(weight);
                             const v2 = v_buf[p2 * self.hidden_size + h * self.head_dim .. p2 * self.hidden_size + (h + 1) * self.head_dim];
-                            for (0..self.head_dim) |d| {
-                                out_h[d] += weight * v2[d];
+                            inline for (0..8) |v_chunk| {
+                                const v_idx = v_chunk * 8;
+                                const v_val: @Vector(8, f32) = v2[v_idx..][0..8].*;
+                                const cur_out: @Vector(8, f32) = out_h[v_idx..][0..8].*;
+                                out_h[v_idx..][0..8].* = cur_out + v_weight * v_val;
                             }
                         }
                     }

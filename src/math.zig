@@ -67,108 +67,112 @@ pub fn dotF32F32(a: []const f32, b: []const f32) f32 {
 }
 
 pub fn dotF16F32(a_bytes: []const u8, b: []const f32, n: usize) f32 {
-    if (@intFromPtr(a_bytes.ptr) % @alignOf(f16) == 0) {
-        const a: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, a_bytes[0 .. n * @sizeOf(f16)]));
-        const Vec = @Vector(8, f32);
-        const Vec16 = @Vector(8, f16);
-        const vec_len = 8;
-        const n_unroll = n / 16;
+    const Vec = @Vector(8, f32);
+    const Vec16 = @Vector(8, f16);
+    const vec_len = 8;
+    const n_unroll = n / 32;
 
-        var sum0: Vec = @splat(0.0);
-        var sum1: Vec = @splat(0.0);
-        var i: usize = 0;
+    var sum0: Vec = @splat(0.0);
+    var sum1: Vec = @splat(0.0);
+    var sum2: Vec = @splat(0.0);
+    var sum3: Vec = @splat(0.0);
+    var i: usize = 0;
 
-        while (i < n_unroll * 16) : (i += 16) {
-            const raw0: Vec16 = a[i..][0..8].*;
-            const raw1: Vec16 = a[i + 8 ..][0..8].*;
+    while (i < n_unroll * 32) : (i += 32) {
+        const raw0: Vec16 = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[i * 2 ..][0..16])).*[0..16].*);
+        const raw1: Vec16 = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[(i + 8) * 2 ..][0..16])).*[0..16].*);
+        const raw2: Vec16 = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[(i + 16) * 2 ..][0..16])).*[0..16].*);
+        const raw3: Vec16 = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[(i + 24) * 2 ..][0..16])).*[0..16].*);
 
-            const va0: Vec = @floatCast(raw0);
-            const va1: Vec = @floatCast(raw1);
+        const va0: Vec = @floatCast(raw0);
+        const va1: Vec = @floatCast(raw1);
+        const va2: Vec = @floatCast(raw2);
+        const va3: Vec = @floatCast(raw3);
 
-            const vb0: Vec = b[i..][0..8].*;
-            const vb1: Vec = b[i + 8 ..][0..8].*;
+        const vb0: Vec = b[i..][0..8].*;
+        const vb1: Vec = b[i + 8 ..][0..8].*;
+        const vb2: Vec = b[i + 16 ..][0..8].*;
+        const vb3: Vec = b[i + 24 ..][0..8].*;
 
-            sum0 += va0 * vb0;
-            sum1 += va1 * vb1;
-        }
-
-        while (i + vec_len <= n) : (i += vec_len) {
-            const raw: Vec16 = a[i..][0..8].*;
-            const va: Vec = @floatCast(raw);
-            const vb: Vec = b[i..][0..8].*;
-            sum0 += va * vb;
-        }
-
-        var total = @reduce(.Add, sum0 + sum1);
-
-        while (i < n) : (i += 1) {
-            total += quant.f16ToF32(a[i]) * b[i];
-        }
-
-        return total;
-    } else {
-        var total: f32 = 0.0;
-        for (0..n) |i| {
-            const u = std.mem.readInt(u16, a_bytes[i * 2 ..][0..2], .little);
-            const f: f16 = @bitCast(u);
-            total += quant.f16ToF32(f) * b[i];
-        }
-        return total;
+        sum0 += va0 * vb0;
+        sum1 += va1 * vb1;
+        sum2 += va2 * vb2;
+        sum3 += va3 * vb3;
     }
+
+    while (i + vec_len <= n) : (i += vec_len) {
+        const raw: Vec16 = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[i * 2 ..][0..16])).*[0..16].*);
+        const va: Vec = @floatCast(raw);
+        const vb: Vec = b[i..][0..8].*;
+        sum0 += va * vb;
+    }
+
+    var total = @reduce(.Add, (sum0 + sum1) + (sum2 + sum3));
+
+    while (i < n) : (i += 1) {
+        const u = std.mem.readInt(u16, a_bytes[i * 2 ..][0..2], .little);
+        const f: f16 = @bitCast(u);
+        total += quant.f16ToF32(f) * b[i];
+    }
+
+    return total;
 }
 
 pub fn dotBf16F32(a_bytes: []const u8, b: []const f32, n: usize) f32 {
-    if (@intFromPtr(a_bytes.ptr) % @alignOf(u16) == 0) {
-        const a: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, a_bytes[0 .. n * @sizeOf(u16)]));
-        const Vec = @Vector(8, f32);
-        const VecU = @Vector(8, u32);
-        const vec_len = 8;
-        const n_unroll = n / 16;
+    const Vec = @Vector(8, f32);
+    const VecU = @Vector(8, u32);
+    const vec_len = 8;
+    const n_unroll = n / 32;
 
-        var sum0: Vec = @splat(0.0);
-        var sum1: Vec = @splat(0.0);
-        var i: usize = 0;
+    var sum0: Vec = @splat(0.0);
+    var sum1: Vec = @splat(0.0);
+    var sum2: Vec = @splat(0.0);
+    var sum3: Vec = @splat(0.0);
+    var i: usize = 0;
 
-        while (i < n_unroll * 16) : (i += 16) {
-            const raw0: @Vector(8, u16) = a[i..][0..8].*;
-            const raw1: @Vector(8, u16) = a[i + 8 ..][0..8].*;
+    while (i < n_unroll * 32) : (i += 32) {
+        const raw0: @Vector(8, u16) = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[i * 2 ..][0..16])).*[0..16].*);
+        const raw1: @Vector(8, u16) = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[(i + 8) * 2 ..][0..16])).*[0..16].*);
+        const raw2: @Vector(8, u16) = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[(i + 16) * 2 ..][0..16])).*[0..16].*);
+        const raw3: @Vector(8, u16) = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[(i + 24) * 2 ..][0..16])).*[0..16].*);
 
-            const val0: VecU = @as(VecU, raw0) << @as(VecU, @splat(16));
-            const val1: VecU = @as(VecU, raw1) << @as(VecU, @splat(16));
+        const val0: VecU = @as(VecU, raw0) << @as(VecU, @splat(16));
+        const val1: VecU = @as(VecU, raw1) << @as(VecU, @splat(16));
+        const val2: VecU = @as(VecU, raw2) << @as(VecU, @splat(16));
+        const val3: VecU = @as(VecU, raw3) << @as(VecU, @splat(16));
 
-            const va0: Vec = @bitCast(val0);
-            const va1: Vec = @bitCast(val1);
+        const va0: Vec = @bitCast(val0);
+        const va1: Vec = @bitCast(val1);
+        const va2: Vec = @bitCast(val2);
+        const va3: Vec = @bitCast(val3);
 
-            const vb0: Vec = b[i..][0..8].*;
-            const vb1: Vec = b[i + 8 ..][0..8].*;
+        const vb0: Vec = b[i..][0..8].*;
+        const vb1: Vec = b[i + 8 ..][0..8].*;
+        const vb2: Vec = b[i + 16 ..][0..8].*;
+        const vb3: Vec = b[i + 24 ..][0..8].*;
 
-            sum0 += va0 * vb0;
-            sum1 += va1 * vb1;
-        }
-
-        while (i + vec_len <= n) : (i += vec_len) {
-            const raw: @Vector(8, u16) = a[i..][0..8].*;
-            const val: VecU = @as(VecU, raw) << @as(VecU, @splat(16));
-            const va: Vec = @bitCast(val);
-            const vb: Vec = b[i..][0..8].*;
-            sum0 += va * vb;
-        }
-
-        var total = @reduce(.Add, sum0 + sum1);
-
-        while (i < n) : (i += 1) {
-            total += quant.bf16ToF32(a[i]) * b[i];
-        }
-
-        return total;
-    } else {
-        var total: f32 = 0.0;
-        for (0..n) |i| {
-            const u = std.mem.readInt(u16, a_bytes[i * 2 ..][0..2], .little);
-            total += quant.bf16ToF32(u) * b[i];
-        }
-        return total;
+        sum0 += va0 * vb0;
+        sum1 += va1 * vb1;
+        sum2 += va2 * vb2;
+        sum3 += va3 * vb3;
     }
+
+    while (i + vec_len <= n) : (i += vec_len) {
+        const raw: @Vector(8, u16) = @bitCast(@as(*align(1) const [16]u8, @ptrCast(a_bytes[i * 2 ..][0..16])).*[0..16].*);
+        const val: VecU = @as(VecU, raw) << @as(VecU, @splat(16));
+        const va: Vec = @bitCast(val);
+        const vb: Vec = b[i..][0..8].*;
+        sum0 += va * vb;
+    }
+
+    var total = @reduce(.Add, (sum0 + sum1) + (sum2 + sum3));
+
+    while (i < n) : (i += 1) {
+        const u = std.mem.readInt(u16, a_bytes[i * 2 ..][0..2], .little);
+        total += quant.bf16ToF32(u) * b[i];
+    }
+
+    return total;
 }
 
 pub fn dotQ8_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
@@ -178,10 +182,46 @@ pub fn dotQ8_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     var sum0: Vec = @splat(0.0);
     var sum1: Vec = @splat(0.0);
 
-    for (0..n_blocks) |block_idx| {
+    var block_idx: usize = 0;
+    while (block_idx + 2 <= n_blocks) : (block_idx += 2) {
+        const blk0: *const BlockQ8_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
+        const blk1: *const BlockQ8_0 = @ptrCast(@alignCast(a_bytes[(block_idx + 1) * block_size .. (block_idx + 2) * block_size].ptr));
+
+        const vd0: Vec = @splat(@as(f32, @floatCast(blk0.d)));
+        const vd1: Vec = @splat(@as(f32, @floatCast(blk1.d)));
+
+        const b_ptr0 = b.ptr + block_idx * 32;
+        const b_ptr1 = b.ptr + (block_idx + 1) * 32;
+
+        const vb0_0: Vec = b_ptr0[0..16].*;
+        const vb0_1: Vec = b_ptr0[16..32].*;
+        const vb1_0: Vec = b_ptr1[0..16].*;
+        const vb1_1: Vec = b_ptr1[16..32].*;
+
+        var q0_0: [16]f32 = undefined;
+        var q0_1: [16]f32 = undefined;
+        var q1_0: [16]f32 = undefined;
+        var q1_1: [16]f32 = undefined;
+
+        inline for (0..16) |k| {
+            q0_0[k] = @floatFromInt(blk0.qs[k]);
+            q0_1[k] = @floatFromInt(blk0.qs[k + 16]);
+            q1_0[k] = @floatFromInt(blk1.qs[k]);
+            q1_1[k] = @floatFromInt(blk1.qs[k + 16]);
+        }
+
+        const vq0_0: Vec = q0_0;
+        const vq0_1: Vec = q0_1;
+        const vq1_0: Vec = q1_0;
+        const vq1_1: Vec = q1_1;
+
+        sum0 += (vq0_0 * vb0_0 + vq0_1 * vb0_1) * vd0;
+        sum1 += (vq1_0 * vb1_0 + vq1_1 * vb1_1) * vd1;
+    }
+
+    while (block_idx < n_blocks) : (block_idx += 1) {
         const blk: *const BlockQ8_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        const d: f32 = @floatCast(blk.d);
-        const vd: Vec = @splat(d);
+        const vd: Vec = @splat(@as(f32, @floatCast(blk.d)));
         const b_ptr = b.ptr + block_idx * 32;
 
         const vb0: Vec = b_ptr[0..16].*;
@@ -195,9 +235,7 @@ pub fn dotQ8_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         }
         const vq0: Vec = q0;
         const vq1: Vec = q1;
-
-        sum0 += vq0 * vb0 * vd;
-        sum1 += vq1 * vb1 * vd;
+        sum0 += (vq0 * vb0 + vq1 * vb1) * vd;
     }
 
     return @reduce(.Add, sum0 + sum1);
@@ -275,14 +313,16 @@ pub fn dotQ4_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         const vq1_0: Vec = v1_0_arr;
         const vq1_1: Vec = v1_1_arr;
 
-        sum0 += (vq0_0 - eight) * vb0_0 * vd0 + (vq1_0 - eight) * vb1_0 * vd1;
-        sum1 += (vq0_1 - eight) * vb0_1 * vd0 + (vq1_1 - eight) * vb1_1 * vd1;
+        const acc0 = (vq0_0 * vb0_0 + vq0_1 * vb0_1) - eight * (vb0_0 + vb0_1);
+        const acc1 = (vq1_0 * vb1_0 + vq1_1 * vb1_1) - eight * (vb1_0 + vb1_1);
+
+        sum0 += acc0 * vd0;
+        sum1 += acc1 * vd1;
     }
 
     while (block_idx < n_blocks) : (block_idx += 1) {
         const blk: *const BlockQ4_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        const d: f32 = @floatCast(blk.d);
-        const vd: Vec = @splat(d);
+        const vd: Vec = @splat(@as(f32, @floatCast(blk.d)));
         const b_ptr = b.ptr + block_idx * 32;
 
         const vb0: Vec = b_ptr[0..16].*;
@@ -299,8 +339,8 @@ pub fn dotQ4_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         const vq0: Vec = v0_arr;
         const vq1: Vec = v1_arr;
 
-        sum0 += (vq0 - eight) * vb0 * vd;
-        sum1 += (vq1 - eight) * vb1 * vd;
+        const acc = (vq0 * vb0 + vq1 * vb1) - eight * (vb0 + vb1);
+        sum0 += acc * vd;
     }
 
     return @reduce(.Add, sum0 + sum1);
@@ -776,17 +816,32 @@ pub fn rmsNorm(
     var sum_sq: f32 = 0.0;
     const Vec = @Vector(8, f32);
     const vec_len = 8;
-    const n_vec = n / vec_len;
+    const n_unroll = n / 32;
 
-    var sum_vec: Vec = @splat(0.0);
+    var sum0: Vec = @splat(0.0);
+    var sum1: Vec = @splat(0.0);
+    var sum2: Vec = @splat(0.0);
+    var sum3: Vec = @splat(0.0);
     var i: usize = 0;
 
-    while (i < n_vec * vec_len) : (i += vec_len) {
-        const vx: Vec = x[i..][0..vec_len].*;
-        sum_vec += vx * vx;
+    while (i < n_unroll * 32) : (i += 32) {
+        const vx0: Vec = x[i..][0..8].*;
+        const vx1: Vec = x[i + 8 ..][0..8].*;
+        const vx2: Vec = x[i + 16 ..][0..8].*;
+        const vx3: Vec = x[i + 24 ..][0..8].*;
+
+        sum0 += vx0 * vx0;
+        sum1 += vx1 * vx1;
+        sum2 += vx2 * vx2;
+        sum3 += vx3 * vx3;
     }
 
-    sum_sq = @reduce(.Add, sum_vec);
+    while (i + vec_len <= n) : (i += vec_len) {
+        const vx: Vec = x[i..][0..vec_len].*;
+        sum0 += vx * vx;
+    }
+
+    sum_sq = @reduce(.Add, (sum0 + sum1) + (sum2 + sum3));
 
     while (i < n) : (i += 1) {
         sum_sq += x[i] * x[i];
@@ -799,7 +854,31 @@ pub fn rmsNorm(
     const inv_std_vec: Vec = @splat(inv_std);
     const one_vec: Vec = @splat(1.0);
 
-    while (i < n_vec * vec_len) : (i += vec_len) {
+    while (i < n_unroll * 32) : (i += 32) {
+        const vx0: Vec = x[i..][0..8].*;
+        const vx1: Vec = x[i + 8 ..][0..8].*;
+        const vx2: Vec = x[i + 16 ..][0..8].*;
+        const vx3: Vec = x[i + 24 ..][0..8].*;
+
+        const vw0: Vec = weight[i..][0..8].*;
+        const vw1: Vec = weight[i + 8 ..][0..8].*;
+        const vw2: Vec = weight[i + 16 ..][0..8].*;
+        const vw3: Vec = weight[i + 24 ..][0..8].*;
+
+        if (use_unit_offset) {
+            out[i..][0..8].* = (vx0 * inv_std_vec) * (one_vec + vw0);
+            out[i + 8 ..][0..8].* = (vx1 * inv_std_vec) * (one_vec + vw1);
+            out[i + 16 ..][0..8].* = (vx2 * inv_std_vec) * (one_vec + vw2);
+            out[i + 24 ..][0..8].* = (vx3 * inv_std_vec) * (one_vec + vw3);
+        } else {
+            out[i..][0..8].* = (vx0 * inv_std_vec) * vw0;
+            out[i + 8 ..][0..8].* = (vx1 * inv_std_vec) * vw1;
+            out[i + 16 ..][0..8].* = (vx2 * inv_std_vec) * vw2;
+            out[i + 24 ..][0..8].* = (vx3 * inv_std_vec) * vw3;
+        }
+    }
+
+    while (i + vec_len <= n) : (i += vec_len) {
         const vx: Vec = x[i..][0..vec_len].*;
         const vw: Vec = weight[i..][0..vec_len].*;
         const norm_x = vx * inv_std_vec;

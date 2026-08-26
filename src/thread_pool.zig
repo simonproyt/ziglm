@@ -12,7 +12,7 @@ const WorkerState = struct {
     task_ctx: ?*anyopaque = null,
     epoch: Atomic(u64) = Atomic(u64).init(0),
     done_epoch: Atomic(u64) = Atomic(u64).init(0),
-    _pad: [16]u8 = undefined,
+    _pad: [128 - 56]u8 = [_]u8{0} ** (128 - 56),
 };
 
 pub const ThreadPool = struct {

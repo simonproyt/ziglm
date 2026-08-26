@@ -616,18 +616,29 @@ pub const TransformerModel = struct {
                 }
             }
 
-            // RoPE for Query
+            // RoPE for Query and Key with precomputed table (avoid 50,000+ transcendental pow/cos/sin calls)
             const pos_f32 = @as(f32, @floatFromInt(pos)) * p.rope_freq_scale;
             const eff_rotary = if (layer.rotary_dim == 0 or layer.rotary_dim > head_size) head_size else layer.rotary_dim;
             const half_dim = eff_rotary / 2;
+            const log_theta = @log(layer.rope_theta);
+            const inv_rotary = 1.0 / @as(f32, @floatFromInt(eff_rotary));
+
+            var cos_tab: [256]f32 = undefined;
+            var sin_tab: [256]f32 = undefined;
+            const safe_half_dim = @min(half_dim, 256);
+            for (0..safe_half_dim) |i| {
+                const exponent = @as(f32, @floatFromInt(2 * i)) * inv_rotary;
+                const freq = @exp(-exponent * log_theta);
+                const theta = pos_f32 * freq;
+                cos_tab[i] = @cos(theta);
+                sin_tab[i] = @sin(theta);
+            }
+
             for (0..n_heads) |h| {
                 const q_head = bufs.q[h * head_size .. (h + 1) * head_size];
-                var i: usize = 0;
-                while (i < half_dim) : (i += 1) {
-                    const exponent = @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(eff_rotary));
-                    const theta = pos_f32 / std.math.pow(f32, layer.rope_theta, exponent);
-                    const cos_t = @cos(theta);
-                    const sin_t = @sin(theta);
+                for (0..safe_half_dim) |i| {
+                    const cos_t = cos_tab[i];
+                    const sin_t = sin_tab[i];
                     const v0 = q_head[i];
                     const v1 = q_head[i + half_dim];
                     q_head[i] = v0 * cos_t - v1 * sin_t;
@@ -661,15 +672,12 @@ pub const TransformerModel = struct {
                     }
                 }
 
-                // RoPE for Key
+                // RoPE for Key (reusing precomputed cos/sin table)
                 for (0..n_kv_heads) |h| {
                     const k_head = bufs.k[h * head_size .. (h + 1) * head_size];
-                    var i: usize = 0;
-                    while (i < half_dim) : (i += 1) {
-                        const exponent = @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(eff_rotary));
-                        const theta = pos_f32 / std.math.pow(f32, layer.rope_theta, exponent);
-                        const cos_t = @cos(theta);
-                        const sin_t = @sin(theta);
+                    for (0..safe_half_dim) |i| {
+                        const cos_t = cos_tab[i];
+                        const sin_t = sin_tab[i];
                         const v0 = k_head[i];
                         const v1 = k_head[i + half_dim];
                         k_head[i] = v0 * cos_t - v1 * sin_t;
@@ -704,15 +712,23 @@ pub const TransformerModel = struct {
 
                 math.softmax(head_scores);
 
-                // Accumulate weighted values into attn_out
+                // Accumulate weighted values into attn_out using SIMD
                 const out_head = bufs.attn_out[h * head_size .. (h + 1) * head_size];
                 @memset(out_head, 0.0);
 
+                const Vec = @Vector(8, f32);
+                const n_vec = head_size / 8;
+
                 for (start_t..seq_len) |t| {
                     const weight = head_scores[t - start_t];
+                    const v_weight: Vec = @splat(weight);
                     const v_vec = kv_cache.getValue(donor_layer, t, kv_h);
-                    for (0..head_size) |d| {
-                        out_head[d] += weight * v_vec[d];
+
+                    for (0..n_vec) |chunk| {
+                        const idx = chunk * 8;
+                        const v_val: Vec = v_vec[idx..][0..8].*;
+                        const cur: Vec = out_head[idx..][0..8].*;
+                        out_head[idx..][0..8].* = cur + v_weight * v_val;
                     }
                 }
             }
