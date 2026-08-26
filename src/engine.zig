@@ -228,12 +228,14 @@ pub const Engine = struct {
 
         var last_logits: []const f32 = undefined;
         for (tokens, 0..) |tok, pos| {
+            const is_last = (pos == tokens.len - 1);
             last_logits = try self.model.forward(
                 tok,
                 pos,
                 self.kv_cache,
                 self.buffers,
                 self.thread_pool,
+                is_last,
             );
         }
         return last_logits;
@@ -247,6 +249,7 @@ pub const Engine = struct {
             self.kv_cache,
             self.buffers,
             self.thread_pool,
+            true,
         );
     }
 

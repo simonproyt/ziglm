@@ -341,6 +341,21 @@ pub const GGUFFile = struct {
                 .UINT64 => |v| v,
                 .UINT32 => |v| v,
                 .INT64 => |v| @intCast(v),
+                .INT32 => |v| @intCast(v),
+                .ARRAY => |arr| blk: {
+                    if (arr.len > 0) {
+                        if (arr.type == .UINT32 and arr.data.len >= 4) {
+                            break :blk std.mem.readInt(u32, arr.data[0..4], .little);
+                        } else if (arr.type == .UINT64 and arr.data.len >= 8) {
+                            break :blk std.mem.readInt(u64, arr.data[0..8], .little);
+                        } else if (arr.type == .INT32 and arr.data.len >= 4) {
+                            break :blk @intCast(std.mem.readInt(i32, arr.data[0..4], .little));
+                        } else if (arr.type == .INT64 and arr.data.len >= 8) {
+                            break :blk @intCast(std.mem.readInt(i64, arr.data[0..8], .little));
+                        }
+                    }
+                    break :blk null;
+                },
                 else => null,
             };
         }
@@ -352,6 +367,15 @@ pub const GGUFFile = struct {
             return switch (val) {
                 .FLOAT32 => |v| v,
                 .FLOAT64 => |v| @floatCast(v),
+                .ARRAY => |arr| blk: {
+                    if (arr.len > 0) {
+                        if (arr.type == .FLOAT32 and arr.data.len >= 4) {
+                            const u = std.mem.readInt(u32, arr.data[0..4], .little);
+                            break :blk @bitCast(u);
+                        }
+                    }
+                    break :blk null;
+                },
                 else => null,
             };
         }
@@ -398,6 +422,12 @@ pub const GGUFFile = struct {
         } else {
             self.params.head_count_kv = self.params.head_count;
         }
+        if (self.findParamU64(arch_name, "attention.key_length", &key_buf)) |v| {
+            self.params.head_size = v;
+        }
+        if (self.findParamU64(arch_name, "attention.sliding_window", &key_buf)) |v| {
+            self.params.sliding_window = v;
+        }
         if (self.findParamF32(arch_name, "attention.layer_norm_rms_epsilon", &key_buf)) |v| {
             self.params.layer_norm_rms_epsilon = v;
         }
@@ -409,6 +439,9 @@ pub const GGUFFile = struct {
         }
         if (self.findParamU64(arch_name, "rope.dimension_count", &key_buf)) |v| {
             self.params.rope_dim_count = v;
+        }
+        if (self.findParamF32(arch_name, "final_logit_softcapping", &key_buf)) |v| {
+            self.params.final_logit_softcapping = v;
         }
         if (self.getTensor("token_embd.weight")) |t| {
             self.params.vocab_size = t.shape[1];

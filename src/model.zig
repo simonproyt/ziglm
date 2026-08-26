@@ -136,6 +136,22 @@ pub const TransformerModel = struct {
         return null;
     }
 
+    fn loadScalar(t_opt: ?Tensor) f32 {
+        if (t_opt) |t_scalar| {
+            if (t_scalar.type == .BF16 and t_scalar.data.len >= 2) {
+                const u = std.mem.readInt(u16, t_scalar.data[0..2], .little);
+                return @as(f32, @bitCast(@as(u32, u) << 16));
+            } else if (t_scalar.type == .F16 and t_scalar.data.len >= 2) {
+                const u = std.mem.readInt(u16, t_scalar.data[0..2], .little);
+                return @floatCast(@as(f16, @bitCast(u)));
+            } else if (t_scalar.type == .F32 and t_scalar.data.len >= 4) {
+                const u = std.mem.readInt(u32, t_scalar.data[0..4], .little);
+                return @bitCast(u);
+            }
+        }
+        return 1.0;
+    }
+
     pub fn load(allocator: std.mem.Allocator, gguf: *const GGUFFile) !*TransformerModel {
         const token_embd = gguf.getTensor("token_embd.weight") orelse return error.MissingTokenEmbeddingTensor;
         const out_norm_t = gguf.getTensor("output_norm.weight") orelse return error.MissingOutputNormTensor;
@@ -152,7 +168,9 @@ pub const TransformerModel = struct {
             .allocator = allocator,
             .params = gguf.params,
             .token_embd = token_embd,
-            .embed_tokens_per_layer = null,
+            .embed_tokens_per_layer = gguf.getTensor("per_layer_token_embd.weight") orelse gguf.getTensor("embed_tokens_per_layer.weight"),
+            .per_layer_model_projection = gguf.getTensor("per_layer_model_proj.weight") orelse gguf.getTensor("per_layer_model_projection.weight"),
+            .per_layer_projection_norm = try loadNorm(allocator, gguf.getTensor("per_layer_proj_norm.weight") orelse gguf.getTensor("per_layer_projection_norm.weight"), 256),
             .output_norm = out_norm_slice,
             .output = gguf.getTensor("output.weight"),
             .layers = try allocator.alloc(LayerWeights, gguf.params.block_count),
@@ -164,11 +182,53 @@ pub const TransformerModel = struct {
         for (0..gguf.params.block_count) |i| {
             var layer = LayerWeights{};
 
-            // Attention Norm
-            const attn_norm_name = std.fmt.bufPrint(&name_buf, "blk.{d}.attn_norm.weight", .{i}) catch continue;
-            layer.input_layernorm = try loadNorm(allocator, gguf.getTensor(attn_norm_name), dim);
+            // 1. Attention Norm
+            const in_norm_name = std.fmt.bufPrint(&name_buf, "blk.{d}.attn_norm.weight", .{i}) catch continue;
+            layer.input_layernorm = try loadNorm(allocator, gguf.getTensor(in_norm_name), dim);
 
-            // Q, K, V
+            const post_attn_name = std.fmt.bufPrint(&name_buf, "blk.{d}.post_attention_norm.weight", .{i}) catch continue;
+            layer.post_attention_layernorm = try loadNorm(allocator, gguf.getTensor(post_attn_name) orelse blk: {
+                const alt_name = std.fmt.bufPrint(&name_buf, "blk.{d}.post_attn_norm.weight", .{i}) catch break :blk null;
+                break :blk gguf.getTensor(alt_name);
+            }, dim);
+
+            // 2. Pre-FFN Norm & Post-FFN Norm
+            const pre_ffn_name = std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_norm.weight", .{i}) catch continue;
+            layer.pre_feedforward_layernorm = try loadNorm(allocator, gguf.getTensor(pre_ffn_name), dim);
+
+            const post_ffn_name = std.fmt.bufPrint(&name_buf, "blk.{d}.post_ffw_norm.weight", .{i}) catch continue;
+            layer.post_feedforward_layernorm = try loadNorm(allocator, gguf.getTensor(post_ffn_name) orelse blk: {
+                const alt_name = std.fmt.bufPrint(&name_buf, "blk.{d}.post_ffn_norm.weight", .{i}) catch break :blk null;
+                break :blk gguf.getTensor(alt_name);
+            }, dim);
+
+            // 3. PLE Tensors
+            const post_ple_name = std.fmt.bufPrint(&name_buf, "blk.{d}.post_norm.weight", .{i}) catch continue;
+            layer.post_per_layer_input_norm = try loadNorm(allocator, gguf.getTensor(post_ple_name) orelse blk: {
+                const alt_name = std.fmt.bufPrint(&name_buf, "blk.{d}.post_per_layer_input_norm.weight", .{i}) catch break :blk null;
+                break :blk gguf.getTensor(alt_name);
+            }, dim);
+
+            const ple_gate_name = std.fmt.bufPrint(&name_buf, "blk.{d}.inp_gate.weight", .{i}) catch continue;
+            layer.per_layer_input_gate = gguf.getTensor(ple_gate_name) orelse blk: {
+                const alt_name = std.fmt.bufPrint(&name_buf, "blk.{d}.per_layer_input_gate.weight", .{i}) catch break :blk null;
+                break :blk gguf.getTensor(alt_name);
+            };
+
+            const ple_proj_name = std.fmt.bufPrint(&name_buf, "blk.{d}.proj.weight", .{i}) catch continue;
+            layer.per_layer_projection = gguf.getTensor(ple_proj_name) orelse blk: {
+                const alt_name = std.fmt.bufPrint(&name_buf, "blk.{d}.per_layer_projection.weight", .{i}) catch break :blk null;
+                break :blk gguf.getTensor(alt_name);
+            };
+
+            // 4. Layer scalar
+            const scalar_name = std.fmt.bufPrint(&name_buf, "blk.{d}.layer_output_scale.weight", .{i}) catch continue;
+            layer.layer_scalar = loadScalar(gguf.getTensor(scalar_name) orelse blk: {
+                const alt_name = std.fmt.bufPrint(&name_buf, "blk.{d}.layer_scalar", .{i}) catch break :blk null;
+                break :blk gguf.getTensor(alt_name);
+            });
+
+            // 5. Q, K, V, Output
             const q_name = std.fmt.bufPrint(&name_buf, "blk.{d}.attn_q.weight", .{i}) catch continue;
             layer.attn_q = gguf.getTensor(q_name);
 
@@ -181,25 +241,42 @@ pub const TransformerModel = struct {
             const out_name = std.fmt.bufPrint(&name_buf, "blk.{d}.attn_output.weight", .{i}) catch continue;
             layer.attn_output = gguf.getTensor(out_name);
 
-            // Q / K Norms
+            // 6. Q / K Norms & Head Dim
             const q_norm_name = std.fmt.bufPrint(&name_buf, "blk.{d}.attn_q_norm.weight", .{i}) catch continue;
-            layer.attn_q_norm = try loadNorm(allocator, gguf.getTensor(q_norm_name), head_size);
+            const q_norm_t = gguf.getTensor(q_norm_name);
+            if (q_norm_t) |qnt| {
+                layer.head_dim = qnt.elements();
+                layer.attn_q_norm = try loadNorm(allocator, q_norm_t, layer.head_dim);
+            } else {
+                layer.head_dim = head_size;
+            }
 
             const k_norm_name = std.fmt.bufPrint(&name_buf, "blk.{d}.attn_k_norm.weight", .{i}) catch continue;
-            layer.attn_k_norm = try loadNorm(allocator, gguf.getTensor(k_norm_name), head_size);
+            layer.attn_k_norm = try loadNorm(allocator, gguf.getTensor(k_norm_name), layer.head_dim);
 
-            layer.head_dim = head_size;
-            layer.n_heads = gguf.params.head_count;
-            layer.n_kv_heads = gguf.params.head_count_kv;
-            layer.rotary_dim = if (gguf.params.rope_dim_count > 0) gguf.params.rope_dim_count else head_size;
-            layer.rope_theta = gguf.params.rope_freq_base;
-            layer.layer_scalar = 1.0;
+            if (layer.attn_q) |t_q| {
+                layer.n_heads = t_q.elements() / dim / layer.head_dim;
+            } else {
+                layer.n_heads = gguf.params.head_count;
+            }
 
-            // FFN Norm
-            const ffn_norm_name = std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_norm.weight", .{i}) catch continue;
-            layer.pre_feedforward_layernorm = try loadNorm(allocator, gguf.getTensor(ffn_norm_name), dim);
+            if (layer.attn_k) |t_k| {
+                layer.n_kv_heads = t_k.elements() / dim / layer.head_dim;
+            } else {
+                layer.n_kv_heads = if (gguf.params.head_count_kv > 0) gguf.params.head_count_kv else layer.n_heads;
+            }
 
-            // FFN projections
+            if (layer.head_dim >= 512) {
+                layer.rope_theta = 1000000.0;
+                layer.rotary_dim = 128; // 0.25 * 512
+                layer.sliding_window = 0;
+            } else {
+                layer.rope_theta = 10000.0;
+                layer.rotary_dim = layer.head_dim;
+                layer.sliding_window = 512;
+            }
+
+            // 7. FFN Projections
             const gate_name = std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_gate.weight", .{i}) catch continue;
             layer.ffn_gate = gguf.getTensor(gate_name);
 
@@ -212,7 +289,7 @@ pub const TransformerModel = struct {
             if (layer.ffn_gate) |t_gate| {
                 layer.intermediate_size = t_gate.elements() / dim;
             } else {
-                layer.intermediate_size = self.params.feed_forward_length;
+                layer.intermediate_size = gguf.params.feed_forward_length;
             }
 
             self.layers[i] = layer;
@@ -379,6 +456,7 @@ pub const TransformerModel = struct {
         kv_cache: *KVCache,
         bufs: *ModelBuffers,
         pool: ?*ThreadPool,
+        compute_logits: bool,
     ) ![]const f32 {
         const p = &self.params;
         const dim = p.embedding_length;
@@ -634,6 +712,8 @@ pub const TransformerModel = struct {
                 for (bufs.x) |*v| v.* *= scalar;
             }
         }
+
+        if (!compute_logits) return bufs.logits;
 
         // 3. Final Norm
         math.rmsNorm(bufs.x, self.output_norm, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);

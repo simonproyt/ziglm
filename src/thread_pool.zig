@@ -2,11 +2,13 @@ const std = @import("std");
 const Atomic = std.atomic.Value;
 
 pub const TaskFn = *const fn (ctx: ?*anyopaque, item_idx: usize, thread_idx: usize) void;
+pub const RangeTaskFn = *const fn (ctx: ?*anyopaque, start: usize, end: usize, thread_idx: usize) void;
 
 const WorkerState = struct {
     start: usize = 0,
     end: usize = 0,
     task_fn: ?TaskFn = null,
+    range_task_fn: ?RangeTaskFn = null,
     task_ctx: ?*anyopaque = null,
     epoch: Atomic(u64) = Atomic(u64).init(0),
     done_epoch: Atomic(u64) = Atomic(u64).init(0),
@@ -23,7 +25,13 @@ pub const ThreadPool = struct {
     pub fn init(allocator: std.mem.Allocator, num_threads_opt: ?usize) !*ThreadPool {
         const num_threads = num_threads_opt orelse blk: {
             const cpus = std.Thread.getCpuCount() catch 4;
-            break :blk @max(1, cpus);
+            if (cpus >= 16) {
+                break :blk cpus / 2;
+            } else if (cpus > 8) {
+                break :blk 8;
+            } else {
+                break :blk @max(1, cpus);
+            }
         };
 
         const self = try allocator.create(ThreadPool);
@@ -72,7 +80,9 @@ pub const ThreadPool = struct {
         while (!self.shutdown.load(.acquire)) {
             const job_epoch = w.epoch.load(.acquire);
             if (job_epoch != last_epoch) {
-                if (w.task_fn) |f| {
+                if (w.range_task_fn) |rf| {
+                    rf(w.task_ctx, w.start, w.end, worker_idx + 1);
+                } else if (w.task_fn) |f| {
                     var idx = w.start;
                     while (idx < w.end) : (idx += 1) {
                         f(w.task_ctx, idx, worker_idx + 1);
@@ -81,7 +91,7 @@ pub const ThreadPool = struct {
                 last_epoch = job_epoch;
                 w.done_epoch.store(job_epoch, .release);
             } else {
-                std.Thread.yield() catch {};
+                std.atomic.spinLoopHint();
             }
         }
     }
@@ -112,6 +122,7 @@ pub const ThreadPool = struct {
             self.workers[i].start = start;
             self.workers[i].end = end;
             self.workers[i].task_fn = task_fn;
+            self.workers[i].range_task_fn = null;
             self.workers[i].task_ctx = ctx;
             self.workers[i].epoch.store(epoch, .release);
         }
@@ -128,7 +139,59 @@ pub const ThreadPool = struct {
             var spins: usize = 0;
             while (self.workers[i].done_epoch.load(.acquire) != epoch) {
                 spins += 1;
-                if (spins > 500) {
+                if (spins < 10000) {
+                    std.atomic.spinLoopHint();
+                } else {
+                    std.Thread.yield() catch {};
+                }
+            }
+        }
+    }
+
+    pub fn parallelForRange(self: *ThreadPool, total_items: usize, ctx: ?*anyopaque, range_fn: RangeTaskFn) void {
+        if (total_items == 0) return;
+
+        if (self.num_threads <= 1 or total_items == 1) {
+            range_fn(ctx, 0, total_items, 0);
+            return;
+        }
+
+        self.current_epoch += 1;
+        const epoch = self.current_epoch;
+
+        const n_threads = self.num_threads;
+        const chunk_size = (total_items + n_threads - 1) / n_threads;
+
+        // Dispatch chunks to workers (1 .. n_threads - 1)
+        const n_workers = self.workers.len;
+        for (0..n_workers) |i| {
+            const thread_id = i + 1;
+            const start = @min(total_items, thread_id * chunk_size);
+            const end = @min(total_items, start + chunk_size);
+
+            self.workers[i].start = start;
+            self.workers[i].end = end;
+            self.workers[i].task_fn = null;
+            self.workers[i].range_task_fn = range_fn;
+            self.workers[i].task_ctx = ctx;
+            self.workers[i].epoch.store(epoch, .release);
+        }
+
+        // Main thread executes chunk 0
+        const main_start: usize = 0;
+        const main_end = @min(total_items, chunk_size);
+        if (main_end > main_start) {
+            range_fn(ctx, main_start, main_end, 0);
+        }
+
+        // Wait for all workers to complete this epoch
+        for (0..n_workers) |i| {
+            var spins: usize = 0;
+            while (self.workers[i].done_epoch.load(.acquire) != epoch) {
+                spins += 1;
+                if (spins < 10000) {
+                    std.atomic.spinLoopHint();
+                } else {
                     std.Thread.yield() catch {};
                 }
             }

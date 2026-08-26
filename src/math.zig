@@ -128,29 +128,33 @@ pub fn dotBf16F32(a_bytes: []const u8, b: []const f32, n: usize) f32 {
 pub fn dotQ8_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const n_blocks = n_elements / 32;
     const block_size = @sizeOf(BlockQ8_0);
-    var total: f32 = 0.0;
+    const Vec = @Vector(16, f32);
+    var sum0: Vec = @splat(0.0);
+    var sum1: Vec = @splat(0.0);
 
     for (0..n_blocks) |block_idx| {
         const blk: *const BlockQ8_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
         const d: f32 = @floatCast(blk.d);
-        const b_slice = b[block_idx * 32 .. (block_idx + 1) * 32];
+        const vd: Vec = @splat(d);
+        const b_ptr = b.ptr + block_idx * 32;
 
-        var sum: f32 = 0.0;
-        const Vec = @Vector(8, f32);
-        inline for (0..4) |chunk| {
-            var q_f32: [8]f32 = undefined;
-            inline for (0..8) |k| {
-                q_f32[k] = @floatFromInt(blk.qs[chunk * 8 + k]);
-            }
-            const q_vec: Vec = q_f32;
-            const b_vec: Vec = b_slice[chunk * 8 ..][0..8].*;
-            sum += @reduce(.Add, q_vec * b_vec);
+        const vb0: Vec = b_ptr[0..16].*;
+        const vb1: Vec = b_ptr[16..32].*;
+
+        var q0: [16]f32 = undefined;
+        var q1: [16]f32 = undefined;
+        inline for (0..16) |k| {
+            q0[k] = @floatFromInt(blk.qs[k]);
+            q1[k] = @floatFromInt(blk.qs[k + 16]);
         }
+        const vq0: Vec = q0;
+        const vq1: Vec = q1;
 
-        total += sum * d;
+        sum0 += vq0 * vb0 * vd;
+        sum1 += vq1 * vb1 * vd;
     }
 
-    return total;
+    return @reduce(.Add, sum0 + sum1);
 }
 
 pub fn dotQ8_1F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
@@ -184,47 +188,106 @@ pub fn dotQ8_1F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
 pub fn dotQ4_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const n_blocks = n_elements / 32;
     const block_size = @sizeOf(BlockQ4_0);
-    var total: f32 = 0.0;
+    const Vec = @Vector(16, f32);
+    const eight: Vec = @splat(8.0);
+    var sum0: Vec = @splat(0.0);
+    var sum1: Vec = @splat(0.0);
 
-    for (0..n_blocks) |block_idx| {
-        const blk: *const BlockQ4_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        const d: f32 = @floatCast(blk.d);
-        const b_slice = b[block_idx * 32 .. (block_idx + 1) * 32];
+    var block_idx: usize = 0;
+    while (block_idx + 2 <= n_blocks) : (block_idx += 2) {
+        const blk0: *const BlockQ4_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
+        const blk1: *const BlockQ4_0 = @ptrCast(@alignCast(a_bytes[(block_idx + 1) * block_size .. (block_idx + 2) * block_size].ptr));
 
-        var sum: f32 = 0.0;
-        for (0..16) |i| {
-            const qs = blk.qs[i];
-            const v0: f32 = @floatFromInt(@as(i32, @intCast(qs & 0x0F)) - 8);
-            const v1: f32 = @floatFromInt(@as(i32, @intCast((qs >> 4) & 0x0F)) - 8);
-            sum += v0 * b_slice[i] + v1 * b_slice[i + 16];
+        const vd0: Vec = @splat(@as(f32, @floatCast(blk0.d)));
+        const vd1: Vec = @splat(@as(f32, @floatCast(blk1.d)));
+
+        const b_ptr0 = b.ptr + block_idx * 32;
+        const b_ptr1 = b.ptr + (block_idx + 1) * 32;
+
+        const vb0_0: Vec = b_ptr0[0..16].*;
+        const vb0_1: Vec = b_ptr0[16..32].*;
+        const vb1_0: Vec = b_ptr1[0..16].*;
+        const vb1_1: Vec = b_ptr1[16..32].*;
+
+        var v0_0_arr: [16]f32 = undefined;
+        var v0_1_arr: [16]f32 = undefined;
+        var v1_0_arr: [16]f32 = undefined;
+        var v1_1_arr: [16]f32 = undefined;
+
+        inline for (0..16) |k| {
+            const byte0 = blk0.qs[k];
+            v0_0_arr[k] = @floatFromInt(byte0 & 0x0F);
+            v0_1_arr[k] = @floatFromInt(byte0 >> 4);
+
+            const byte1 = blk1.qs[k];
+            v1_0_arr[k] = @floatFromInt(byte1 & 0x0F);
+            v1_1_arr[k] = @floatFromInt(byte1 >> 4);
         }
 
-        total += sum * d;
+        const vq0_0: Vec = v0_0_arr;
+        const vq0_1: Vec = v0_1_arr;
+        const vq1_0: Vec = v1_0_arr;
+        const vq1_1: Vec = v1_1_arr;
+
+        sum0 += (vq0_0 - eight) * vb0_0 * vd0 + (vq1_0 - eight) * vb1_0 * vd1;
+        sum1 += (vq0_1 - eight) * vb0_1 * vd0 + (vq1_1 - eight) * vb1_1 * vd1;
     }
 
-    return total;
+    while (block_idx < n_blocks) : (block_idx += 1) {
+        const blk: *const BlockQ4_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
+        const d: f32 = @floatCast(blk.d);
+        const vd: Vec = @splat(d);
+        const b_ptr = b.ptr + block_idx * 32;
+
+        const vb0: Vec = b_ptr[0..16].*;
+        const vb1: Vec = b_ptr[16..32].*;
+
+        var v0_arr: [16]f32 = undefined;
+        var v1_arr: [16]f32 = undefined;
+        inline for (0..16) |k| {
+            const byte = blk.qs[k];
+            v0_arr[k] = @floatFromInt(byte & 0x0F);
+            v1_arr[k] = @floatFromInt(byte >> 4);
+        }
+
+        const vq0: Vec = v0_arr;
+        const vq1: Vec = v1_arr;
+
+        sum0 += (vq0 - eight) * vb0 * vd;
+        sum1 += (vq1 - eight) * vb1 * vd;
+    }
+
+    return @reduce(.Add, sum0 + sum1);
 }
 
 pub fn dotQ4_1F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const n_blocks = n_elements / 32;
     const block_size = @sizeOf(BlockQ4_1);
+    const Vec = @Vector(16, f32);
     var total: f32 = 0.0;
 
     for (0..n_blocks) |block_idx| {
         const blk: *const BlockQ4_1 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
         const d: f32 = @floatCast(blk.d);
         const m: f32 = @floatCast(blk.m);
-        const b_slice = b[block_idx * 32 .. (block_idx + 1) * 32];
+        const b_ptr = b.ptr + block_idx * 32;
 
-        var sum_q: f32 = 0.0;
-        var sum_b: f32 = 0.0;
-        for (0..16) |i| {
-            const qs = blk.qs[i];
-            const v0: f32 = @floatFromInt(qs & 0x0F);
-            const v1: f32 = @floatFromInt((qs >> 4) & 0x0F);
-            sum_q += v0 * b_slice[i] + v1 * b_slice[i + 16];
-            sum_b += b_slice[i] + b_slice[i + 16];
+        const vb0: Vec = b_ptr[0..16].*;
+        const vb1: Vec = b_ptr[16..32].*;
+
+        var v0_arr: [16]f32 = undefined;
+        var v1_arr: [16]f32 = undefined;
+        inline for (0..16) |k| {
+            const byte = blk.qs[k];
+            v0_arr[k] = @floatFromInt(byte & 0x0F);
+            v1_arr[k] = @floatFromInt(byte >> 4);
         }
+
+        const vq0: Vec = v0_arr;
+        const vq1: Vec = v1_arr;
+
+        const sum_q = @reduce(.Add, vq0 * vb0 + vq1 * vb1);
+        const sum_b = @reduce(.Add, vb0 + vb1);
 
         total += sum_q * d + sum_b * m;
     }
@@ -235,13 +298,34 @@ pub fn dotQ4_1F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
 pub fn dotQ5_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const n_blocks = n_elements / 32;
     const block_size = @sizeOf(BlockQ5_0);
+    const Vec = @Vector(16, f32);
+    const sixteen: Vec = @splat(16.0);
     var total: f32 = 0.0;
 
-    var temp_buf: [32]f32 = undefined;
     for (0..n_blocks) |block_idx| {
         const blk: *const BlockQ5_0 = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        quant.dequantizeQ5_0(blk, &temp_buf);
-        total += dotF32F32(&temp_buf, b[block_idx * 32 .. (block_idx + 1) * 32]);
+        const d: f32 = @floatCast(blk.d);
+        const b_ptr = b.ptr + block_idx * 32;
+        const qh = std.mem.readInt(u32, blk.qh[0..4], .little);
+
+        const vb0: Vec = b_ptr[0..16].*;
+        const vb1: Vec = b_ptr[16..32].*;
+
+        var v0_arr: [16]f32 = undefined;
+        var v1_arr: [16]f32 = undefined;
+        inline for (0..16) |k| {
+            const qs = blk.qs[k];
+            const h0: u8 = if ((qh & (@as(u32, 1) << @intCast(k))) != 0) 16 else 0;
+            const h1: u8 = if ((qh & (@as(u32, 1) << @intCast(k + 16))) != 0) 16 else 0;
+
+            v0_arr[k] = @floatFromInt((qs & 0x0F) | h0);
+            v1_arr[k] = @floatFromInt((qs >> 4) | h1);
+        }
+
+        const vq0: Vec = v0_arr;
+        const vq1: Vec = v1_arr;
+
+        total += @reduce(.Add, (vq0 - sixteen) * vb0 + (vq1 - sixteen) * vb1) * d;
     }
 
     return total;
@@ -295,16 +379,59 @@ pub fn dotQ3_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
 pub fn dotQ4_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const n_blocks = n_elements / 256;
     const block_size = @sizeOf(BlockQ4_K);
-    var total: f32 = 0.0;
+    const Vec = @Vector(16, f32);
+    var total_sum: Vec = @splat(0.0);
 
-    var temp_buf: [256]f32 = undefined;
     for (0..n_blocks) |block_idx| {
         const blk: *const BlockQ4_K = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        quant.dequantizeQ4_K(blk, &temp_buf);
-        total += dotF32F32(&temp_buf, b[block_idx * 256 .. (block_idx + 1) * 256]);
+        const d: f32 = @floatCast(blk.d);
+        const min: f32 = @floatCast(blk.dmin);
+        const b_ptr = b.ptr + block_idx * 256;
+
+        var scales: [8]u8 = undefined;
+        var mins: [8]u8 = undefined;
+
+        inline for (0..4) |j| {
+            scales[j] = blk.scales[j] & 63;
+            mins[j] = blk.scales[j + 4] & 63;
+            scales[j + 4] = (blk.scales[j + 8] & 0x0F) | ((blk.scales[j] >> 6) << 4);
+            mins[j + 4] = (blk.scales[j + 8] >> 4) | ((blk.scales[j + 4] >> 6) << 4);
+        }
+
+        var qs_idx: usize = 0;
+        var b_idx: usize = 0;
+
+        for (0..4) |j| {
+            const vd0: Vec = @splat(d * @as(f32, @floatFromInt(scales[2 * j])));
+            const vm0: Vec = @splat(min * @as(f32, @floatFromInt(mins[2 * j])));
+            const vd1: Vec = @splat(d * @as(f32, @floatFromInt(scales[2 * j + 1])));
+            const vm1: Vec = @splat(min * @as(f32, @floatFromInt(mins[2 * j + 1])));
+
+            for (0..2) |half| {
+                const off = half * 16;
+                var q0_arr: [16]f32 = undefined;
+                var q1_arr: [16]f32 = undefined;
+
+                inline for (0..16) |k| {
+                    const q = blk.qs[qs_idx + off + k];
+                    q0_arr[k] = @floatFromInt(q & 0x0F);
+                    q1_arr[k] = @floatFromInt(q >> 4);
+                }
+
+                const vq0: Vec = q0_arr;
+                const vq1: Vec = q1_arr;
+                const vb0: Vec = b_ptr[b_idx + off ..][0..16].*;
+                const vb1: Vec = b_ptr[b_idx + 32 + off ..][0..16].*;
+
+                total_sum += (vq0 * vd0 - vm0) * vb0 + (vq1 * vd1 - vm1) * vb1;
+            }
+
+            qs_idx += 32;
+            b_idx += 64;
+        }
     }
 
-    return total;
+    return @reduce(.Add, total_sum);
 }
 
 pub fn dotQ5_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
@@ -312,11 +439,54 @@ pub fn dotQ5_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const block_size = @sizeOf(BlockQ5_K);
     var total: f32 = 0.0;
 
-    var temp_buf: [256]f32 = undefined;
     for (0..n_blocks) |block_idx| {
         const blk: *const BlockQ5_K = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        quant.dequantizeQ5_K(blk, &temp_buf);
-        total += dotF32F32(&temp_buf, b[block_idx * 256 .. (block_idx + 1) * 256]);
+        const d: f32 = @floatCast(blk.d);
+        const min: f32 = @floatCast(blk.dmin);
+        const b_ptr = b.ptr + block_idx * 256;
+
+        var scales: [8]u8 = undefined;
+        var mins: [8]u8 = undefined;
+
+        inline for (0..4) |j| {
+            scales[j] = blk.scales[j] & 63;
+            mins[j] = blk.scales[j + 4] & 63;
+            scales[j + 4] = (blk.scales[j + 8] & 0x0F) | ((blk.scales[j] >> 6) << 4);
+            mins[j + 4] = (blk.scales[j + 8] >> 4) | ((blk.scales[j + 4] >> 6) << 4);
+        }
+
+        var ql_idx: usize = 0;
+        var b_idx: usize = 0;
+        var mask1: u8 = 1;
+        var mask2: u8 = 2;
+        var block_sum: f32 = 0.0;
+
+        for (0..4) |j| {
+            const d0 = d * @as(f32, @floatFromInt(scales[2 * j]));
+            const m0 = min * @as(f32, @floatFromInt(mins[2 * j]));
+            const d1 = d * @as(f32, @floatFromInt(scales[2 * j + 1]));
+            const m1 = min * @as(f32, @floatFromInt(mins[2 * j + 1]));
+
+            for (0..32) |l| {
+                const ql = blk.qs[ql_idx + l];
+                const qh = blk.qh[l];
+
+                const h0: u8 = if ((qh & mask1) != 0) 16 else 0;
+                const h1: u8 = if ((qh & mask2) != 0) 16 else 0;
+
+                const v0 = @as(f32, @floatFromInt((ql & 0x0F) | h0)) * d0 - m0;
+                const v1 = @as(f32, @floatFromInt(((ql >> 4) & 0x0F) | h1)) * d1 - m1;
+
+                block_sum += v0 * b_ptr[b_idx + l] + v1 * b_ptr[b_idx + 32 + l];
+            }
+
+            ql_idx += 32;
+            b_idx += 64;
+            mask1 <<= 2;
+            mask2 <<= 2;
+        }
+
+        total += block_sum;
     }
 
     return total;
@@ -325,16 +495,63 @@ pub fn dotQ5_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
 pub fn dotQ6_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const n_blocks = n_elements / 256;
     const block_size = @sizeOf(BlockQ6_K);
-    var total: f32 = 0.0;
+    const Vec = @Vector(16, f32);
+    var total_sum: Vec = @splat(0.0);
 
-    var temp_buf: [256]f32 = undefined;
     for (0..n_blocks) |block_idx| {
         const blk: *const BlockQ6_K = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        quant.dequantizeQ6_K(blk, &temp_buf);
-        total += dotF32F32(&temp_buf, b[block_idx * 256 .. (block_idx + 1) * 256]);
+        const d: f32 = @floatCast(blk.d);
+        const vd: Vec = @splat(d);
+        const b_ptr = b.ptr + block_idx * 256;
+
+        for (0..2) |n| {
+            const ql_offset = n * 64;
+            const qh_offset = n * 32;
+            const sc_offset = n * 8;
+            const b_offset = n * 128;
+
+            for (0..2) |chunk| {
+                const l_start = chunk * 16;
+                const is = chunk;
+
+                var q1_arr: [16]f32 = undefined;
+                var q2_arr: [16]f32 = undefined;
+                var q3_arr: [16]f32 = undefined;
+                var q4_arr: [16]f32 = undefined;
+
+                inline for (0..16) |k| {
+                    const l = l_start + k;
+                    const ql_l = blk.ql[ql_offset + l];
+                    const ql_l32 = blk.ql[ql_offset + l + 32];
+                    const qh_l = blk.qh[qh_offset + l];
+
+                    q1_arr[k] = @floatFromInt(@as(i32, @intCast((ql_l & 0x0F) | (((qh_l >> 0) & 3) << 4))) - 32);
+                    q2_arr[k] = @floatFromInt(@as(i32, @intCast((ql_l32 & 0x0F) | (((qh_l >> 2) & 3) << 4))) - 32);
+                    q3_arr[k] = @floatFromInt(@as(i32, @intCast((ql_l >> 4) | (((qh_l >> 4) & 3) << 4))) - 32);
+                    q4_arr[k] = @floatFromInt(@as(i32, @intCast((ql_l32 >> 4) | (((qh_l >> 6) & 3) << 4))) - 32);
+                }
+
+                const s1: Vec = @splat(@as(f32, @floatFromInt(blk.scales[sc_offset + is + 0])));
+                const s2: Vec = @splat(@as(f32, @floatFromInt(blk.scales[sc_offset + is + 2])));
+                const s3: Vec = @splat(@as(f32, @floatFromInt(blk.scales[sc_offset + is + 4])));
+                const s4: Vec = @splat(@as(f32, @floatFromInt(blk.scales[sc_offset + is + 6])));
+
+                const vb1: Vec = b_ptr[b_offset + l_start + 0 ..][0..16].*;
+                const vb2: Vec = b_ptr[b_offset + l_start + 32 ..][0..16].*;
+                const vb3: Vec = b_ptr[b_offset + l_start + 64 ..][0..16].*;
+                const vb4: Vec = b_ptr[b_offset + l_start + 96 ..][0..16].*;
+
+                const vq1: Vec = q1_arr;
+                const vq2: Vec = q2_arr;
+                const vq3: Vec = q3_arr;
+                const vq4: Vec = q4_arr;
+
+                total_sum += (vq1 * s1 * vb1 + vq2 * s2 * vb2 + vq3 * s3 * vb3 + vq4 * s4 * vb4) * vd;
+            }
+        }
     }
 
-    return total;
+    return @reduce(.Add, total_sum);
 }
 
 pub fn dotQ8_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
@@ -342,11 +559,15 @@ pub fn dotQ8_KF32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
     const block_size = @sizeOf(BlockQ8_K);
     var total: f32 = 0.0;
 
-    var temp_buf: [256]f32 = undefined;
     for (0..n_blocks) |block_idx| {
         const blk: *const BlockQ8_K = @ptrCast(@alignCast(a_bytes[block_idx * block_size .. (block_idx + 1) * block_size].ptr));
-        quant.dequantizeQ8_K(blk, &temp_buf);
-        total += dotF32F32(&temp_buf, b[block_idx * 256 .. (block_idx + 1) * 256]);
+        const d = blk.d;
+        const b_ptr = b.ptr + block_idx * 256;
+        var sum: f32 = 0.0;
+        for (0..256) |i| {
+            sum += @as(f32, @floatFromInt(blk.qs[i])) * b_ptr[i];
+        }
+        total += sum * d;
     }
 
     return total;
@@ -429,11 +650,20 @@ pub const GemvContext = struct {
     cols: usize,
 };
 
-fn gemvWorker(ctx_ptr: ?*anyopaque, row_idx: usize, _: usize) void {
+fn gemvRangeWorker(ctx_ptr: ?*anyopaque, start: usize, end: usize, _: usize) void {
     const ctx: *const GemvContext = @ptrCast(@alignCast(ctx_ptr.?));
-    const row_start = row_idx * ctx.row_bytes;
-    const row_data = ctx.weight_data[row_start .. row_start + ctx.row_bytes];
-    ctx.y[row_idx] = dotRow(ctx.qtype, row_data, ctx.x, ctx.cols);
+    const row_bytes = ctx.row_bytes;
+    const qtype = ctx.qtype;
+    const weight_data = ctx.weight_data;
+    const x = ctx.x;
+    const y = ctx.y;
+    const cols = ctx.cols;
+
+    for (start..end) |r| {
+        const row_start = r * row_bytes;
+        const row_data = weight_data[row_start .. row_start + row_bytes];
+        y[r] = dotRow(qtype, row_data, x, cols);
+    }
 }
 
 pub fn gemv(
@@ -459,11 +689,9 @@ pub fn gemv(
     };
 
     if (pool) |p| {
-        p.parallelFor(rows, &ctx, gemvWorker);
+        p.parallelForRange(rows, &ctx, gemvRangeWorker);
     } else {
-        for (0..rows) |r| {
-            gemvWorker(&ctx, r, 0);
-        }
+        gemvRangeWorker(&ctx, 0, rows, 0);
     }
 }
 

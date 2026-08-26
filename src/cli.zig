@@ -93,6 +93,8 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
             if (arg_it.next()) |v| args.max_tokens = std.fmt.parseInt(usize, v, 10) catch 256;
         } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
             if (arg_it.next()) |v| args.threads = std.fmt.parseInt(usize, v, 10) catch null;
+        } else if (std.mem.eql(u8, arg, "--greedy")) {
+            args.temperature = 0.0;
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (arg_it.next()) |v| args.port = std.fmt.parseInt(u16, v, 10) catch 8080;
         } else if (std.mem.eql(u8, arg, "--seed")) {
