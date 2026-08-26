@@ -42,12 +42,12 @@ pub const Sampler = struct {
             return sampleGreedy(logits);
         }
 
-        // Initialize candidates
+        // Initialize candidates (masking pad token 0)
         for (0..vocab_size) |i| {
             self.candidates[i] = .{
                 .id = @intCast(i),
                 .prob = 0.0,
-                .logit = logits[i],
+                .logit = if (i == 0) -1e9 else logits[i],
             };
         }
         var active_count: usize = vocab_size;
@@ -157,9 +157,10 @@ pub const Sampler = struct {
     }
 
     pub fn sampleGreedy(logits: []const f32) u32 {
-        var max_idx: usize = 0;
-        var max_val: f32 = logits[0];
-        for (logits[1..], 1..) |val, i| {
+        if (logits.len <= 1) return 0;
+        var max_idx: usize = 1;
+        var max_val: f32 = logits[1];
+        for (logits[2..], 2..) |val, i| {
             if (val > max_val) {
                 max_val = val;
                 max_idx = i;
@@ -180,8 +181,8 @@ test "Sampler stochastic selection" {
     var sampler = try Sampler.init(allocator, 4, 1234);
     defer sampler.deinit();
 
-    const logits = [_]f32{ 10.0, 0.0, 0.0, 0.0 };
+    const logits = [_]f32{ 0.0, 10.0, 0.0, 0.0 };
     const history = [_]u32{};
     const sampled = sampler.sample(&logits, &history, .{ .temperature = 0.7 });
-    try std.testing.expectEqual(@as(u32, 0), sampled);
+    try std.testing.expectEqual(@as(u32, 1), sampled);
 }

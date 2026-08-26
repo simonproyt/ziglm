@@ -734,8 +734,9 @@ pub fn gemv(
         .cols = cols,
     };
 
-    if (pool) |p| {
-        p.parallelForRange(rows, &ctx, gemvRangeWorker);
+    // For smaller matrices or projections, avoid thread dispatch overhead
+    if (pool != null and rows >= 64 and (rows * cols) >= 32768) {
+        pool.?.parallelForRange(rows, &ctx, gemvRangeWorker);
     } else {
         gemvRangeWorker(&ctx, 0, rows, 0);
     }

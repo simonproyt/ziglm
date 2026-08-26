@@ -10,7 +10,9 @@ const KVCache = @import("kv_cache.zig").KVCache;
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const math = @import("math.zig");
 const quant = @import("quant.zig");
-const VisionEncoder = @import("vision.zig").VisionEncoder;
+const vision = @import("vision.zig");
+const VisionEncoder = vision.VisionEncoder;
+const VisionLayerWeights = vision.VisionLayerWeights;
 
 pub const LayerWeights = struct {
     // Layernorms
@@ -302,7 +304,7 @@ pub const TransformerModel = struct {
         const emb_proj = gguf.getTensor("v.embedding_projection.weight") orelse gguf.getTensor("vision.embedding_projection.weight");
 
         self.vision_encoder = if (patch_proj != null or emb_proj != null)
-            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj)
+            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj, &[_]vision.VisionLayerWeights{})
         else
             null;
 
@@ -445,8 +447,52 @@ pub const TransformerModel = struct {
         const pos_emb = st.getTensor("model.vision_tower.patch_embedder.position_embedding_table") orelse st.getTensor("vision_tower.patch_embedder.position_embedding_table");
         const emb_proj = st.getTensor("model.embed_vision.embedding_projection.weight") orelse st.getTensor("embed_vision.embedding_projection.weight");
 
-        self.vision_encoder = if (patch_proj != null or emb_proj != null)
-            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj)
+        // Load 16 Vision Transformer layers from SafeTensors
+        var vision_layers = std.ArrayList(vision.VisionLayerWeights).empty;
+        for (0..16) |l_idx| {
+            var v_name: [128]u8 = undefined;
+            const q_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.q_proj.linear.weight", .{l_idx}) catch break;
+            const q_proj = st.getTensor(q_proj_name) orelse break;
+
+            const in_ln_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.input_layernorm.weight", .{l_idx}) catch break;
+            const post_attn_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.post_attention_layernorm.weight", .{l_idx}) catch break;
+            const pre_ffn_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.pre_feedforward_layernorm.weight", .{l_idx}) catch break;
+            const post_ffn_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.post_feedforward_layernorm.weight", .{l_idx}) catch break;
+
+            const k_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.k_proj.linear.weight", .{l_idx}) catch break;
+            const v_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.v_proj.linear.weight", .{l_idx}) catch break;
+            const o_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.o_proj.linear.weight", .{l_idx}) catch break;
+
+            const q_norm_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.q_norm.weight", .{l_idx}) catch break;
+            const k_norm_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.k_norm.weight", .{l_idx}) catch break;
+
+            const gate_proj_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.mlp.gate_proj.linear.weight", .{l_idx}) catch break;
+            const up_proj_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.mlp.up_proj.linear.weight", .{l_idx}) catch break;
+            const down_proj_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.mlp.down_proj.linear.weight", .{l_idx}) catch break;
+
+            try vision_layers.append(allocator, .{
+                .input_layernorm = try loadNorm(allocator, st.getTensor(in_ln_name), 768),
+                .post_attention_layernorm = try loadNorm(allocator, st.getTensor(post_attn_name), 768),
+                .pre_feedforward_layernorm = try loadNorm(allocator, st.getTensor(pre_ffn_name), 768),
+                .post_feedforward_layernorm = try loadNorm(allocator, st.getTensor(post_ffn_name), 768),
+                .q_proj = q_proj,
+                .k_proj = st.getTensor(k_proj_name),
+                .v_proj = st.getTensor(v_proj_name),
+                .o_proj = st.getTensor(o_proj_name),
+                .q_norm = try loadNorm(allocator, st.getTensor(q_norm_n), 64),
+                .k_norm = try loadNorm(allocator, st.getTensor(k_norm_n), 64),
+                .gate_proj = st.getTensor(gate_proj_n),
+                .up_proj = st.getTensor(up_proj_n),
+                .down_proj = st.getTensor(down_proj_n),
+            });
+        }
+        const v_layers_slice = try vision_layers.toOwnedSlice(allocator);
+        if (v_layers_slice.len > 0) {
+            std.debug.print("  Loaded {d} Vision Transformer layers from SafeTensors\n", .{v_layers_slice.len});
+        }
+
+        self.vision_encoder = if (patch_proj != null or emb_proj != null or v_layers_slice.len > 0)
+            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj, v_layers_slice)
         else
             null;
 
@@ -454,6 +500,7 @@ pub const TransformerModel = struct {
     }
 
     pub fn deinit(self: *TransformerModel) void {
+        if (self.vision_encoder) |*ve| ve.deinit();
         for (self.layers) |layer| {
             if (layer.input_layernorm) |n| self.allocator.free(n);
             if (layer.post_attention_layernorm) |n| self.allocator.free(n);

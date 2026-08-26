@@ -18,7 +18,8 @@ const KVCache = @import("kv_cache.zig").KVCache;
 const Sampler = @import("sampler.zig").Sampler;
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const Image = @import("image.zig").Image;
-const VisionEncoder = @import("vision.zig").VisionEncoder;
+const vision = @import("vision.zig");
+const VisionEncoder = vision.VisionEncoder;
 
 pub const ModelFormat = enum {
     gguf,
@@ -262,43 +263,90 @@ pub const Engine = struct {
         if (self.model.vision_encoder) |*v_enc| {
             return v_enc.encodeImage(self.allocator, &img, self.thread_pool);
         } else {
-            const enc = VisionEncoder.init(self.allocator, null, null, null);
+            const enc = vision.VisionEncoder.init(self.allocator, null, null, null, &[_]vision.VisionLayerWeights{});
             return enc.encodeImage(self.allocator, &img, self.thread_pool);
         }
     }
+
+    pub const PrefillResult = struct {
+        logits: []const f32,
+        pos: usize,
+    };
 
     pub fn prefillMultimodal(
         self: *Engine,
         tokens: []const u32,
         image_embeddings: ?[]const f32,
         image_patch_count: usize,
-    ) ![]const f32 {
+    ) !PrefillResult {
         if (tokens.len == 0 and image_patch_count == 0) return error.EmptyPrompt;
-        const total_len = tokens.len + image_patch_count;
+
+        // Check if there is an image placeholder token (<|image|> or <|image>)
+        var image_tok_pos: ?usize = null;
+        for (tokens, 0..) |tok, idx| {
+            const s = self.tokenizer.decode(tok);
+            if (std.mem.eql(u8, s, "<|image|>") or std.mem.eql(u8, s, "<|image>") or tok == 258880 or tok == 255999) {
+                image_tok_pos = idx;
+                break;
+            }
+        }
+
+        const total_len = tokens.len + (if (image_embeddings != null) (if (image_tok_pos != null) image_patch_count + 1 else image_patch_count + 2) else 0);
         if (total_len > self.max_seq_len) return error.PromptExceedsContext;
 
         const dim = self.model.params.embedding_length;
         var last_logits: []const f32 = undefined;
         var pos: usize = 0;
+        var inserted_image = false;
 
-        if (image_embeddings) |emb| {
-            for (0..image_patch_count) |p| {
-                const patch_emb = emb[p * dim .. (p + 1) * dim];
-                const is_last = (pos == total_len - 1);
+        for (tokens, 0..) |tok, idx| {
+            if (image_embeddings != null and !inserted_image and (image_tok_pos == null or idx == image_tok_pos.?)) {
+                const emb = image_embeddings.?;
+                // 1. Beginning of Image token: <|image>
                 last_logits = try self.model.forwardWithEmbedding(
-                    patch_emb,
-                    258880,
+                    null,
+                    255999,
                     pos,
                     self.kv_cache,
                     self.buffers,
                     self.thread_pool,
-                    is_last,
+                    false,
                 );
                 pos += 1;
-            }
-        }
 
-        for (tokens) |tok| {
+                // 2. Image patch embeddings
+                for (0..image_patch_count) |p| {
+                    const patch_emb = emb[p * dim .. (p + 1) * dim];
+                    last_logits = try self.model.forwardWithEmbedding(
+                        patch_emb,
+                        258880,
+                        pos,
+                        self.kv_cache,
+                        self.buffers,
+                        self.thread_pool,
+                        false,
+                    );
+                    pos += 1;
+                }
+
+                // 3. End of Image token: <image|>
+                last_logits = try self.model.forwardWithEmbedding(
+                    null,
+                    258882,
+                    pos,
+                    self.kv_cache,
+                    self.buffers,
+                    self.thread_pool,
+                    false,
+                );
+                pos += 1;
+
+                inserted_image = true;
+                if (image_tok_pos != null) {
+                    continue; // Token placeholder replaced by image patches
+                }
+            }
+
             const is_last = (pos == total_len - 1);
             last_logits = try self.model.forwardWithEmbedding(
                 null,
@@ -312,7 +360,10 @@ pub const Engine = struct {
             pos += 1;
         }
 
-        return last_logits;
+        return PrefillResult{
+            .logits = last_logits,
+            .pos = pos,
+        };
     }
 
     pub fn generate(
@@ -320,7 +371,7 @@ pub const Engine = struct {
         prompt: []const u8,
         options: GenerationOptions,
         callback_ctx: ?*anyopaque,
-        callback: ?TokenCallback,
+        callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
     ) !GenerationStats {
         return self.generateWithImage(prompt, null, options, callback_ctx, callback);
     }
@@ -331,7 +382,7 @@ pub const Engine = struct {
         image_path: ?[]const u8,
         options: GenerationOptions,
         callback_ctx: ?*anyopaque,
-        callback: ?TokenCallback,
+        callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
     ) !GenerationStats {
         var stats = GenerationStats{};
         const t_start = getTimestampNs();
@@ -359,7 +410,8 @@ pub const Engine = struct {
 
         // 2. Prefill phase
         const t_prefill_start = getTimestampNs();
-        var logits = try self.prefillMultimodal(prompt_tokens, image_embeddings, image_patches);
+        const prefill_res = try self.prefillMultimodal(prompt_tokens, image_embeddings, image_patches);
+        var logits = prefill_res.logits;
         const t_prefill_end = getTimestampNs();
         stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
 
@@ -375,10 +427,18 @@ pub const Engine = struct {
 
         // 3. Autoregressive Generation phase
         const t_gen_start = getTimestampNs();
-        var cur_pos = prompt_tokens.len + image_patches;
+        var cur_pos = prefill_res.pos;
         var completion_count: usize = 0;
 
         var prev_token = self.sampler.sample(logits, history.items, options.sampler);
+        if (self.tokenizer.isEosToken(prev_token)) {
+            const t_now = getTimestampNs();
+            stats.completion_tokens = 0;
+            stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
+            stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
+            return stats;
+        }
+
         try history.append(self.allocator, prev_token);
         completion_count += 1;
 
@@ -393,24 +453,22 @@ pub const Engine = struct {
             }
         }
 
-        const eos_id = self.tokenizer.eos_token_id;
-
         while (completion_count < options.max_tokens and cur_pos < self.max_seq_len) {
-            if (eos_id != null and prev_token == eos_id.?) break;
+            logits = try self.decode(prev_token, cur_pos);
+            cur_pos += 1;
+
+            const next_token = self.sampler.sample(logits, history.items, options.sampler);
+            if (self.tokenizer.isEosToken(next_token)) break;
 
             var is_stop = false;
             for (options.stop_tokens) |stop_id| {
-                if (prev_token == stop_id) {
+                if (next_token == stop_id) {
                     is_stop = true;
                     break;
                 }
             }
             if (is_stop) break;
 
-            logits = try self.decode(prev_token, cur_pos);
-            cur_pos += 1;
-
-            const next_token = self.sampler.sample(logits, history.items, options.sampler);
             try history.append(self.allocator, next_token);
             completion_count += 1;
             prev_token = next_token;

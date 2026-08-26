@@ -113,6 +113,34 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
     return args;
 }
 
+fn unescapePrompt(allocator: std.mem.Allocator, input: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, input, "\\n") == null and std.mem.indexOf(u8, input, "\\t") == null) {
+        return input;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '\\' and i + 1 < input.len) {
+            if (input[i + 1] == 'n') {
+                out.append(allocator, '\n') catch return input;
+                i += 2;
+                continue;
+            } else if (input[i + 1] == 't') {
+                out.append(allocator, '\t') catch return input;
+                i += 2;
+                continue;
+            } else if (input[i + 1] == '\\') {
+                out.append(allocator, '\\') catch return input;
+                i += 2;
+                continue;
+            }
+        }
+        out.append(allocator, input[i]) catch return input;
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator) catch input;
+}
+
 fn printTokenStdout(_: ?*anyopaque, token_str: []const u8, _: u32) bool {
     const stdout = std.posix.STDOUT_FILENO;
     _ = std.posix.system.write(stdout, token_str.ptr, token_str.len);
@@ -248,11 +276,13 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
             },
         };
 
+        const clean_prompt = unescapePrompt(allocator, args.prompt);
+
         if (args.image_path) |img| {
             std.debug.print("Processing multimodal image: {s} ...\n", .{img});
         }
 
-        const stats = try engine.generateWithImage(args.prompt, args.image_path, options, null, printTokenStdout);
+        const stats = try engine.generateWithImage(clean_prompt, args.image_path, options, null, printTokenStdout);
 
         std.debug.print("\n\n────────────────────────────────────────\n", .{});
         std.debug.print("⚡ Prefill:    {d:.1} tok/s ({d} tokens in {d:.1} ms)\n", .{

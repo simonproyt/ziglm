@@ -352,6 +352,15 @@ pub const Tokenizer = struct {
             "<tool_call|>",
             "<|tool_response>",
             "<tool_response|>",
+            "<|image|>",
+            "<|image>",
+            "<image|>",
+            "<|audio|>",
+            "<|audio>",
+            "<audio|>",
+            "<|video|>",
+            "<|video>",
+            "<video|>",
         };
 
         var text_idx: usize = 0;
@@ -525,6 +534,26 @@ pub const Tokenizer = struct {
         }
 
         return decode_buf[0..out_idx];
+    }
+
+    pub fn isEosToken(self: *const Tokenizer, token_id: u32) bool {
+        if (self.eos_token_id) |eos| {
+            if (token_id == eos) return true;
+        }
+        if (token_id == 1 or token_id == 106) return true;
+        if (token_id < self.tokens.len) {
+            const raw_text = self.tokens[token_id].text;
+            if (std.mem.eql(u8, raw_text, "<eos>") or
+                std.mem.eql(u8, raw_text, "</s>") or
+                std.mem.eql(u8, raw_text, "<|end_of_text|>") or
+                std.mem.eql(u8, raw_text, "<|eot_id|>") or
+                std.mem.eql(u8, raw_text, "<turn|>") or
+                std.mem.eql(u8, raw_text, "<end_of_turn>"))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn applyChatTemplate(

@@ -16,5 +16,9 @@ zig build -Doptimize=ReleaseFast
 ```sh 
 ./zig-out/bin/ziglm run -m <path_to_the_model_folder> -p "<prompt>" --greedy -n <number_of_tokens_to_generate>
 ```
+# Dependencies 
+- a zig complier (if you want to compile everything from source)
+- imagemagick/convert/ffmpeg for image converion for multimodal models
+
 
 more coming soontm
