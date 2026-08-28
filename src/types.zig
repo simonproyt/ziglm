@@ -27,7 +27,7 @@ pub const GGMLType = enum(u32) {
     IQ2_S = 24,
     IQ4_XS = 25,
     I8_0 = 26,
-    BF16 = 27,
+    BF16 = 30,
     _,
 
     pub fn blockSize(self: GGMLType) usize {

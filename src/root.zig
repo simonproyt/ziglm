@@ -15,6 +15,9 @@ pub const synthetic = @import("synthetic.zig");
 pub const cli = @import("cli.zig");
 pub const image = @import("image.zig");
 pub const vision = @import("vision.zig");
+pub const audio = @import("audio.zig");
+pub const video = @import("video.zig");
+pub const backend = @import("backend.zig");
 
 // Direct public exports for ergonomic library usage
 pub const Engine = engine.Engine;
@@ -31,6 +34,10 @@ pub const GenerationOptions = types.GenerationOptions;
 pub const GenerationStats = types.GenerationStats;
 pub const Image = image.Image;
 pub const VisionEncoder = vision.VisionEncoder;
+pub const AudioData = audio.AudioData;
+pub const LogMelSpectrogram = audio.LogMelSpectrogram;
+pub const Video = video.Video;
+pub const Backend = backend.Backend;
 
 test {
     _ = types;
@@ -48,4 +55,7 @@ test {
     _ = cli;
     _ = image;
     _ = vision;
+    _ = audio;
+    _ = video;
+    _ = backend;
 }

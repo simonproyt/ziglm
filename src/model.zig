@@ -11,6 +11,7 @@ const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const math = @import("math.zig");
 const quant = @import("quant.zig");
 const vision = @import("vision.zig");
+const audio = @import("audio.zig");
 const VisionEncoder = vision.VisionEncoder;
 const VisionLayerWeights = vision.VisionLayerWeights;
 
@@ -128,6 +129,7 @@ pub const TransformerModel = struct {
     output_norm: []const f32,
     output: ?Tensor = null,
     layers: []LayerWeights,
+    audio_encoder: ?audio.AudioEncoder = null,
     vision_encoder: ?VisionEncoder = null,
 
     fn loadNorm(allocator: std.mem.Allocator, t_opt: ?Tensor, len: usize) !?[]const f32 {
@@ -309,6 +311,136 @@ pub const TransformerModel = struct {
             null;
 
         return self;
+    }
+
+    pub fn loadMMPROJ(self: *TransformerModel, allocator: std.mem.Allocator, gguf: *const GGUFFile) !void {
+        const patch_proj = gguf.getTensor("v.patch_embedder.input_proj.weight") orelse
+            gguf.getTensor("v.patch_embd.weight") orelse
+            gguf.getTensor("mm.patch_embd.weight");
+
+        const pos_emb = gguf.getTensor("v.position_embd.weight") orelse
+            gguf.getTensor("v.patch_embedder.position_embedding_table") orelse
+            gguf.getTensor("v.position_embedding_table");
+
+        const emb_proj = gguf.getTensor("mm.input_projection.weight") orelse
+            gguf.getTensor("v.embedding_projection.weight") orelse
+            gguf.getTensor("mm.0.weight");
+
+        var vision_layers: std.ArrayList(vision.VisionLayerWeights) = .empty;
+        errdefer vision_layers.deinit(allocator);
+
+        for (0..32) |l_idx| {
+            var buf: [128]u8 = undefined;
+            const q_name = std.fmt.bufPrint(&buf, "v.blk.{d}.attn_q.weight", .{l_idx}) catch break;
+            const q_proj = gguf.getTensor(q_name);
+            if (q_proj == null) break;
+
+            var layer = vision.VisionLayerWeights{};
+            layer.q_proj = q_proj;
+
+            var name_buf: [128]u8 = undefined;
+            layer.input_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ln1.weight", .{l_idx})), 768);
+            layer.post_attention_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ln2.weight", .{l_idx})), 768);
+            layer.q_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_q.weight", .{l_idx}));
+            layer.k_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_k.weight", .{l_idx}));
+            layer.v_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_v.weight", .{l_idx}));
+            layer.o_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_out.weight", .{l_idx}));
+            layer.gate_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_gate.weight", .{l_idx}));
+            layer.up_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_up.weight", .{l_idx}));
+            layer.down_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_down.weight", .{l_idx}));
+            layer.q_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_q_norm.weight", .{l_idx})), 72);
+            layer.k_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_k_norm.weight", .{l_idx})), 72);
+            layer.pre_feedforward_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_pre_norm.weight", .{l_idx})), 768);
+            layer.post_feedforward_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_post_norm.weight", .{l_idx})), 768);
+
+            try vision_layers.append(allocator, layer);
+        }
+
+        const v_layers_slice = vision_layers.toOwnedSlice(allocator) catch |e| {
+            vision_layers.deinit(allocator);
+            return e;
+        };
+
+        if (patch_proj != null) {
+            self.vision_encoder = vision.VisionEncoder.init(
+                allocator,
+                patch_proj,
+                pos_emb,
+                emb_proj,
+                v_layers_slice,
+            );
+        }
+
+        const a_conv0_w = gguf.getTensor("a.conv1d.0.weight");
+        const a_conv0_n = try loadNorm(allocator, gguf.getTensor("a.conv1d.0.norm.weight"), 128);
+        const a_conv1_w = gguf.getTensor("a.conv1d.1.weight");
+        const a_conv1_n = try loadNorm(allocator, gguf.getTensor("a.conv1d.1.norm.weight"), 32);
+        const a_inp_proj = gguf.getTensor("a.input_projection.weight");
+        const a_pre_out = gguf.getTensor("a.pre_encode.out.weight");
+        const a_pre_bias = try loadNorm(allocator, gguf.getTensor("a.pre_encode.out.bias"), 1536);
+        const a_mm_proj = gguf.getTensor("mm.a.input_projection.weight");
+
+        var audio_layers: std.ArrayList(audio.AudioLayerWeights) = .empty;
+        errdefer audio_layers.deinit(allocator);
+
+        for (0..32) |l_idx| {
+            var buf: [128]u8 = undefined;
+            const q_name = std.fmt.bufPrint(&buf, "a.blk.{d}.attn_q.weight", .{l_idx}) catch break;
+            const q_proj = gguf.getTensor(q_name);
+            if (q_proj == null) break;
+
+            var layer = audio.AudioLayerWeights{};
+            layer.attn_q = q_proj;
+
+            var name_buf: [128]u8 = undefined;
+            layer.ffn_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_norm.weight", .{l_idx})), 1024);
+            layer.ffn_up = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_up.weight", .{l_idx}));
+            layer.ffn_down = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_down.weight", .{l_idx}));
+            layer.ffn_post_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_post_norm.weight", .{l_idx})), 1024);
+            
+            layer.attn_pre_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_pre_norm.weight", .{l_idx})), 1024);
+            layer.attn_k = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_k.weight", .{l_idx}));
+            layer.attn_v = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_v.weight", .{l_idx}));
+            layer.attn_k_rel = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_k_rel.weight", .{l_idx}));
+            layer.per_dim_scale = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.per_dim_scale.weight", .{l_idx})), 128);
+            layer.attn_out = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_out.weight", .{l_idx}));
+            layer.attn_post_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_post_norm.weight", .{l_idx})), 1024);
+            
+            layer.norm_conv = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.norm_conv.weight", .{l_idx})), 1024);
+            layer.conv_pw1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_pw1.weight", .{l_idx}));
+            layer.conv_dw = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_dw.weight", .{l_idx}));
+            layer.conv_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_norm.weight", .{l_idx})), 1024);
+            layer.conv_pw2 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_pw2.weight", .{l_idx}));
+            
+            layer.ffn_norm_1 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_norm_1.weight", .{l_idx})), 1024);
+            layer.ffn_up_1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_up_1.weight", .{l_idx}));
+            layer.ffn_down_1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_down_1.weight", .{l_idx}));
+            layer.ffn_post_norm_1 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_post_norm_1.weight", .{l_idx})), 1024);
+            
+            layer.ln2 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ln2.weight", .{l_idx})), 1024);
+
+            try audio_layers.append(allocator, layer);
+        }
+
+        const a_layers_slice = audio_layers.toOwnedSlice(allocator) catch |e| {
+            audio_layers.deinit(allocator);
+            return e;
+        };
+
+        if (a_conv0_w != null) {
+            self.audio_encoder = audio.AudioEncoder.init(
+                allocator,
+                a_conv0_w,
+                a_conv0_n,
+                a_conv1_w,
+                a_conv1_n,
+                a_inp_proj,
+                a_pre_out,
+                a_pre_bias,
+                a_mm_proj,
+                a_layers_slice,
+            );
+        }
     }
 
     pub fn loadFromSafeTensors(allocator: std.mem.Allocator, params: ModelParams, st: *const SafeTensorsFile) !*TransformerModel {
@@ -501,6 +633,7 @@ pub const TransformerModel = struct {
 
     pub fn deinit(self: *TransformerModel) void {
         if (self.vision_encoder) |*ve| ve.deinit();
+        if (self.audio_encoder) |*ae| ae.deinit();
         for (self.layers) |layer| {
             if (layer.input_layernorm) |n| self.allocator.free(n);
             if (layer.post_attention_layernorm) |n| self.allocator.free(n);

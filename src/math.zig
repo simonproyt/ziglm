@@ -198,22 +198,15 @@ pub fn dotQ8_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         const vb1_0: Vec = b_ptr1[0..16].*;
         const vb1_1: Vec = b_ptr1[16..32].*;
 
-        var q0_0: [16]f32 = undefined;
-        var q0_1: [16]f32 = undefined;
-        var q1_0: [16]f32 = undefined;
-        var q1_1: [16]f32 = undefined;
-
-        inline for (0..16) |k| {
-            q0_0[k] = @floatFromInt(blk0.qs[k]);
-            q0_1[k] = @floatFromInt(blk0.qs[k + 16]);
-            q1_0[k] = @floatFromInt(blk1.qs[k]);
-            q1_1[k] = @floatFromInt(blk1.qs[k + 16]);
-        }
-
-        const vq0_0: Vec = q0_0;
-        const vq0_1: Vec = q0_1;
-        const vq1_0: Vec = q1_0;
-        const vq1_1: Vec = q1_1;
+        const qs0_0: @Vector(16, i8) = blk0.qs[0..16].*;
+        const qs0_1: @Vector(16, i8) = blk0.qs[16..32].*;
+        const qs1_0: @Vector(16, i8) = blk1.qs[0..16].*;
+        const qs1_1: @Vector(16, i8) = blk1.qs[16..32].*;
+        
+        const vq0_0: Vec = @floatFromInt(@as(@Vector(16, i32), qs0_0));
+        const vq0_1: Vec = @floatFromInt(@as(@Vector(16, i32), qs0_1));
+        const vq1_0: Vec = @floatFromInt(@as(@Vector(16, i32), qs1_0));
+        const vq1_1: Vec = @floatFromInt(@as(@Vector(16, i32), qs1_1));
 
         sum0 += (vq0_0 * vb0_0 + vq0_1 * vb0_1) * vd0;
         sum1 += (vq1_0 * vb1_0 + vq1_1 * vb1_1) * vd1;
@@ -293,25 +286,15 @@ pub fn dotQ4_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         const vb1_0: Vec = b_ptr1[0..16].*;
         const vb1_1: Vec = b_ptr1[16..32].*;
 
-        var v0_0_arr: [16]f32 = undefined;
-        var v0_1_arr: [16]f32 = undefined;
-        var v1_0_arr: [16]f32 = undefined;
-        var v1_1_arr: [16]f32 = undefined;
+        const byte0: @Vector(16, u8) = blk0.qs;
+        const byte1: @Vector(16, u8) = blk1.qs;
+        const mask: @Vector(16, u8) = @splat(0x0F);
+        const shift: @Vector(16, u3) = @splat(4);
 
-        inline for (0..16) |k| {
-            const byte0 = blk0.qs[k];
-            v0_0_arr[k] = @floatFromInt(byte0 & 0x0F);
-            v0_1_arr[k] = @floatFromInt(byte0 >> 4);
-
-            const byte1 = blk1.qs[k];
-            v1_0_arr[k] = @floatFromInt(byte1 & 0x0F);
-            v1_1_arr[k] = @floatFromInt(byte1 >> 4);
-        }
-
-        const vq0_0: Vec = v0_0_arr;
-        const vq0_1: Vec = v0_1_arr;
-        const vq1_0: Vec = v1_0_arr;
-        const vq1_1: Vec = v1_1_arr;
+        const vq0_0: Vec = @floatFromInt(@as(@Vector(16, i32), byte0 & mask));
+        const vq0_1: Vec = @floatFromInt(@as(@Vector(16, i32), byte0 >> shift));
+        const vq1_0: Vec = @floatFromInt(@as(@Vector(16, i32), byte1 & mask));
+        const vq1_1: Vec = @floatFromInt(@as(@Vector(16, i32), byte1 >> shift));
 
         const acc0 = (vq0_0 * vb0_0 + vq0_1 * vb0_1) - eight * (vb0_0 + vb0_1);
         const acc1 = (vq1_0 * vb1_0 + vq1_1 * vb1_1) - eight * (vb1_0 + vb1_1);
@@ -328,16 +311,12 @@ pub fn dotQ4_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         const vb0: Vec = b_ptr[0..16].*;
         const vb1: Vec = b_ptr[16..32].*;
 
-        var v0_arr: [16]f32 = undefined;
-        var v1_arr: [16]f32 = undefined;
-        inline for (0..16) |k| {
-            const byte = blk.qs[k];
-            v0_arr[k] = @floatFromInt(byte & 0x0F);
-            v1_arr[k] = @floatFromInt(byte >> 4);
-        }
+        const byte: @Vector(16, u8) = blk.qs;
+        const mask: @Vector(16, u8) = @splat(0x0F);
+        const shift: @Vector(16, u3) = @splat(4);
 
-        const vq0: Vec = v0_arr;
-        const vq1: Vec = v1_arr;
+        const vq0: Vec = @floatFromInt(@as(@Vector(16, i32), byte & mask));
+        const vq1: Vec = @floatFromInt(@as(@Vector(16, i32), byte >> shift));
 
         const acc = (vq0 * vb0 + vq1 * vb1) - eight * (vb0 + vb1);
         sum0 += acc * vd;
@@ -361,16 +340,12 @@ pub fn dotQ4_1F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         const vb0: Vec = b_ptr[0..16].*;
         const vb1: Vec = b_ptr[16..32].*;
 
-        var v0_arr: [16]f32 = undefined;
-        var v1_arr: [16]f32 = undefined;
-        inline for (0..16) |k| {
-            const byte = blk.qs[k];
-            v0_arr[k] = @floatFromInt(byte & 0x0F);
-            v1_arr[k] = @floatFromInt(byte >> 4);
-        }
+        const byte: @Vector(16, u8) = blk.qs;
+        const mask: @Vector(16, u8) = @splat(0x0F);
+        const shift: @Vector(16, u3) = @splat(4);
 
-        const vq0: Vec = v0_arr;
-        const vq1: Vec = v1_arr;
+        const vq0: Vec = @floatFromInt(@as(@Vector(16, i32), byte & mask));
+        const vq1: Vec = @floatFromInt(@as(@Vector(16, i32), byte >> shift));
 
         const sum_q = @reduce(.Add, vq0 * vb0 + vq1 * vb1);
         const sum_b = @reduce(.Add, vb0 + vb1);
@@ -1130,4 +1105,10 @@ test "RoPE positional embedding" {
 
     applyRoPE(&q, &k, 1, 4, 4, 1, 1, 10000.0, 1.0, .normal);
     try std.testing.expect(q[0] != 1.0 or q[1] != 0.0);
+}
+
+pub fn meanAbs(arr: []const f32) f32 {
+    var sum: f32 = 0;
+    for (arr) |v| sum += @abs(v);
+    return sum / @as(f32, @floatFromInt(arr.len));
 }

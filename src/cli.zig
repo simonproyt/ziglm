@@ -33,7 +33,9 @@ pub fn printUsage() void {
         \\        --min-p <float>     Min-P sampling (default: 0.05)
         \\    -n, --max-tokens <int>  Maximum tokens to generate (default: 256)
         \\    -j, --threads <int>     Number of worker threads (default: CPU cores)
-        \\        --image <path>      Path to input image (BMP, PPM) for multimodal vision
+        \\        --image <path>      Path to input image (PNG, JPG, BMP, PPM) for vision
+        \\        --video <path>      Path to input video (MP4, MKV, frames) for video reasoning
+        \\        --audio <path>      Path to input audio (WAV 16kHz) for speech/audio reasoning
         \\        --port <int>        HTTP server port (default: 8080)
         \\        --seed <int>        Random seed for reproducibility (default: 42)
         \\        --system <text>     System prompt for chat mode
@@ -42,6 +44,8 @@ pub fn printUsage() void {
         \\  EXAMPLES:
         \\    ziglm test-model --create-sample model.gguf
         \\    ziglm run -m model.gguf -p "Hello world"
+        \\    ziglm run -m model.gguf --video clip.mp4 -p "Describe the video action."
+        \\    ziglm run -m model.gguf --audio speech.wav -p "Transcribe what you hear."
         \\    ziglm chat -m model.gguf
         \\    ziglm serve -m model.gguf --port 8080
         \\
@@ -61,6 +65,9 @@ pub const CliArgs = struct {
     max_tokens: usize = 256,
     threads: ?usize = null,
     image_path: ?[]const u8 = null,
+    video_path: ?[]const u8 = null,
+    audio_path: ?[]const u8 = null,
+    mmproj_path: ?[]const u8 = null,
     port: u16 = 8080,
     seed: u64 = 42,
     sample_out: []const u8 = "sample_model.gguf",
@@ -99,6 +106,12 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
             args.temperature = 0.0;
         } else if (std.mem.eql(u8, arg, "--image")) {
             args.image_path = arg_it.next();
+        } else if (std.mem.eql(u8, arg, "--video")) {
+            args.video_path = arg_it.next();
+        } else if (std.mem.eql(u8, arg, "--audio")) {
+            args.audio_path = arg_it.next();
+        } else if (std.mem.eql(u8, arg, "--mmproj")) {
+            args.mmproj_path = arg_it.next();
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (arg_it.next()) |v| args.port = std.fmt.parseInt(u16, v, 10) catch 8080;
         } else if (std.mem.eql(u8, arg, "--seed")) {
@@ -239,15 +252,22 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         std.debug.print("  RoPE Base Freq:      {d:.1}\n", .{gguf_file.params.rope_freq_base});
 
         std.debug.print("\n=== Tensors ({d} total) ===\n", .{gguf_file.tensors.len});
-        for (gguf_file.tensors[0..@min(15, gguf_file.tensors.len)]) |t| {
-            std.debug.print("  {s:<32} {s:<8} [{d}, {d}] ({d} bytes)\n", .{
-                t.name,
-                t.type.name(),
-                t.shape[0],
-                t.shape[1],
-                t.sizeBytes(),
-            });
+        var a_count: usize = 0;
+        var v_count: usize = 0;
+        var l_count: usize = 0;
+        for (gguf_file.tensors) |t| {
+            if (std.mem.indexOf(u8, t.name, "blk") == null) {
+                std.debug.print("  [GLOBAL] {s:<42} {s:<8} (id={d}) [{d}, {d}] ({d} bytes)\n", .{ t.name, t.type.name(), @intFromEnum(t.type), t.shape[0], t.shape[1], t.sizeBytes() });
+            }
+            if (std.mem.startsWith(u8, t.name, "a.")) {
+                a_count += 1;
+            } else if (std.mem.startsWith(u8, t.name, "v.") or std.mem.startsWith(u8, t.name, "mm.") or std.mem.startsWith(u8, t.name, "patch_embd")) {
+                v_count += 1;
+            } else {
+                l_count += 1;
+            }
         }
+        std.debug.print("\nSummary: {d} Audio tensors, {d} Vision tensors, {d} Language tensors\n", .{ a_count, v_count, l_count });
         if (gguf_file.tensors.len > 15) {
             std.debug.print("  ... and {d} more tensors\n", .{gguf_file.tensors.len - 15});
         }
@@ -260,6 +280,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
+            .mmproj_path = args.mmproj_path,
         });
         defer engine.deinit();
 
@@ -278,11 +299,19 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
 
         const clean_prompt = unescapePrompt(allocator, args.prompt);
 
-        if (args.image_path) |img| {
-            std.debug.print("Processing multimodal image: {s} ...\n", .{img});
+        var stats: types.GenerationStats = undefined;
+        if (args.video_path) |vid| {
+            std.debug.print("Processing multimodal video: {s} ...\n", .{vid});
+            stats = try engine.generateWithVideo(clean_prompt, vid, options, null, printTokenStdout);
+        } else if (args.audio_path) |aud| {
+            std.debug.print("Processing multimodal audio: {s} ...\n", .{aud});
+            stats = try engine.generateWithAudio(clean_prompt, aud, options, null, printTokenStdout);
+        } else {
+            if (args.image_path) |img| {
+                std.debug.print("Processing multimodal image: {s} ...\n", .{img});
+            }
+            stats = try engine.generateWithImage(clean_prompt, args.image_path, options, null, printTokenStdout);
         }
-
-        const stats = try engine.generateWithImage(clean_prompt, args.image_path, options, null, printTokenStdout);
 
         std.debug.print("\n\n────────────────────────────────────────\n", .{});
         std.debug.print("⚡ Prefill:    {d:.1} tok/s ({d} tokens in {d:.1} ms)\n", .{
@@ -305,6 +334,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
+            .mmproj_path = args.mmproj_path,
         });
         defer engine.deinit();
 
@@ -389,6 +419,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
+            .mmproj_path = args.mmproj_path,
         });
         defer engine.deinit();
 
@@ -405,6 +436,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
+            .mmproj_path = args.mmproj_path,
         });
         defer engine.deinit();
 

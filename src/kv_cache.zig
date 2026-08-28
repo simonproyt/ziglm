@@ -28,7 +28,7 @@ pub const KVCache = struct {
         const layer_stride = 2 * kv_block_stride;
         const total_floats = block_count * layer_stride;
 
-        const buffer = try allocator.alloc(f32, total_floats);
+        const buffer = try allocator.alignedAlloc(f32, .@"64", total_floats);
         @memset(buffer, 0.0);
 
         self.* = .{

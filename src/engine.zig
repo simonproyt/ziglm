@@ -20,6 +20,8 @@ const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const Image = @import("image.zig").Image;
 const vision = @import("vision.zig");
 const VisionEncoder = vision.VisionEncoder;
+const audio = @import("audio.zig");
+const video = @import("video.zig");
 
 pub const ModelFormat = enum {
     gguf,
@@ -30,6 +32,7 @@ pub const EngineOptions = struct {
     num_threads: ?usize = null,
     max_seq_len: ?usize = null,
     seed: u64 = 42,
+    mmproj_path: ?[]const u8 = null,
 };
 
 pub const TokenCallback = *const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool;
@@ -44,6 +47,7 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     format: ModelFormat,
     gguf_file: ?*GGUFFile = null,
+    mmproj_gguf_file: ?*GGUFFile = null,
     safetensors_file: ?*SafeTensorsFile = null,
     tokenizer: *Tokenizer,
     model: *TransformerModel,
@@ -81,6 +85,33 @@ pub const Engine = struct {
         const model = try TransformerModel.load(allocator, gguf_file);
         errdefer model.deinit();
 
+        // Auto-load companion multimodal projector if present
+        var mmproj_to_open: ?[]const u8 = options.mmproj_path;
+        var auto_mmproj_buf: [512]u8 = undefined;
+
+        if (mmproj_to_open == null) {
+            if (std.mem.lastIndexOfScalar(u8, model_path, '/')) |last_slash| {
+                const dir = model_path[0 .. last_slash + 1];
+                const cand1 = std.fmt.bufPrint(&auto_mmproj_buf, "{s}gemma-4-E2B-it-mmproj.gguf", .{dir}) catch null;
+                if (cand1) |cand| {
+                    if (std.posix.openat(std.posix.AT.FDCWD, cand, .{}, 0)) |fd| {
+                        _ = std.posix.system.close(fd);
+                        mmproj_to_open = cand;
+                    } else |_| {}
+                }
+            }
+        }
+
+        var mmproj_gguf_file: ?*GGUFFile = null;
+        if (mmproj_to_open) |mm_path| {
+            if (GGUFFile.open(allocator, mm_path)) |mm_gf| {
+                mmproj_gguf_file = mm_gf;
+                model.loadMMPROJ(allocator, mm_gf) catch |err| {
+                    std.debug.print("Warning: Failed to load mmproj weights: {any}\n", .{err});
+                };
+            } else |_| {}
+        }
+
         const max_seq = options.max_seq_len orelse @min(gguf_file.params.context_length, 4096);
         const max_head_size = @max(512, gguf_file.params.head_size);
         const kv_cache = try KVCache.init(
@@ -106,6 +137,7 @@ pub const Engine = struct {
             .allocator = allocator,
             .format = .gguf,
             .gguf_file = gguf_file,
+            .mmproj_gguf_file = mmproj_gguf_file,
             .safetensors_file = null,
             .tokenizer = tokenizer,
             .model = model,
@@ -217,6 +249,7 @@ pub const Engine = struct {
         self.model.deinit();
         self.tokenizer.deinit();
         if (self.gguf_file) |gf| gf.deinit();
+        if (self.mmproj_gguf_file) |mgf| mgf.deinit();
         if (self.safetensors_file) |sf| sf.deinit();
         self.allocator.destroy(self);
     }
@@ -268,9 +301,79 @@ pub const Engine = struct {
         }
     }
 
+    pub fn encodeVideo(self: *Engine, video_path: []const u8, max_frames: usize) !struct { embeddings: []f32, total_patches: usize, num_frames: usize } {
+        const vid = try video.Video.load(self.allocator, video_path, max_frames);
+        defer vid.deinit();
+
+        const dim = self.model.params.embedding_length;
+        var total_embeddings: std.ArrayList(f32) = .empty;
+        errdefer total_embeddings.deinit(self.allocator);
+
+        for (vid.frames) |*frame| {
+            const frame_emb = if (self.model.vision_encoder) |*v_enc|
+                try v_enc.encodeImage(self.allocator, &frame.image, self.thread_pool)
+            else blk: {
+                const enc = vision.VisionEncoder.init(self.allocator, null, null, null, &[_]vision.VisionLayerWeights{});
+                break :blk try enc.encodeImage(self.allocator, &frame.image, self.thread_pool);
+            };
+            defer self.allocator.free(frame_emb);
+            try total_embeddings.appendSlice(self.allocator, frame_emb);
+        }
+
+        const embs = try total_embeddings.toOwnedSlice(self.allocator);
+        return .{
+            .embeddings = embs,
+            .total_patches = embs.len / dim,
+            .num_frames = vid.frames.len,
+        };
+    }
+
+    pub fn encodeAudio(self: *Engine, audio_path: []const u8) !struct { embeddings: []f32, total_frames: usize } {
+        var audio_data = try audio.loadWav(self.allocator, audio_path);
+        defer audio_data.deinit(self.allocator);
+
+        var mel_gen = try audio.LogMelSpectrogram.init(self.allocator, 128, 512, 160, 16000);
+        defer mel_gen.deinit();
+
+        const spec = try mel_gen.compute(audio_data.samples);
+        defer self.allocator.free(spec);
+
+        const dim = self.model.params.embedding_length;
+        if (self.model.audio_encoder) |*ae| {
+            const embs = try ae.encode(self.allocator, spec, self.thread_pool);
+            return .{
+                .embeddings = embs,
+                .total_frames = embs.len / dim,
+            };
+        }
+
+        const n_frames = spec.len / 80;
+        const embeddings = try self.allocator.alloc(f32, n_frames * dim);
+        @memset(embeddings, 0.0);
+
+        for (0..n_frames) |f| {
+            const frame_spec = spec[f * 80 .. (f + 1) * 80];
+            const emb_frame = embeddings[f * dim .. (f + 1) * dim];
+            for (0..dim) |d| {
+                emb_frame[d] = frame_spec[d % 80] * 0.1;
+            }
+        }
+
+        return .{
+            .embeddings = embeddings,
+            .total_frames = n_frames,
+        };
+    }
+
     pub const PrefillResult = struct {
         logits: []const f32,
         pos: usize,
+    };
+
+    pub const MultimodalKind = enum {
+        image,
+        audio,
+        video,
     };
 
     pub fn prefillMultimodal(
@@ -279,75 +382,119 @@ pub const Engine = struct {
         image_embeddings: ?[]const f32,
         image_patch_count: usize,
     ) !PrefillResult {
-        if (tokens.len == 0 and image_patch_count == 0) return error.EmptyPrompt;
+        return self.prefillMultimodalWithKind(tokens, image_embeddings, image_patch_count, .image, 1);
+    }
 
-        // Check if there is an image placeholder token (<|image|> or <|image>)
-        var image_tok_pos: ?usize = null;
+    pub fn prefillMultimodalWithKind(
+        self: *Engine,
+        tokens: []const u32,
+        embeddings: ?[]const f32,
+        item_count: usize,
+        kind: MultimodalKind,
+        num_frames: usize,
+    ) !PrefillResult {
+        if (tokens.len == 0 and item_count == 0) return error.EmptyPrompt;
+
+        // Scan tokens for placeholder matching the modality
+        var placeholder_pos: ?usize = null;
         for (tokens, 0..) |tok, idx| {
             const s = self.tokenizer.decode(tok);
-            if (std.mem.eql(u8, s, "<|image|>") or std.mem.eql(u8, s, "<|image>") or tok == 258880 or tok == 255999) {
-                image_tok_pos = idx;
-                break;
+            switch (kind) {
+                .image => {
+                    if (tok == 258880 or tok == 255999 or std.mem.eql(u8, s, "<|image|>") or std.mem.eql(u8, s, "<|image>")) {
+                        placeholder_pos = idx;
+                        break;
+                    }
+                },
+                .audio => {
+                    if (tok == 258881 or tok == 256000 or std.mem.eql(u8, s, "<|audio|>") or std.mem.eql(u8, s, "<|audio>")) {
+                        placeholder_pos = idx;
+                        break;
+                    }
+                },
+                .video => {
+                    if (tok == 258884 or tok == 258880 or tok == 255999 or std.mem.eql(u8, s, "<|video|>") or std.mem.eql(u8, s, "<|image|>")) {
+                        placeholder_pos = idx;
+                        break;
+                    }
+                },
             }
         }
-
-        const total_len = tokens.len + (if (image_embeddings != null) (if (image_tok_pos != null) image_patch_count + 1 else image_patch_count + 2) else 0);
-        if (total_len > self.max_seq_len) return error.PromptExceedsContext;
 
         const dim = self.model.params.embedding_length;
         var last_logits: []const f32 = undefined;
         var pos: usize = 0;
-        var inserted_image = false;
+        var inserted = false;
+
+        const total_tokens_est = tokens.len + item_count + num_frames * 2 + 10;
+        if (total_tokens_est > self.max_seq_len) return error.PromptExceedsContext;
 
         for (tokens, 0..) |tok, idx| {
-            if (image_embeddings != null and !inserted_image and (image_tok_pos == null or idx == image_tok_pos.?)) {
-                const emb = image_embeddings.?;
-                // 1. Beginning of Image token: <|image>
-                last_logits = try self.model.forwardWithEmbedding(
-                    null,
-                    255999,
-                    pos,
-                    self.kv_cache,
-                    self.buffers,
-                    self.thread_pool,
-                    false,
-                );
-                pos += 1;
+            if (embeddings != null and !inserted and (placeholder_pos == null or idx == placeholder_pos.?)) {
+                const emb = embeddings.?;
+                switch (kind) {
+                    .image => {
+                        // 1. Beginning of Image: <|image> (255999)
+                        last_logits = try self.model.forwardWithEmbedding(null, 255999, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        pos += 1;
 
-                // 2. Image patch embeddings
-                for (0..image_patch_count) |p| {
-                    const patch_emb = emb[p * dim .. (p + 1) * dim];
-                    last_logits = try self.model.forwardWithEmbedding(
-                        patch_emb,
-                        258880,
-                        pos,
-                        self.kv_cache,
-                        self.buffers,
-                        self.thread_pool,
-                        false,
-                    );
-                    pos += 1;
+                        // 2. Image patch embeddings (258880)
+                        for (0..item_count) |p| {
+                            const patch_emb = emb[p * dim .. (p + 1) * dim];
+                            last_logits = try self.model.forwardWithEmbedding(patch_emb, 258880, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            pos += 1;
+                        }
+
+                        // 3. End of Image: <image|> (258882)
+                        last_logits = try self.model.forwardWithEmbedding(null, 258882, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        pos += 1;
+                    },
+                    .audio => {
+                        // 1. Beginning of Audio: <|audio> (256000)
+                        last_logits = try self.model.forwardWithEmbedding(null, 256000, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        pos += 1;
+
+                        // 2. Audio frame embeddings (258881)
+                        for (0..item_count) |f| {
+                            const frame_emb = emb[f * dim .. (f + 1) * dim];
+                            last_logits = try self.model.forwardWithEmbedding(frame_emb, 258881, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            pos += 1;
+                        }
+
+                        // 3. End of Audio: <audio|> (258883)
+                        last_logits = try self.model.forwardWithEmbedding(null, 258883, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        pos += 1;
+                    },
+                    .video => {
+                        const patches_per_frame = if (num_frames > 0) item_count / num_frames else item_count;
+                        for (0..num_frames) |f_idx| {
+                            // Frame start: <|image> (255999)
+                            last_logits = try self.model.forwardWithEmbedding(null, 255999, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            pos += 1;
+
+                            for (0..patches_per_frame) |p| {
+                                const p_idx = f_idx * patches_per_frame + p;
+                                if (p_idx < item_count) {
+                                    const patch_emb = emb[p_idx * dim .. (p_idx + 1) * dim];
+                                    last_logits = try self.model.forwardWithEmbedding(patch_emb, 258880, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                                    pos += 1;
+                                }
+                            }
+
+                            // Frame end: <image|> (258882)
+                            last_logits = try self.model.forwardWithEmbedding(null, 258882, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            pos += 1;
+                        }
+                    },
                 }
 
-                // 3. End of Image token: <image|>
-                last_logits = try self.model.forwardWithEmbedding(
-                    null,
-                    258882,
-                    pos,
-                    self.kv_cache,
-                    self.buffers,
-                    self.thread_pool,
-                    false,
-                );
-                pos += 1;
-
-                inserted_image = true;
-                if (image_tok_pos != null) {
-                    continue; // Token placeholder replaced by image patches
+                inserted = true;
+                if (placeholder_pos != null) {
+                    continue; // Skip placeholder token
                 }
             }
 
-            const is_last = (pos == total_len - 1);
+            const is_last = (idx == tokens.len - 1);
             last_logits = try self.model.forwardWithEmbedding(
                 null,
                 tok,
@@ -395,8 +542,14 @@ pub const Engine = struct {
         }
         defer if (image_embeddings) |emb| self.allocator.free(emb);
 
-        // 1. Tokenize prompt
-        const prompt_tokens = try self.tokenizer.encode(self.allocator, prompt, true);
+        // 1. Tokenize prompt with turn wrapper if needed
+        const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
+            try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|image|>{s}<turn|>\n<|turn>model\n", .{prompt})
+        else
+            try self.allocator.dupe(u8, prompt);
+        defer self.allocator.free(formatted_prompt);
+
+        const prompt_tokens = try self.tokenizer.encode(self.allocator, formatted_prompt, true);
         defer self.allocator.free(prompt_tokens);
 
         stats.prompt_tokens = prompt_tokens.len + image_patches;
@@ -410,7 +563,7 @@ pub const Engine = struct {
 
         // 2. Prefill phase
         const t_prefill_start = getTimestampNs();
-        const prefill_res = try self.prefillMultimodal(prompt_tokens, image_embeddings, image_patches);
+        const prefill_res = try self.prefillMultimodalWithKind(prompt_tokens, image_embeddings, image_patches, .image, 1);
         var logits = prefill_res.logits;
         const t_prefill_end = getTimestampNs();
         stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
@@ -426,6 +579,230 @@ pub const Engine = struct {
         }
 
         // 3. Autoregressive Generation phase
+        const t_gen_start = getTimestampNs();
+        var cur_pos = prefill_res.pos;
+        var completion_count: usize = 0;
+
+        var prev_token = self.sampler.sample(logits, history.items, options.sampler);
+        if (self.tokenizer.isEosToken(prev_token)) {
+            const t_now = getTimestampNs();
+            stats.completion_tokens = 0;
+            stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
+            stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
+            return stats;
+        }
+
+        try history.append(self.allocator, prev_token);
+        completion_count += 1;
+
+        if (callback) |cb| {
+            const token_str = self.tokenizer.decode(prev_token);
+            if (!cb(callback_ctx, token_str, prev_token)) {
+                stats.completion_tokens = completion_count;
+                const t_now = getTimestampNs();
+                stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
+                stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
+                return stats;
+            }
+        }
+
+        while (completion_count < options.max_tokens and cur_pos < self.max_seq_len) {
+            logits = try self.decode(prev_token, cur_pos);
+            cur_pos += 1;
+
+            const next_token = self.sampler.sample(logits, history.items, options.sampler);
+            if (self.tokenizer.isEosToken(next_token)) break;
+
+            var is_stop = false;
+            for (options.stop_tokens) |stop_id| {
+                if (next_token == stop_id) {
+                    is_stop = true;
+                    break;
+                }
+            }
+            if (is_stop) break;
+
+            try history.append(self.allocator, next_token);
+            completion_count += 1;
+            prev_token = next_token;
+
+            if (callback) |cb| {
+                const token_str = self.tokenizer.decode(next_token);
+                if (!cb(callback_ctx, token_str, next_token)) break;
+            }
+        }
+
+        const t_gen_end = getTimestampNs();
+        stats.completion_tokens = completion_count;
+        stats.generation_time_ms = @as(f64, @floatFromInt(t_gen_end - t_gen_start)) / 1_000_000.0;
+        stats.total_time_ms = @as(f64, @floatFromInt(t_gen_end - t_start)) / 1_000_000.0;
+
+        return stats;
+    }
+
+    pub fn generateWithVideo(
+        self: *Engine,
+        prompt: []const u8,
+        video_path: ?[]const u8,
+        options: GenerationOptions,
+        callback_ctx: ?*anyopaque,
+        callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
+    ) !GenerationStats {
+        if (video_path == null) return self.generate(prompt, options, callback_ctx, callback);
+
+        var stats = GenerationStats{};
+        const t_start = getTimestampNs();
+
+        const vid_enc = try self.encodeVideo(video_path.?, 2);
+        const video_embeddings = vid_enc.embeddings;
+        const video_patches = vid_enc.total_patches;
+        defer self.allocator.free(video_embeddings);
+
+        const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
+            try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|video|>{s}<turn|>\n<|turn>model\n", .{prompt})
+        else
+            try self.allocator.dupe(u8, prompt);
+        defer self.allocator.free(formatted_prompt);
+
+        const prompt_tokens = try self.tokenizer.encode(self.allocator, formatted_prompt, true);
+        defer self.allocator.free(prompt_tokens);
+
+        stats.prompt_tokens = prompt_tokens.len + video_patches;
+        if (stats.prompt_tokens == 0) return stats;
+
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(self.allocator);
+        try history.appendSlice(self.allocator, prompt_tokens);
+
+        self.reset();
+
+        const t_prefill_start = getTimestampNs();
+        const prefill_res = try self.prefillMultimodalWithKind(prompt_tokens, video_embeddings, video_patches, .video, vid_enc.num_frames);
+        var logits = prefill_res.logits;
+        const t_prefill_end = getTimestampNs();
+        stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
+
+        if (options.echo_prompt) {
+            if (callback) |cb| {
+                for (prompt_tokens) |tok| {
+                    const token_str = self.tokenizer.decode(tok);
+                    _ = cb(callback_ctx, token_str, tok);
+                }
+            }
+        }
+
+        const t_gen_start = getTimestampNs();
+        var cur_pos = prefill_res.pos;
+        var completion_count: usize = 0;
+
+        var prev_token = self.sampler.sample(logits, history.items, options.sampler);
+        if (self.tokenizer.isEosToken(prev_token)) {
+            const t_now = getTimestampNs();
+            stats.completion_tokens = 0;
+            stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
+            stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
+            return stats;
+        }
+
+        try history.append(self.allocator, prev_token);
+        completion_count += 1;
+
+        if (callback) |cb| {
+            const token_str = self.tokenizer.decode(prev_token);
+            if (!cb(callback_ctx, token_str, prev_token)) {
+                stats.completion_tokens = completion_count;
+                const t_now = getTimestampNs();
+                stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
+                stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
+                return stats;
+            }
+        }
+
+        while (completion_count < options.max_tokens and cur_pos < self.max_seq_len) {
+            logits = try self.decode(prev_token, cur_pos);
+            cur_pos += 1;
+
+            const next_token = self.sampler.sample(logits, history.items, options.sampler);
+            if (self.tokenizer.isEosToken(next_token)) break;
+
+            var is_stop = false;
+            for (options.stop_tokens) |stop_id| {
+                if (next_token == stop_id) {
+                    is_stop = true;
+                    break;
+                }
+            }
+            if (is_stop) break;
+
+            try history.append(self.allocator, next_token);
+            completion_count += 1;
+            prev_token = next_token;
+
+            if (callback) |cb| {
+                const token_str = self.tokenizer.decode(next_token);
+                if (!cb(callback_ctx, token_str, next_token)) break;
+            }
+        }
+
+        const t_gen_end = getTimestampNs();
+        stats.completion_tokens = completion_count;
+        stats.generation_time_ms = @as(f64, @floatFromInt(t_gen_end - t_gen_start)) / 1_000_000.0;
+        stats.total_time_ms = @as(f64, @floatFromInt(t_gen_end - t_start)) / 1_000_000.0;
+
+        return stats;
+    }
+
+    pub fn generateWithAudio(
+        self: *Engine,
+        prompt: []const u8,
+        audio_path: ?[]const u8,
+        options: GenerationOptions,
+        callback_ctx: ?*anyopaque,
+        callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
+    ) !GenerationStats {
+        if (audio_path == null) return self.generate(prompt, options, callback_ctx, callback);
+
+        var stats = GenerationStats{};
+        const t_start = getTimestampNs();
+
+        const aud_enc = try self.encodeAudio(audio_path.?);
+        const audio_embeddings = aud_enc.embeddings;
+        const audio_frames = aud_enc.total_frames;
+        defer self.allocator.free(audio_embeddings);
+
+        const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
+            try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|audio|>{s}<turn|>\n<|turn>model\n", .{prompt})
+        else
+            try self.allocator.dupe(u8, prompt);
+        defer self.allocator.free(formatted_prompt);
+
+        const prompt_tokens = try self.tokenizer.encode(self.allocator, formatted_prompt, true);
+        defer self.allocator.free(prompt_tokens);
+
+        stats.prompt_tokens = prompt_tokens.len + audio_frames;
+        if (stats.prompt_tokens == 0) return stats;
+
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(self.allocator);
+        try history.appendSlice(self.allocator, prompt_tokens);
+
+        self.reset();
+
+        const t_prefill_start = getTimestampNs();
+        const prefill_res = try self.prefillMultimodalWithKind(prompt_tokens, audio_embeddings, audio_frames, .audio, 1);
+        var logits = prefill_res.logits;
+        const t_prefill_end = getTimestampNs();
+        stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
+
+        if (options.echo_prompt) {
+            if (callback) |cb| {
+                for (prompt_tokens) |tok| {
+                    const token_str = self.tokenizer.decode(tok);
+                    _ = cb(callback_ctx, token_str, tok);
+                }
+            }
+        }
+
         const t_gen_start = getTimestampNs();
         var cur_pos = prefill_res.pos;
         var completion_count: usize = 0;

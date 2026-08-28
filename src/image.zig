@@ -56,7 +56,7 @@ pub const Image = struct {
         };
     }
 
-    fn loadPPM(allocator: std.mem.Allocator, bytes: []const u8) !Image {
+    pub fn loadPPM(allocator: std.mem.Allocator, bytes: []const u8) !Image {
         var it = std.mem.tokenizeAny(u8, bytes, " \t\r\n");
         const magic = it.next() orelse return error.InvalidPPM;
         if (!std.mem.eql(u8, magic, "P6")) return error.InvalidPPM;
