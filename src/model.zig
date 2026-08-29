@@ -696,14 +696,14 @@ pub const TransformerModel = struct {
         if (self.embed_tokens_per_layer) |ple_tab| {
             const ple_dim: usize = 256;
             const total_ple_dim = self.layers.len * ple_dim;
-            if (token_id < p.vocab_size) {
+            if (custom_embedding == null and token_id < p.vocab_size) {
                 const ple_row = ple_tab.getRow(token_id);
                 quant.dequantizeRow(ple_tab.type, ple_row, bufs.ctx_ple_buf[0..total_ple_dim], total_ple_dim);
+                const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+                for (bufs.ctx_ple_buf[0..total_ple_dim]) |*v| v.* *= token_scale;
             } else {
                 @memset(bufs.ctx_ple_buf[0..total_ple_dim], 0.0);
             }
-            const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
-            for (bufs.ctx_ple_buf[0..total_ple_dim]) |*v| v.* *= token_scale;
 
             if (self.per_layer_model_projection) |ctx_proj_t| {
                 const inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
@@ -714,8 +714,14 @@ pub const TransformerModel = struct {
                     for (0..self.layers.len) |l_idx| {
                         const slice = bufs.ctx_scratch[l_idx * ple_dim .. (l_idx + 1) * ple_dim];
                         math.rmsNorm(slice, norm_slice, slice, p.layer_norm_rms_epsilon, false);
-                        for (0..ple_dim) |d| {
-                            bufs.ctx_ple_buf[l_idx * ple_dim + d] = (bufs.ctx_ple_buf[l_idx * ple_dim + d] + slice[d]) * inv_sqrt_2;
+                        if (custom_embedding == null) {
+                            for (0..ple_dim) |d| {
+                                bufs.ctx_ple_buf[l_idx * ple_dim + d] = (bufs.ctx_ple_buf[l_idx * ple_dim + d] + slice[d]) * inv_sqrt_2;
+                            }
+                        } else {
+                            for (0..ple_dim) |d| {
+                                bufs.ctx_ple_buf[l_idx * ple_dim + d] = slice[d];
+                            }
                         }
                     }
                 }

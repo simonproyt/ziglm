@@ -11,42 +11,65 @@ const GGUFFile = @import("gguf.zig").GGUFFile;
 pub fn printUsage() void {
     std.debug.print(
         \\
-        \\  ⚡ ziglm - High-Performance LLM Inference Engine in Pure Zig ⚡
+        \\  ⚡ ziglm - High-Performance LLM & Multimodal Inference Engine in Pure Zig ⚡
         \\
         \\  USAGE:
         \\    ziglm <subcommand> [options]
         \\
         \\  SUBCOMMANDS:
-        \\    run          Run one-shot prompt inference
+        \\    run          Run one-shot prompt inference (text, vision, video, audio)
         \\    chat         Start interactive multi-turn chat session
         \\    serve        Start OpenAI-compatible HTTP REST API server
         \\    bench        Run performance and throughput benchmark
         \\    info         Inspect GGUF model metadata and tensors
         \\    test-model   Generate a sample GGUF model for testing
         \\
-        \\  GENERAL OPTIONS:
-        \\    -m, --model <path>      Path to GGUF model file
+        \\  MODEL & PROMPT OPTIONS:
+        \\    -m, --model <path>      Path to GGUF model file (required for inference)
         \\    -p, --prompt <text>     Input prompt for text generation
-        \\    -t, --temp <float>      Sampling temperature (default: 0.7, 0 = greedy)
+        \\        --system <text>     System prompt for chat / instructions
+        \\    -n, --max-tokens <int>  Maximum tokens to generate (default: 256)
+        \\    -j, --threads <int>     Number of worker threads (default: CPU cores)
+        \\        --max-seq-len <int> Maximum context window sequence length (default: 4096)
+        \\        --echo-prompt       Echo prompt tokens before generating completion
+        \\
+        \\  SAMPLING OPTIONS:
+        \\    -t, --temp <float>      Sampling temperature (default: 0.7)
+        \\        --greedy            Greedy decoding (equivalent to --temp 0)
         \\        --top-p <float>     Nucleus sampling top-p (default: 0.9)
         \\        --top-k <int>       Top-K sampling (default: 40)
         \\        --min-p <float>     Min-P sampling (default: 0.05)
-        \\    -n, --max-tokens <int>  Maximum tokens to generate (default: 256)
-        \\    -j, --threads <int>     Number of worker threads (default: CPU cores)
+        \\        --seed <int>        Random seed for reproducibility (default: 42)
+        \\
+        \\  MULTIMODAL (A/V) OPTIONS:
         \\        --image <path>      Path to input image (PNG, JPG, BMP, PPM) for vision
         \\        --video <path>      Path to input video (MP4, MKV, frames) for video reasoning
-        \\        --audio <path>      Path to input audio (WAV 16kHz) for speech/audio reasoning
+        \\        --audio <path>      Path to input audio (WAV 16kHz) for speech/audio transcription
+        \\        --max-frames <int>  Max video frames to sample (default: 32)
+        \\        --mmproj <path>     Path to external multimodal projector (mmproj.gguf)
+        \\
+        \\  SERVER & TEST OPTIONS:
         \\        --port <int>        HTTP server port (default: 8080)
-        \\        --seed <int>        Random seed for reproducibility (default: 42)
-        \\        --system <text>     System prompt for chat mode
+        \\        --create-sample <f> Output path for generated test GGUF
         \\    -h, --help              Print this help menu
         \\
         \\  EXAMPLES:
-        \\    ziglm test-model --create-sample model.gguf
-        \\    ziglm run -m model.gguf -p "Hello world"
-        \\    ziglm run -m model.gguf --video clip.mp4 -p "Describe the video action."
-        \\    ziglm run -m model.gguf --audio speech.wav -p "Transcribe what you hear."
-        \\    ziglm chat -m model.gguf
+        \\    # Text generation
+        \\    ziglm run -m model.gguf -p "Explain quantum computing in simple terms."
+        \\
+        \\    # Image understanding
+        \\    ziglm run -m model.gguf --image photo.jpg -p "Describe what is in this image."
+        \\
+        \\    # Video understanding
+        \\    ziglm run -m model.gguf --video clip.mp4 --max-frames 8 -p "Summarize the actions in this video."
+        \\
+        \\    # Audio speech transcription & reasoning
+        \\    ziglm run -m model.gguf --audio voice.wav -p "Transcribe the audio clip."
+        \\
+        \\    # Interactive chat session
+        \\    ziglm chat -m model.gguf --system "You are a helpful coding assistant."
+        \\
+        \\    # OpenAI-compatible REST server
         \\    ziglm serve -m model.gguf --port 8080
         \\
         \\
@@ -63,6 +86,8 @@ pub const CliArgs = struct {
     top_k: usize = 40,
     min_p: f32 = 0.05,
     max_tokens: usize = 256,
+    max_seq_len: usize = 4096,
+    max_frames: usize = 32,
     threads: ?usize = null,
     image_path: ?[]const u8 = null,
     video_path: ?[]const u8 = null,
@@ -70,6 +95,7 @@ pub const CliArgs = struct {
     mmproj_path: ?[]const u8 = null,
     port: u16 = 8080,
     seed: u64 = 42,
+    echo_prompt: bool = false,
     sample_out: []const u8 = "sample_model.gguf",
 };
 
@@ -78,6 +104,10 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
     _ = arg_it.skip(); // skip binary name
 
     if (arg_it.next()) |sub| {
+        if (std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "help")) {
+            args.subcommand = "help";
+            return args;
+        }
         args.subcommand = sub;
     } else {
         return args;
@@ -102,6 +132,12 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
             if (arg_it.next()) |v| args.max_tokens = std.fmt.parseInt(usize, v, 10) catch 256;
         } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
             if (arg_it.next()) |v| args.threads = std.fmt.parseInt(usize, v, 10) catch null;
+        } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
+            if (arg_it.next()) |v| args.max_seq_len = std.fmt.parseInt(usize, v, 10) catch 4096;
+        } else if (std.mem.eql(u8, arg, "--max-frames")) {
+            if (arg_it.next()) |v| args.max_frames = std.fmt.parseInt(usize, v, 10) catch 32;
+        } else if (std.mem.eql(u8, arg, "--echo-prompt")) {
+            args.echo_prompt = true;
         } else if (std.mem.eql(u8, arg, "--greedy")) {
             args.temperature = 0.0;
         } else if (std.mem.eql(u8, arg, "--image")) {
@@ -301,8 +337,8 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
 
         var stats: types.GenerationStats = undefined;
         if (args.video_path) |vid| {
-            std.debug.print("Processing multimodal video: {s} ...\n", .{vid});
-            stats = try engine.generateWithVideo(clean_prompt, vid, options, null, printTokenStdout);
+            std.debug.print("Processing multimodal video: {s} (max_frames: {d}) ...\n", .{ vid, args.max_frames });
+            stats = try engine.generateWithVideo(clean_prompt, vid, args.max_frames, options, null, printTokenStdout);
         } else if (args.audio_path) |aud| {
             std.debug.print("Processing multimodal audio: {s} ...\n", .{aud});
             stats = try engine.generateWithAudio(clean_prompt, aud, options, null, printTokenStdout);

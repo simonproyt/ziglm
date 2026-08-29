@@ -311,10 +311,10 @@ pub const Engine = struct {
 
         for (vid.frames) |*frame| {
             const frame_emb = if (self.model.vision_encoder) |*v_enc|
-                try v_enc.encodeImage(self.allocator, &frame.image, self.thread_pool)
+                try v_enc.encodeImageWithTokens(self.allocator, &frame.image, self.thread_pool, 70)
             else blk: {
                 const enc = vision.VisionEncoder.init(self.allocator, null, null, null, &[_]vision.VisionLayerWeights{});
-                break :blk try enc.encodeImage(self.allocator, &frame.image, self.thread_pool);
+                break :blk try enc.encodeImageWithTokens(self.allocator, &frame.image, self.thread_pool, 70);
             };
             defer self.allocator.free(frame_emb);
             try total_embeddings.appendSlice(self.allocator, frame_emb);
@@ -468,6 +468,18 @@ pub const Engine = struct {
                     .video => {
                         const patches_per_frame = if (num_frames > 0) item_count / num_frames else item_count;
                         for (0..num_frames) |f_idx| {
+                            // Frame timestamp: e.g. "00:00 "
+                            const ts_min = (f_idx * 2) / 60;
+                            const ts_sec = (f_idx * 2) % 60;
+                            var ts_buf: [32]u8 = undefined;
+                            const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>2}:{d:0>2} ", .{ ts_min, ts_sec }) catch "00:00 ";
+                            const ts_toks = self.tokenizer.encode(self.allocator, ts_str, false) catch &[_]u32{};
+                            defer if (ts_toks.len > 0) self.allocator.free(ts_toks);
+                            for (ts_toks) |t_tok| {
+                                last_logits = try self.model.forwardWithEmbedding(null, t_tok, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                                pos += 1;
+                            }
+
                             // Frame start: <|image> (255999)
                             last_logits = try self.model.forwardWithEmbedding(null, 255999, pos, self.kv_cache, self.buffers, self.thread_pool, false);
                             pos += 1;
@@ -476,7 +488,7 @@ pub const Engine = struct {
                                 const p_idx = f_idx * patches_per_frame + p;
                                 if (p_idx < item_count) {
                                     const patch_emb = emb[p_idx * dim .. (p_idx + 1) * dim];
-                                    last_logits = try self.model.forwardWithEmbedding(patch_emb, 258880, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                                    last_logits = try self.model.forwardWithEmbedding(patch_emb, 258884, pos, self.kv_cache, self.buffers, self.thread_pool, false);
                                     pos += 1;
                                 }
                             }
@@ -644,6 +656,7 @@ pub const Engine = struct {
         self: *Engine,
         prompt: []const u8,
         video_path: ?[]const u8,
+        max_frames: usize,
         options: GenerationOptions,
         callback_ctx: ?*anyopaque,
         callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
@@ -653,7 +666,7 @@ pub const Engine = struct {
         var stats = GenerationStats{};
         const t_start = getTimestampNs();
 
-        const vid_enc = try self.encodeVideo(video_path.?, 2);
+        const vid_enc = try self.encodeVideo(video_path.?, if (max_frames > 0) max_frames else 2);
         const video_embeddings = vid_enc.embeddings;
         const video_patches = vid_enc.total_patches;
         defer self.allocator.free(video_embeddings);

@@ -71,12 +71,13 @@ pub const VisionEncoder = struct {
         }
     }
 
-    /// Encode an image through the 16-layer Vision Transformer into LLM embeddings [num_patches, llm_dim]
-    pub fn encodeImage(
+    /// Encode an image through the 16-layer Vision Transformer into LLM embeddings [target_tokens, llm_dim]
+    pub fn encodeImageWithTokens(
         self: *const VisionEncoder,
         allocator: std.mem.Allocator,
         image: *const Image,
         pool: ?*ThreadPool,
+        target_tokens: usize,
     ) ![]f32 {
         const raw_patches = try image.extractPatches(allocator, self.patch_size);
         defer allocator.free(raw_patches);
@@ -95,15 +96,22 @@ pub const VisionEncoder = struct {
         var y_pos_buf: [768]f32 = undefined;
         var x_pos_buf: [768]f32 = undefined;
 
+        var patch_buf: [768]f32 = undefined;
+
         for (0..num_patches) |p| {
             const p_in = raw_patches[p * patch_dim .. (p + 1) * patch_dim];
             const p_state = states[p * self.hidden_size .. (p + 1) * self.hidden_size];
 
+            // Gemma 4 scales pixels from [0, 1] to [-1, 1]: 2 * (pixel - 0.5)
+            for (0..patch_dim) |d| {
+                patch_buf[d] = 2.0 * (p_in[d] - 0.5);
+            }
+
             // Linear patch embedding
             if (self.patch_proj) |proj| {
-                math.gemv(pool, proj.type, proj.data, p_in, p_state, self.hidden_size, patch_dim);
+                math.gemv(pool, proj.type, proj.data, &patch_buf, p_state, self.hidden_size, patch_dim);
             } else {
-                @memcpy(p_state[0..@min(patch_dim, self.hidden_size)], p_in[0..@min(patch_dim, self.hidden_size)]);
+                @memcpy(p_state[0..@min(patch_dim, self.hidden_size)], patch_buf[0..@min(patch_dim, self.hidden_size)]);
             }
 
             // 2D Spatial Positional Embeddings: [2, 10240, 768] -> table[0, py, :] + table[1, px, :]
@@ -291,20 +299,27 @@ pub const VisionEncoder = struct {
         const out_embeddings = try allocator.alloc(f32, num_patches * self.llm_dim);
         defer allocator.free(out_embeddings);
 
+        var norm_buf_single: [768]f32 = undefined;
+
         for (0..num_patches) |p| {
             const p_state = states[p * self.hidden_size .. (p + 1) * self.hidden_size];
             const p_out = out_embeddings[p * self.llm_dim .. (p + 1) * self.llm_dim];
 
+            // Gemma4MultimodalEmbedder: RMSNorm(no scale) before Linear projection
+            var sum_sq: f32 = 0.0;
+            for (p_state) |v| sum_sq += v * v;
+            const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+            for (0..self.hidden_size) |d| norm_buf_single[d] = p_state[d] * inv_rms;
+
             if (self.embedding_projection) |emb_proj| {
-                math.gemv(pool, emb_proj.type, emb_proj.data, p_state, p_out, self.llm_dim, self.hidden_size);
+                math.gemv(pool, emb_proj.type, emb_proj.data, &norm_buf_single, p_out, self.llm_dim, self.hidden_size);
             } else {
                 @memset(p_out, 0.0);
-                @memcpy(p_out[0..@min(self.hidden_size, self.llm_dim)], p_state[0..@min(self.hidden_size, self.llm_dim)]);
+                @memcpy(p_out[0..@min(self.hidden_size, self.llm_dim)], norm_buf_single[0..@min(self.hidden_size, self.llm_dim)]);
             }
         }
 
-        // 4. Resample / Pool to exactly 280 soft tokens (Gemma 4 vision token count)
-        const target_tokens: usize = 280;
+        // 4. Resample / Pool to target soft tokens (280 for image, 70 for video)
         const final_embeddings = try allocator.alloc(f32, target_tokens * self.llm_dim);
         errdefer allocator.free(final_embeddings);
 
@@ -322,6 +337,15 @@ pub const VisionEncoder = struct {
         }
 
         return final_embeddings;
+    }
+
+    pub fn encodeImage(
+        self: *const VisionEncoder,
+        allocator: std.mem.Allocator,
+        image: *const Image,
+        pool: ?*ThreadPool,
+    ) ![]f32 {
+        return self.encodeImageWithTokens(allocator, image, pool, 280);
     }
 };
 

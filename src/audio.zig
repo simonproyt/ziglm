@@ -144,24 +144,26 @@ pub fn parseWavBytes(allocator: std.mem.Allocator, bytes: []const u8) !AudioData
     };
 }
 
-/// Mel Filterbank & Log-Mel Spectrogram Generator
+/// Mel Filterbank & Log-Mel Spectrogram Generator matching Gemma 4 Audio Feature Extractor
 pub const LogMelSpectrogram = struct {
     allocator: std.mem.Allocator,
-    n_mels: usize = 80,
+    n_mels: usize = 128,
     n_fft: usize = 512,
+    frame_length: usize = 320,
     hop_length: usize = 160,
     sample_rate: u32 = 16000,
     mel_filters: []f32, // [n_mels * (n_fft / 2 + 1)]
 
     pub fn init(allocator: std.mem.Allocator, n_mels: usize, n_fft: usize, hop_length: usize, sample_rate: u32) !LogMelSpectrogram {
+        const frame_len: usize = 320;
         const num_freq_bins = n_fft / 2 + 1;
         const filter_size = n_mels * num_freq_bins;
         const mel_filters = try allocator.alloc(f32, filter_size);
         @memset(mel_filters, 0.0);
 
-        // Precompute Triangular Mel filterbanks
+        // Precompute Triangular Mel filterbanks (HTK scale from 0 to 8000 Hz)
         const f_min: f32 = 0.0;
-        const f_max: f32 = @as(f32, @floatFromInt(sample_rate)) / 2.0;
+        const f_max: f32 = 8000.0;
 
         const mel_min = hzToMel(f_min);
         const mel_max = hzToMel(f_max);
@@ -192,6 +194,7 @@ pub const LogMelSpectrogram = struct {
             .allocator = allocator,
             .n_mels = n_mels,
             .n_fft = n_fft,
+            .frame_length = frame_len,
             .hop_length = hop_length,
             .sample_rate = sample_rate,
             .mel_filters = mel_filters,
@@ -203,26 +206,34 @@ pub const LogMelSpectrogram = struct {
     }
 
     pub fn compute(self: *const LogMelSpectrogram, samples: []const f32) ![]f32 {
-        if (samples.len < self.n_fft) return error.AudioTooShort;
+        if (samples.len < self.frame_length) return error.AudioTooShort;
 
         const num_freq_bins = self.n_fft / 2 + 1;
-        const n_frames = (samples.len - self.n_fft) / self.hop_length + 1;
+        const n_frames = (samples.len - self.frame_length) / self.hop_length + 1;
         const result = try self.allocator.alloc(f32, n_frames * self.n_mels);
         errdefer self.allocator.free(result);
 
-        // Precompute Hanning window
-        var window: [512]f32 = undefined;
-        const n_fft_f = @as(f32, @floatFromInt(self.n_fft));
-        for (0..self.n_fft) |i| {
-            const angle = 2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / (n_fft_f - 1.0);
+        // Precompute 320-point Periodic Hanning window
+        var window: [320]f32 = undefined;
+        const fl_f = @as(f32, @floatFromInt(self.frame_length));
+        for (0..self.frame_length) |i| {
+            const angle = 2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / fl_f;
             window[i] = 0.5 * (1.0 - @cos(angle));
         }
 
+        var frame_buf: [512]f32 = undefined;
         var power_spectrum: [257]f32 = undefined;
+        const n_fft_f = @as(f32, @floatFromInt(self.n_fft));
 
         for (0..n_frames) |frame_idx| {
             const frame_start = frame_idx * self.hop_length;
-            const frame = samples[frame_start .. frame_start + self.n_fft];
+            const frame = samples[frame_start .. frame_start + self.frame_length];
+
+            // Apply 320-point window and zero-pad to 512
+            for (0..self.frame_length) |n| {
+                frame_buf[n] = frame[n] * window[n];
+            }
+            @memset(frame_buf[self.frame_length..self.n_fft], 0.0);
 
             // Compute DFT power spectrum for real windowed signal
             for (0..num_freq_bins) |k| {
@@ -231,23 +242,22 @@ pub const LogMelSpectrogram = struct {
                 const k_f = @as(f32, @floatFromInt(k));
 
                 for (0..self.n_fft) |n| {
-                    const val = frame[n] * window[n];
+                    const val = frame_buf[n];
                     const theta = 2.0 * std.math.pi * k_f * @as(f32, @floatFromInt(n)) / n_fft_f;
                     real += val * @cos(theta);
                     imag -= val * @sin(theta);
                 }
-                power_spectrum[k] = (real * real + imag * imag) / n_fft_f;
+                power_spectrum[k] = (real * real + imag * imag);
             }
 
-            // Apply Mel Filterbanks & Log scale
+            // Apply Mel Filterbanks & Natural Log with mel_floor=0.001
             for (0..self.n_mels) |m| {
                 var mel_energy: f32 = 0.0;
                 const filter_offset = m * num_freq_bins;
                 for (0..num_freq_bins) |k| {
                     mel_energy += power_spectrum[k] * self.mel_filters[filter_offset + k];
                 }
-                const log_val = @log10(@max(mel_energy, 1e-5));
-                result[frame_idx * self.n_mels + m] = (log_val + 4.0) / 4.0; // Normalized log mel
+                result[frame_idx * self.n_mels + m] = @log(@max(mel_energy, 0.001));
             }
         }
 
@@ -539,42 +549,90 @@ pub const AudioEncoder = struct {
                 if (layer.attn_k) |t| math.gemm(pool, t.type, t.data, p_norm, k_buf, num_frames, self.hidden_size, self.hidden_size);
                 if (layer.attn_v) |t| math.gemm(pool, t.type, t.data, p_norm, v_buf, num_frames, self.hidden_size, self.hidden_size);
                 
+                // Scaling factors
+                const q_base_scale: f32 = (1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)))) / std.math.ln2;
+                const k_base_scale: f32 = @log(1.0 + std.math.e) / std.math.ln2;
+
+                // Scale Q and K
+                for (0..num_frames) |t| {
+                    for (0..self.num_heads) |h| {
+                        for (0..self.head_dim) |d| {
+                            const pds = if (layer.per_dim_scale) |ps| ps[d] else 0.0;
+                            const softplus_pds = @log(1.0 + @exp(pds));
+                            q_buf[t * self.hidden_size + h * self.head_dim + d] *= (q_base_scale * softplus_pds);
+                            k_buf[t * self.hidden_size + h * self.head_dim + d] *= k_base_scale;
+                        }
+                    }
+                }
+
+                // Precompute sinusoidal relative position embeddings (13 offsets: 0..12)
+                var rel_pos_embed: [13 * 1024]f32 = undefined;
+                const log_inc = @log(10000.0) / 511.0;
+                for (0..13) |pos_id| {
+                    const pid_f = @as(f32, @floatFromInt(pos_id));
+                    for (0..512) |ts_idx| {
+                        const inv_ts = @exp(-@as(f32, @floatFromInt(ts_idx)) * log_inc);
+                        const scaled_time = pid_f * inv_ts;
+                        rel_pos_embed[pos_id * 1024 + ts_idx] = @sin(scaled_time);
+                        rel_pos_embed[pos_id * 1024 + 512 + ts_idx] = @cos(scaled_time);
+                    }
+                }
+
+                var rel_k_proj: [13 * 1024]f32 = undefined;
+                if (layer.attn_k_rel) |k_rel| {
+                    math.gemm(pool, k_rel.type, k_rel.data, &rel_pos_embed, &rel_k_proj, 13, self.hidden_size, self.hidden_size);
+                } else {
+                    @memcpy(&rel_k_proj, &rel_pos_embed);
+                }
+
                 const attn_out = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(attn_out);
-                
-                // Very naive full attention (ignoring chunking/rel pos for simplicity)
-                const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+
+                const softcap: f32 = 50.0;
+                const inv_softcap: f32 = 1.0 / 50.0;
+
                 for (0..self.num_heads) |h| {
+                    const h_offset = h * self.head_dim;
                     for (0..num_frames) |t_q| {
                         var max_score: f32 = -std.math.inf(f32);
                         const scores = try allocator.alloc(f32, num_frames);
                         defer allocator.free(scores);
-                        
+
                         for (0..num_frames) |t_k| {
-                            var score: f32 = 0;
+                            var ac_score: f32 = 0.0;
+                            var bd_score: f32 = 0.0;
+
+                            const delta: usize = @min(@as(usize, @intCast(@abs(@as(isize, @intCast(t_q)) - @as(isize, @intCast(t_k))))), 12);
+                            const r_slice = rel_k_proj[delta * self.hidden_size + h_offset .. delta * self.hidden_size + h_offset + self.head_dim];
+
                             for (0..self.head_dim) |d| {
-                                score += q_buf[t_q * self.hidden_size + h * self.head_dim + d] * k_buf[t_k * self.hidden_size + h * self.head_dim + d];
+                                const q_val = q_buf[t_q * self.hidden_size + h_offset + d];
+                                ac_score += q_val * k_buf[t_k * self.hidden_size + h_offset + d];
+                                bd_score += q_val * r_slice[d];
                             }
-                            score *= scale;
-                            scores[t_k] = score;
-                            if (score > max_score) max_score = score;
+
+                            var raw_score = ac_score + bd_score;
+                            // Softcap: softcap * tanh(score / softcap)
+                            raw_score = softcap * std.math.tanh(raw_score * inv_softcap);
+                            scores[t_k] = raw_score;
+                            if (raw_score > max_score) max_score = raw_score;
                         }
-                        
-                        var sum_exp: f32 = 0;
+
+                        var sum_exp: f32 = 0.0;
                         for (0..num_frames) |t_k| {
                             scores[t_k] = @exp(scores[t_k] - max_score);
                             sum_exp += scores[t_k];
                         }
-                        
+
                         for (0..self.head_dim) |d| {
-                            var val: f32 = 0;
+                            var val: f32 = 0.0;
                             for (0..num_frames) |t_k| {
-                                val += (scores[t_k] / sum_exp) * v_buf[t_k * self.hidden_size + h * self.head_dim + d];
+                                val += (scores[t_k] / sum_exp) * v_buf[t_k * self.hidden_size + h_offset + d];
                             }
-                            attn_out[t_q * self.hidden_size + h * self.head_dim + d] = val;
+                            attn_out[t_q * self.hidden_size + h_offset + d] = val;
                         }
                     }
                 }
-                
+
                 const out_proj = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(out_proj);
                 if (layer.attn_out) |t| math.gemm(pool, t.type, t.data, attn_out, out_proj, num_frames, self.hidden_size, self.hidden_size);
                 
