@@ -27,32 +27,33 @@ or see the help command for all the options that are possible
 curently according to my tests closely matches  the $\text{TPS} = \frac{\text{System RAM Bandwidth (GB/s)}}{\text{Model Size (GB)}}$  so i dont think i can improve more.
 <details>
 <summary>see current cpu architechture</summary>
+
 ```mermaid
 flowchart TD
     %% CLI / Entry
-    subgraph Entry ["1. CLI & Server Entrypoints (cli.zig / server.zig)"]
-        CLI_RUN["ziglm run / chat / bench"] --> PARSER["CLI Argument Parser<br/>(Options, Paths, Thread Count)"]
+    subgraph Entry ["1. CLI and Server Entrypoints (cli.zig / server.zig)"]
+        CLI_RUN["ziglm run / chat / bench"] --> PARSER["CLI Argument Parser<br/>Options, Paths, Thread Count"]
         HTTP_SRV["HTTP REST Server (:8080)<br/>OpenAI-compatible endpoints"] --> PARSER
     end
 
     %% Engine Initialization & Memory Mapping
-    subgraph Init ["2. Engine Initialization & Model Loader (engine.zig / gguf.zig / model.zig)"]
-        PARSER --> GGUF_LOAD["GGUF / SafeTensors File Loader<br/>• mmap weights into memory<br/>• Parse tensor metadata & header"]
-        GGUF_LOAD --> KV_ALLOC["KV Cache Allocation<br/>[layers, kv_heads, max_seq_len, head_size]"]
+    subgraph Init ["2. Engine Initialization and Model Loader (engine.zig / gguf.zig / model.zig)"]
+        PARSER --> GGUF_LOAD["GGUF / SafeTensors File Loader<br/>• mmap weights into memory<br/>• Parse tensor metadata and header"]
+        GGUF_LOAD --> KV_ALLOC["KV Cache Allocation<br/>layers, kv_heads, max_seq_len, head_size"]
         GGUF_LOAD --> BUF_ALLOC["Per-Thread Scratchpad Buffers<br/>• Residuals, Q/K/V, Attention scores, MLP states"]
-        GGUF_LOAD --> TP_INIT["ThreadPool Initialization<br/>• N worker threads pinned to CPU cores<br/>• Lock-free / mutex-free work distribution"]
+        GGUF_LOAD --> TP_INIT["ThreadPool Initialization<br/>• N worker threads pinned to CPU cores<br/>• Lock-free work distribution"]
     end
 
     %% Multimodal Input Processing (CPU)
-    subgraph Inputs ["3. Multimodal Preprocessing & Tower Encoders"]
+    subgraph Inputs ["3. Multimodal Preprocessing and Tower Encoders"]
         direction TB
         TEXT_IN["Prompt Text"] --> TOKENIZER["BPE / SentencePiece Tokenizer<br/>Token ID Lookup (tokenizer.zig)"]
         
         IMAGE_IN["Image File (PNG/JPG/PPM)"] --> IMG_PROC["Image Rescaling [-1, 1]<br/>16x16 Patch Extraction (image.zig)"]
-        IMG_PROC --> VIT["16-Layer Vision Transformer<br/>• Patch Proj + 2D Pos Embedding<br/>• Self-Attention + GeGLU<br/>• RMSNorm + mm.input_projection<br/>• 280 Soft Tokens [280, 1536] (vision.zig)"]
+        IMG_PROC --> VIT["16-Layer Vision Transformer<br/>• Patch Proj + 2D Pos Embedding<br/>• Self-Attention + GeGLU<br/>• RMSNorm + mm.input_projection<br/>• 280 Soft Tokens (vision.zig)"]
 
-        VIDEO_IN["Video File (MP4/MKV)"] --> VID_PROC["Frame Extraction & Sampling (video.zig)"]
-        VID_PROC --> VID_VIT["Per-Frame Vision Pooling<br/>• 70 Soft Tokens per Frame [70, 1536]<br/>• Wrapped with &lt;|video|&gt; + Timestamps"]
+        VIDEO_IN["Video File (MP4/MKV)"] --> VID_PROC["Frame Extraction and Sampling (video.zig)"]
+        VID_PROC --> VID_VIT["Per-Frame Vision Pooling<br/>• 70 Soft Tokens per Frame<br/>• Wrapped with &lt;|video|&gt; + Timestamps"]
 
         AUDIO_IN["Audio WAV (16kHz Mono)"] --> AUDIO_STFT["Log-Mel Spectrogram (audio.zig)<br/>• 320-pt Hann Window (20ms)<br/>• 512-pt Real FFT + 128 Mel Bins<br/>• Natural Log ln(max(E, 0.001))"]
         AUDIO_STFT --> AUDIO_USM["12-Layer Audio Conformer (audio.zig)<br/>• 2x Conv2D Subsampling (4x temporal reduction)<br/>• Macaron FFNs (0.5 residual weight)<br/>• Relative Attention + Sinusoidal Embeddings<br/>• Causal 1D Depthwise Separable Conv (k=5)<br/>• a.pre_encode.out + RMSNorm + mm.a.input_projection"]
@@ -66,9 +67,9 @@ flowchart TD
         VID_VIT --> DISPATCH
         AUDIO_USM --> DISPATCH
 
-        DISPATCH --> PLE_GATE{"Is Multimodal Token?<br/>(custom_embedding != null)"}
+        DISPATCH --> PLE_GATE{"Is Multimodal Token?<br/>custom_embedding != null"}
         PLE_GATE -- "Yes (Vision/Audio/Video)" --> PLE_MM["Multimodal PLE Path<br/>• Context Projection ONLY<br/>• No Token ID Identity Lookup"]
-        PLE_GATE -- "No (Text Token)" --> PLE_TXT["Text PLE Path<br/>• (Token Identity + Context Proj) * 1/&radic;2"]
+        PLE_GATE -- "No (Text Token)" --> PLE_TXT["Text PLE Path<br/>• (Token Identity + Context Proj) * 1/sqrt(2)"]
     end
 
     %% Transformer Layer CPU Pipeline
@@ -91,7 +92,7 @@ flowchart TD
         
         ATTN_OUT --> FFN_NORM["Post-Attention RMSNorm<br/>math.rmsNorm()"]
         
-        FFN_NORM --> MLP_BLOCK["Gated MLP (GeGLU / SwiGLU)<br/>• gate = x @ W_gate<br/>• up = x @ W_up<br/>• act = GELU(gate) * up (or SiLU(gate) * up)<br/>• down = act @ W_down<br/>Residual Add: x = x + down"]
+        FFN_NORM --> MLP_BLOCK["Gated MLP (GeGLU / SwiGLU)<br/>• gate = x @ W_gate<br/>• up = x @ W_up<br/>• act = GELU(gate) * up<br/>• down = act @ W_down<br/>Residual Add: x = x + down"]
         
         MLP_BLOCK --> NEXT_LAYER{"More Layers?"}
         NEXT_LAYER -- "Yes" --> LAYER_LOOP
@@ -99,7 +100,7 @@ flowchart TD
     end
 
     %% Math & SIMD Kernels
-    subgraph Compute ["6. CPU SIMD Math & Dequantization Kernels (math.zig / quant.zig)"]
+    subgraph Compute ["6. CPU SIMD Math and Dequantization Kernels (math.zig / quant.zig)"]
         direction TB
         SIMD_VEC["SIMD Vector Operations<br/>• AVX-512 (512-bit registers, 16 floats/op)<br/>• AVX2 + FMA (256-bit registers, 8 floats/op)<br/>• ARM NEON (128-bit vectors)"]
         
@@ -115,11 +116,11 @@ flowchart TD
     end
 
     %% Logits & Sampling
-    subgraph Output ["7. Logits & Autoregressive Generation Loop (sampler.zig / engine.zig)"]
+    subgraph Output ["7. Logits and Autoregressive Generation Loop (sampler.zig / engine.zig)"]
         direction TB
-        FINAL_NORM --> LM_HEAD["LM Head Output GEMV: x @ W_head<br/>Produces Raw Logits [vocab_size]"]
+        FINAL_NORM --> LM_HEAD["LM Head Output GEMV: x @ W_head<br/>Produces Raw Logits"]
         
-        LM_HEAD --> SAMPLER["Logits Processor & Sampler<br/>• Temperature Scaling<br/>• Greedy argmax (if temp == 0)<br/>• Top-K Filtering<br/>• Top-P Nucleus Filtering<br/>• Min-P Filtering"]
+        LM_HEAD --> SAMPLER["Logits Processor and Sampler<br/>• Temperature Scaling<br/>• Greedy argmax (if temp == 0)<br/>• Top-K Filtering<br/>• Top-P Nucleus Filtering<br/>• Min-P Filtering"]
         
         SAMPLER --> NEXT_TOKEN["Sample Next Token ID"]
         
@@ -131,6 +132,7 @@ flowchart TD
         EOS_CHECK -- "Yes (Finished)" --> STATS["Print Bench Stats<br/>(Prefill tok/s, Gen tok/s, Total ms)"]
     end
 ```
+
 </details>
 
 # Dependencies 
