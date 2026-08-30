@@ -205,6 +205,82 @@ pub const LogMelSpectrogram = struct {
         self.allocator.free(self.mel_filters);
     }
 
+const BIT_REV_512: [512]u16 = blk: {
+    @setEvalBranchQuota(10000);
+    var table: [512]u16 = undefined;
+    for (0..512) |i| {
+        var n = i;
+        var rev: u16 = 0;
+        for (0..9) |_| {
+            rev = (rev << 1) | @as(u16, @intCast(n & 1));
+            n >>= 1;
+        }
+        table[i] = rev;
+    }
+    break :blk table;
+};
+
+const TWIDDLE_COS_512: [256]f32 = blk: {
+    @setEvalBranchQuota(10000);
+    var cos_tab: [256]f32 = undefined;
+    for (0..256) |k| {
+        const theta = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / 512.0;
+        cos_tab[k] = @cos(theta);
+    }
+    break :blk cos_tab;
+};
+
+const TWIDDLE_SIN_512: [256]f32 = blk: {
+    @setEvalBranchQuota(10000);
+    var sin_tab: [256]f32 = undefined;
+    for (0..256) |k| {
+        const theta = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / 512.0;
+        sin_tab[k] = @sin(theta);
+    }
+    break :blk sin_tab;
+};
+
+fn fft512(in_real: *const [512]f32, out_power_spectrum: *[257]f32) void {
+    var real: [512]f32 = undefined;
+    var imag: [512]f32 = undefined;
+
+    // 1. Bit-reversal permutation
+    for (0..512) |i| {
+        real[i] = in_real[BIT_REV_512[i]];
+        imag[i] = 0.0;
+    }
+
+    // 2. Cooley-Tukey Radix-2 butterfly stages
+    var len: usize = 2;
+    while (len <= 512) : (len <<= 1) {
+        const half = len >> 1;
+        const step = 512 / len;
+        var i: usize = 0;
+        while (i < 512) : (i += len) {
+            for (0..half) |k| {
+                const tw_idx = k * step;
+                const w_re = TWIDDLE_COS_512[tw_idx];
+                const w_im = TWIDDLE_SIN_512[tw_idx];
+
+                const u_re = real[i + k];
+                const u_im = imag[i + k];
+                const v_re = real[i + k + half] * w_re - imag[i + k + half] * w_im;
+                const v_im = real[i + k + half] * w_im + imag[i + k + half] * w_re;
+
+                real[i + k] = u_re + v_re;
+                imag[i + k] = u_im + v_im;
+                real[i + k + half] = u_re - v_re;
+                imag[i + k + half] = u_im - v_im;
+            }
+        }
+    }
+
+    // 3. Power spectrum for 0..256 (Nyquist)
+    for (0..257) |k| {
+        out_power_spectrum[k] = real[k] * real[k] + imag[k] * imag[k];
+    }
+}
+
     pub fn compute(self: *const LogMelSpectrogram, samples: []const f32) ![]f32 {
         if (samples.len < self.frame_length) return error.AudioTooShort;
 
@@ -223,7 +299,6 @@ pub const LogMelSpectrogram = struct {
 
         var frame_buf: [512]f32 = undefined;
         var power_spectrum: [257]f32 = undefined;
-        const n_fft_f = @as(f32, @floatFromInt(self.n_fft));
 
         for (0..n_frames) |frame_idx| {
             const frame_start = frame_idx * self.hop_length;
@@ -235,20 +310,8 @@ pub const LogMelSpectrogram = struct {
             }
             @memset(frame_buf[self.frame_length..self.n_fft], 0.0);
 
-            // Compute DFT power spectrum for real windowed signal
-            for (0..num_freq_bins) |k| {
-                var real: f32 = 0.0;
-                var imag: f32 = 0.0;
-                const k_f = @as(f32, @floatFromInt(k));
-
-                for (0..self.n_fft) |n| {
-                    const val = frame_buf[n];
-                    const theta = 2.0 * std.math.pi * k_f * @as(f32, @floatFromInt(n)) / n_fft_f;
-                    real += val * @cos(theta);
-                    imag -= val * @sin(theta);
-                }
-                power_spectrum[k] = (real * real + imag * imag);
-            }
+            // Compute 512-point Cooley-Tukey Radix-2 FFT
+            fft512(&frame_buf, &power_spectrum);
 
             // Apply Mel Filterbanks & Natural Log with mel_floor=0.001
             for (0..self.n_mels) |m| {
@@ -484,14 +547,72 @@ pub const AudioEncoder = struct {
         }
 
                 // Now apply conformer layers
+        // Preallocate scratchpad working buffers once for all 12 Conformer layers
+        const p_norm = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(p_norm);
+
+        const p_ffn_up = try allocator.alloc(f32, target_frames * self.intermediate_size);
+        defer allocator.free(p_ffn_up);
+
+        const p_ffn_down = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(p_ffn_down);
+
+        const q_buf = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(q_buf);
+
+        const k_buf = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(k_buf);
+
+        const v_buf = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(v_buf);
+
+        const attn_out = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(attn_out);
+
+        const out_proj = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(out_proj);
+
+        const scores = try allocator.alloc(f32, target_frames);
+        defer allocator.free(scores);
+
+        const pw1_out = try allocator.alloc(f32, target_frames * self.hidden_size * 2);
+        defer allocator.free(pw1_out);
+
+        const glu_out = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(glu_out);
+
+        const dw_out = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(dw_out);
+
+        const pw2_out = try allocator.alloc(f32, target_frames * self.hidden_size);
+        defer allocator.free(pw2_out);
+
+        // Precompute sinusoidal relative position embeddings (13 offsets: 0..12)
+        var rel_pos_embed: [13 * 1024]f32 = undefined;
+        const log_inc = @log(10000.0) / 511.0;
+        for (0..13) |pos_id| {
+            const pid_f = @as(f32, @floatFromInt(pos_id));
+            for (0..512) |ts_idx| {
+                const inv_ts = @exp(-@as(f32, @floatFromInt(ts_idx)) * log_inc);
+                const scaled_time = pid_f * inv_ts;
+                rel_pos_embed[pos_id * 1024 + ts_idx] = @sin(scaled_time);
+                rel_pos_embed[pos_id * 1024 + 512 + ts_idx] = @cos(scaled_time);
+            }
+        }
+        var rel_k_proj: [13 * 1024]f32 = undefined;
+
+        // Scaling factors
+        const q_base_scale: f32 = (1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)))) / std.math.ln2;
+        const k_base_scale: f32 = @log(1.0 + std.math.e) / std.math.ln2;
+        const softcap: f32 = 50.0;
+        const inv_softcap: f32 = 1.0 / 50.0;
+
+        // Now apply conformer layers with zero heap allocations
         for (self.layers) |layer| {
             const num_frames = target_frames;
-            
+
             // --- FFN 1 ---
             if (layer.ffn_norm) |norm| {
-                const p_norm = try allocator.alloc(f32, num_frames * self.hidden_size);
-                defer allocator.free(p_norm);
-                
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
@@ -500,22 +621,18 @@ pub const AudioEncoder = struct {
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
-                
-                const p_ffn_up = try allocator.alloc(f32, num_frames * self.intermediate_size);
-                defer allocator.free(p_ffn_up);
+
                 if (layer.ffn_up) |up| {
                     math.gemm(pool, up.type, up.data, p_norm, p_ffn_up, num_frames, self.intermediate_size, self.hidden_size);
                 }
-                
+
                 // SiLU
                 for (p_ffn_up) |*v| v.* = v.* / (1.0 + @exp(-v.*));
-                
-                const p_ffn_down = try allocator.alloc(f32, num_frames * self.hidden_size);
-                defer allocator.free(p_ffn_down);
+
                 if (layer.ffn_down) |down| {
                     math.gemm(pool, down.type, down.data, p_ffn_up, p_ffn_down, num_frames, self.hidden_size, self.intermediate_size);
                 }
-                
+
                 if (layer.ffn_post_norm) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = p_ffn_down[t * self.hidden_size .. (t + 1) * self.hidden_size];
@@ -526,12 +643,9 @@ pub const AudioEncoder = struct {
                     }
                 }
             }
-            
+
             // --- Attention ---
             if (layer.attn_pre_norm) |norm| {
-                const p_norm = try allocator.alloc(f32, num_frames * self.hidden_size);
-                defer allocator.free(p_norm);
-                
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
@@ -540,18 +654,10 @@ pub const AudioEncoder = struct {
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
-                
-                const q_buf = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(q_buf);
-                const k_buf = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(k_buf);
-                const v_buf = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(v_buf);
-                
+
                 if (layer.attn_q) |t| math.gemm(pool, t.type, t.data, p_norm, q_buf, num_frames, self.hidden_size, self.hidden_size);
                 if (layer.attn_k) |t| math.gemm(pool, t.type, t.data, p_norm, k_buf, num_frames, self.hidden_size, self.hidden_size);
                 if (layer.attn_v) |t| math.gemm(pool, t.type, t.data, p_norm, v_buf, num_frames, self.hidden_size, self.hidden_size);
-                
-                // Scaling factors
-                const q_base_scale: f32 = (1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)))) / std.math.ln2;
-                const k_base_scale: f32 = @log(1.0 + std.math.e) / std.math.ln2;
 
                 // Scale Q and K
                 for (0..num_frames) |t| {
@@ -565,37 +671,16 @@ pub const AudioEncoder = struct {
                     }
                 }
 
-                // Precompute sinusoidal relative position embeddings (13 offsets: 0..12)
-                var rel_pos_embed: [13 * 1024]f32 = undefined;
-                const log_inc = @log(10000.0) / 511.0;
-                for (0..13) |pos_id| {
-                    const pid_f = @as(f32, @floatFromInt(pos_id));
-                    for (0..512) |ts_idx| {
-                        const inv_ts = @exp(-@as(f32, @floatFromInt(ts_idx)) * log_inc);
-                        const scaled_time = pid_f * inv_ts;
-                        rel_pos_embed[pos_id * 1024 + ts_idx] = @sin(scaled_time);
-                        rel_pos_embed[pos_id * 1024 + 512 + ts_idx] = @cos(scaled_time);
-                    }
-                }
-
-                var rel_k_proj: [13 * 1024]f32 = undefined;
                 if (layer.attn_k_rel) |k_rel| {
                     math.gemm(pool, k_rel.type, k_rel.data, &rel_pos_embed, &rel_k_proj, 13, self.hidden_size, self.hidden_size);
                 } else {
                     @memcpy(&rel_k_proj, &rel_pos_embed);
                 }
 
-                const attn_out = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(attn_out);
-
-                const softcap: f32 = 50.0;
-                const inv_softcap: f32 = 1.0 / 50.0;
-
                 for (0..self.num_heads) |h| {
                     const h_offset = h * self.head_dim;
                     for (0..num_frames) |t_q| {
                         var max_score: f32 = -std.math.inf(f32);
-                        const scores = try allocator.alloc(f32, num_frames);
-                        defer allocator.free(scores);
 
                         for (0..num_frames) |t_k| {
                             var ac_score: f32 = 0.0;
@@ -633,9 +718,8 @@ pub const AudioEncoder = struct {
                     }
                 }
 
-                const out_proj = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(out_proj);
                 if (layer.attn_out) |t| math.gemm(pool, t.type, t.data, attn_out, out_proj, num_frames, self.hidden_size, self.hidden_size);
-                
+
                 if (layer.attn_post_norm) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = out_proj[t * self.hidden_size .. (t + 1) * self.hidden_size];
@@ -646,10 +730,9 @@ pub const AudioEncoder = struct {
                     }
                 }
             }
-            
+
             // --- Conv Module ---
             if (layer.norm_conv) |norm| {
-                const p_norm = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(p_norm);
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
@@ -658,12 +741,10 @@ pub const AudioEncoder = struct {
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
-                
-                const pw1_out = try allocator.alloc(f32, num_frames * self.hidden_size * 2); defer allocator.free(pw1_out);
+
                 if (layer.conv_pw1) |pw1| math.gemm(pool, pw1.type, pw1.data, p_norm, pw1_out, num_frames, self.hidden_size * 2, self.hidden_size);
-                
+
                 // GLU
-                const glu_out = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(glu_out);
                 for (0..num_frames) |t| {
                     for (0..self.hidden_size) |d| {
                         const v1 = pw1_out[t * self.hidden_size * 2 + d];
@@ -671,19 +752,16 @@ pub const AudioEncoder = struct {
                         glu_out[t * self.hidden_size + d] = v1 * (1.0 / (1.0 + @exp(-v2)));
                     }
                 }
-                
+
                 // 1D Depthwise Conv (kernel=5, causal: left_pad=4)
-                const dw_out = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(dw_out);
                 if (layer.conv_dw) |dw| {
                     const w_slice = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(dw.data)));
                     for (0..num_frames) |t| {
                         for (0..self.hidden_size) |d| {
                             var sum: f32 = 0;
-                            // kernel=5, causal padding: left_pad=4, right_pad=0
                             for (0..5) |k| {
                                 const t_in: isize = @as(isize, @intCast(t)) + @as(isize, @intCast(k)) - 4;
                                 if (t_in >= 0 and t_in < num_frames) {
-                                    // GGUF stores [5, 1024] = [kernel, channels]
                                     sum += glu_out[@as(usize, @intCast(t_in)) * self.hidden_size + d] * w_slice[k * self.hidden_size + d];
                                 }
                             }
@@ -691,7 +769,7 @@ pub const AudioEncoder = struct {
                         }
                     }
                 }
-                
+
                 // Conv Norm (LayerNorm)
                 if (layer.conv_norm) |cnorm| {
                     for (0..num_frames) |t| {
@@ -702,23 +780,21 @@ pub const AudioEncoder = struct {
                         for (src, 0..) |*v, d| v.* = (v.* - mean) * inv_std * cnorm[d];
                     }
                 }
-                
+
                 // SiLU
                 for (dw_out) |*v| v.* = v.* / (1.0 + @exp(-v.*));
-                
-                const pw2_out = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(pw2_out);
+
                 if (layer.conv_pw2) |pw2| math.gemm(pool, pw2.type, pw2.data, dw_out, pw2_out, num_frames, self.hidden_size, self.hidden_size);
-                
+
                 for (0..num_frames) |t| {
                     for (0..self.hidden_size) |d| {
                         states[t * self.hidden_size + d] += pw2_out[t * self.hidden_size + d];
                     }
                 }
             }
-            
+
             // --- FFN 2 ---
             if (layer.ffn_norm_1) |norm| {
-                const p_norm = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(p_norm);
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
@@ -727,15 +803,13 @@ pub const AudioEncoder = struct {
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
-                
-                const p_ffn_up = try allocator.alloc(f32, num_frames * self.intermediate_size); defer allocator.free(p_ffn_up);
+
                 if (layer.ffn_up_1) |up| math.gemm(pool, up.type, up.data, p_norm, p_ffn_up, num_frames, self.intermediate_size, self.hidden_size);
-                
+
                 for (p_ffn_up) |*v| v.* = v.* / (1.0 + @exp(-v.*));
-                
-                const p_ffn_down = try allocator.alloc(f32, num_frames * self.hidden_size); defer allocator.free(p_ffn_down);
+
                 if (layer.ffn_down_1) |down| math.gemm(pool, down.type, down.data, p_ffn_up, p_ffn_down, num_frames, self.hidden_size, self.intermediate_size);
-                
+
                 if (layer.ffn_post_norm_1) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = p_ffn_down[t * self.hidden_size .. (t + 1) * self.hidden_size];
@@ -746,7 +820,7 @@ pub const AudioEncoder = struct {
                     }
                 }
             }
-            
+
             // --- LN2 ---
             if (layer.ln2) |ln2| {
                 for (0..num_frames) |t| {

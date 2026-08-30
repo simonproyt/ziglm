@@ -140,13 +140,13 @@ pub const Video = struct {
             }
 
             const slice = bytes[offset..];
-            if (Image.loadPPM(allocator, slice)) |img| {
+            if (Image.loadPPMWithConsumedBytes(allocator, slice)) |res| {
                 try frames_list.append(allocator, .{
-                    .image = img,
+                    .image = res.image,
                     .timestamp_sec = @as(f32, @floatFromInt(frame_idx)),
                 });
                 frame_idx += 1;
-                offset += (img.width * img.height * 3) + 15;
+                offset += res.bytes_consumed;
             } else |_| {
                 offset += 1;
             }

@@ -56,7 +56,7 @@ pub const Image = struct {
         };
     }
 
-    pub fn loadPPM(allocator: std.mem.Allocator, bytes: []const u8) !Image {
+    pub fn loadPPMWithConsumedBytes(allocator: std.mem.Allocator, bytes: []const u8) !struct { image: Image, bytes_consumed: usize } {
         var it = std.mem.tokenizeAny(u8, bytes, " \t\r\n");
         const magic = it.next() orelse return error.InvalidPPM;
         if (!std.mem.eql(u8, magic, "P6")) return error.InvalidPPM;
@@ -73,7 +73,8 @@ pub const Image = struct {
         const pixel_bytes = bytes[header_end..];
         const is_16bit = max_val > 255.0;
         const sample_bytes: usize = if (is_16bit) 2 else 1;
-        if (pixel_bytes.len < w * h * 3 * sample_bytes) return error.UnexpectedEOF;
+        const pixel_len = w * h * 3 * sample_bytes;
+        if (pixel_bytes.len < pixel_len) return error.UnexpectedEOF;
 
         const out_data = try allocator.alloc(f32, w * h * 3);
         errdefer allocator.free(out_data);
@@ -89,13 +90,21 @@ pub const Image = struct {
             }
         }
 
-        return Image{
-            .width = w,
-            .height = h,
-            .channels = 3,
-            .data = out_data,
-            .allocator = allocator,
+        return .{
+            .image = Image{
+                .width = w,
+                .height = h,
+                .channels = 3,
+                .data = out_data,
+                .allocator = allocator,
+            },
+            .bytes_consumed = header_end + pixel_len,
         };
+    }
+
+    pub fn loadPPM(allocator: std.mem.Allocator, bytes: []const u8) !Image {
+        const res = try loadPPMWithConsumedBytes(allocator, bytes);
+        return res.image;
     }
 
     fn loadViaExternalConverter(allocator: std.mem.Allocator, actual_path: []const u8) !Image {

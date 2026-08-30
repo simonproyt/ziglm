@@ -757,6 +757,38 @@ pub fn gemv(
     }
 }
 
+pub const GemmContext = struct {
+    qtype: GGMLType,
+    weight_data: []const u8,
+    row_bytes: usize,
+    X: []const f32,
+    Y: []f32,
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+};
+
+fn gemmRangeWorker(ctx_ptr: ?*anyopaque, start_row: usize, end_row: usize, _: usize) void {
+    const ctx: *const GemmContext = @ptrCast(@alignCast(ctx_ptr.?));
+    const qtype = ctx.qtype;
+    const weight_data = ctx.weight_data;
+    const row_bytes = ctx.row_bytes;
+    const X = ctx.X;
+    const Y = ctx.Y;
+    const batch_size = ctx.batch_size;
+    const rows = ctx.rows;
+    const cols = ctx.cols;
+
+    for (start_row..end_row) |r| {
+        const row_start = r * row_bytes;
+        const row_data = weight_data[row_start .. row_start + row_bytes];
+        for (0..batch_size) |b| {
+            const x_slice = X[b * cols .. (b + 1) * cols];
+            Y[b * rows + r] = dotRow(qtype, row_data, x_slice, cols);
+        }
+    }
+}
+
 pub fn gemm(
     pool: ?*ThreadPool,
     qtype: GGMLType,
@@ -767,10 +799,31 @@ pub fn gemm(
     rows: usize,
     cols: usize,
 ) void {
-    for (0..batch_size) |b| {
-        const x_slice = X[b * cols .. (b + 1) * cols];
-        const y_slice = Y[b * rows .. (b + 1) * rows];
-        gemv(pool, qtype, weight_data, x_slice, y_slice, rows, cols);
+    if (batch_size == 0 or rows == 0 or cols == 0) return;
+    if (batch_size == 1) {
+        gemv(pool, qtype, weight_data, X, Y, rows, cols);
+        return;
+    }
+
+    const blk_size = qtype.blockSize();
+    const type_size = qtype.typeSize();
+    const row_bytes = (cols / blk_size) * type_size;
+
+    var ctx = GemmContext{
+        .qtype = qtype,
+        .weight_data = weight_data,
+        .row_bytes = row_bytes,
+        .X = X,
+        .Y = Y,
+        .batch_size = batch_size,
+        .rows = rows,
+        .cols = cols,
+    };
+
+    if (pool != null and rows >= 8 and (rows * cols * batch_size) >= 8192) {
+        pool.?.parallelForRange(rows, &ctx, gemmRangeWorker);
+    } else {
+        gemmRangeWorker(&ctx, 0, rows, 0);
     }
 }
 

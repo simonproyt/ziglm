@@ -160,17 +160,17 @@ pub const VisionEncoder = struct {
             const attn_out = try allocator.alloc(f32, num_patches * self.hidden_size);
             defer allocator.free(attn_out);
 
-            const gate_buf = try allocator.alloc(f32, self.intermediate_size);
-            defer allocator.free(gate_buf);
+            const gate_buf_all = try allocator.alloc(f32, num_patches * self.intermediate_size);
+            defer allocator.free(gate_buf_all);
 
-            const up_buf = try allocator.alloc(f32, self.intermediate_size);
-            defer allocator.free(up_buf);
+            const up_buf_all = try allocator.alloc(f32, num_patches * self.intermediate_size);
+            defer allocator.free(up_buf_all);
 
-            const act_buf = try allocator.alloc(f32, self.intermediate_size);
-            defer allocator.free(act_buf);
+            const act_buf_all = try allocator.alloc(f32, num_patches * self.intermediate_size);
+            defer allocator.free(act_buf_all);
 
-            const down_buf = try allocator.alloc(f32, self.hidden_size);
-            defer allocator.free(down_buf);
+            const down_buf_all = try allocator.alloc(f32, num_patches * self.hidden_size);
+            defer allocator.free(down_buf_all);
 
             const scores = try allocator.alloc(f32, num_patches);
             defer allocator.free(scores);
@@ -189,18 +189,15 @@ pub const VisionEncoder = struct {
                     }
                 }
 
-                // B. Q, K, V Projections
+                // B. Parallel Batched Q, K, V Projections
+                if (layer.q_proj) |t| math.gemm(pool, t.type, t.data, norm_buf, q_buf, num_patches, self.hidden_size, self.hidden_size);
+                if (layer.k_proj) |t| math.gemm(pool, t.type, t.data, norm_buf, k_buf, num_patches, self.hidden_size, self.hidden_size);
+                if (layer.v_proj) |t| math.gemm(pool, t.type, t.data, norm_buf, v_buf, num_patches, self.hidden_size, self.hidden_size);
+
+                // Head norms for Q and K
                 for (0..num_patches) |p| {
-                    const p_norm = norm_buf[p * self.hidden_size .. (p + 1) * self.hidden_size];
                     const p_q = q_buf[p * self.hidden_size .. (p + 1) * self.hidden_size];
                     const p_k = k_buf[p * self.hidden_size .. (p + 1) * self.hidden_size];
-                    const p_v = v_buf[p * self.hidden_size .. (p + 1) * self.hidden_size];
-
-                    if (layer.q_proj) |t| math.gemv(pool, t.type, t.data, p_norm, p_q, self.hidden_size, self.hidden_size);
-                    if (layer.k_proj) |t| math.gemv(pool, t.type, t.data, p_norm, p_k, self.hidden_size, self.hidden_size);
-                    if (layer.v_proj) |t| math.gemv(pool, t.type, t.data, p_norm, p_v, self.hidden_size, self.hidden_size);
-
-                    // Head norms for Q and K
                     for (0..self.num_heads) |h| {
                         const q_h = p_q[h * self.head_dim .. (h + 1) * self.head_dim];
                         const k_h = p_k[h * self.head_dim .. (h + 1) * self.head_dim];
@@ -238,16 +235,15 @@ pub const VisionEncoder = struct {
                 }
 
                 // D. Attention Output Projection & Residual
+                if (layer.o_proj) |t| {
+                    math.gemm(pool, t.type, t.data, attn_ctx, attn_out, num_patches, self.hidden_size, self.hidden_size);
+                } else {
+                    @memcpy(attn_out, attn_ctx);
+                }
+
                 for (0..num_patches) |p| {
-                    const p_ctx = attn_ctx[p * self.hidden_size .. (p + 1) * self.hidden_size];
                     const p_out = attn_out[p * self.hidden_size .. (p + 1) * self.hidden_size];
                     const p_state = states[p * self.hidden_size .. (p + 1) * self.hidden_size];
-
-                    if (layer.o_proj) |t| {
-                        math.gemv(pool, t.type, t.data, p_ctx, p_out, self.hidden_size, self.hidden_size);
-                    } else {
-                        @memcpy(p_out, p_ctx);
-                    }
 
                     if (layer.post_attention_layernorm) |pn| {
                         math.rmsNorm(p_out, pn, p_out, 1e-6, false);
@@ -268,28 +264,42 @@ pub const VisionEncoder = struct {
                     } else {
                         @memcpy(p_norm, p_state);
                     }
+                }
 
-                    if (layer.gate_proj) |t_gate| {
-                        math.gemv(pool, t_gate.type, t_gate.data, p_norm, gate_buf, self.intermediate_size, self.hidden_size);
-                    }
-                    if (layer.up_proj) |t_up| {
-                        math.gemv(pool, t_up.type, t_up.data, p_norm, up_buf, self.intermediate_size, self.hidden_size);
-                    }
+                if (layer.gate_proj) |t_gate| {
+                    math.gemm(pool, t_gate.type, t_gate.data, norm_buf, gate_buf_all, num_patches, self.intermediate_size, self.hidden_size);
+                }
+                if (layer.up_proj) |t_up| {
+                    math.gemm(pool, t_up.type, t_up.data, norm_buf, up_buf_all, num_patches, self.intermediate_size, self.hidden_size);
+                }
 
-                    math.geglu(gate_buf, up_buf, act_buf);
+                for (0..num_patches) |p| {
+                    const g = gate_buf_all[p * self.intermediate_size .. (p + 1) * self.intermediate_size];
+                    const u = up_buf_all[p * self.intermediate_size .. (p + 1) * self.intermediate_size];
+                    const a = act_buf_all[p * self.intermediate_size .. (p + 1) * self.intermediate_size];
+                    math.geglu(g, u, a);
+                }
 
-                    if (layer.down_proj) |t_down| {
-                        math.gemv(pool, t_down.type, t_down.data, act_buf, down_buf, self.hidden_size, self.intermediate_size);
-                    } else {
-                        @memcpy(down_buf, act_buf[0..self.hidden_size]);
+                if (layer.down_proj) |t_down| {
+                    math.gemm(pool, t_down.type, t_down.data, act_buf_all, down_buf_all, num_patches, self.hidden_size, self.intermediate_size);
+                } else {
+                    for (0..num_patches) |p| {
+                        const a = act_buf_all[p * self.intermediate_size .. (p + 1) * self.intermediate_size];
+                        const d = down_buf_all[p * self.hidden_size .. (p + 1) * self.hidden_size];
+                        @memcpy(d, a[0..self.hidden_size]);
                     }
+                }
+
+                for (0..num_patches) |p| {
+                    const p_state = states[p * self.hidden_size .. (p + 1) * self.hidden_size];
+                    const p_down = down_buf_all[p * self.hidden_size .. (p + 1) * self.hidden_size];
 
                     if (layer.post_feedforward_layernorm) |pfn| {
-                        math.rmsNorm(down_buf, pfn, down_buf, 1e-6, false);
+                        math.rmsNorm(p_down, pfn, p_down, 1e-6, false);
                     }
 
                     for (0..self.hidden_size) |d| {
-                        p_state[d] += down_buf[d];
+                        p_state[d] += p_down[d];
                     }
                 }
             }
