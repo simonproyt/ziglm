@@ -483,6 +483,56 @@ extern "C" void cuda_rmsnorm(const float* x, const float* weight, float* out, in
     k_rmsnorm<<<1, 256, 0, (cudaStream_t)stream>>>(x, weight, out, n, eps, use_unit_offset);
 }
 
+__global__ void k_add_rmsnorm(
+    float* __restrict__ x,
+    const float* __restrict__ residual,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int n,
+    float eps,
+    int use_unit_offset
+) {
+    __shared__ float s_sum[256];
+    int tid = threadIdx.x;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float val = x[i] + residual[i];
+        x[i] = val; // in-place update of residual
+        local_sum += val * val;
+    }
+    s_sum[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float mean = s_sum[0] / (float)n;
+    float inv_std = rsqrtf(mean + eps);
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        float w = (weight != NULL) ? (weight[i] + (use_unit_offset ? 1.0f : 0.0f)) : 1.0f;
+        out[i] = x[i] * inv_std * w;
+    }
+}
+
+extern "C" void cuda_add_rmsnorm(
+    float* x,
+    const float* residual,
+    const float* weight,
+    float* out,
+    int n,
+    float eps,
+    int use_unit_offset,
+    CudaStream_t stream
+) {
+    k_add_rmsnorm<<<1, 256, 0, (cudaStream_t)stream>>>(x, residual, weight, out, n, eps, use_unit_offset);
+}
+
 __global__ void k_rope(
     float* __restrict__ q,
     float* __restrict__ k,

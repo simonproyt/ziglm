@@ -27,6 +27,7 @@ pub extern "c" fn cuda_gemv_bf16(weights: ?*const anyopaque, x: [*]const f32, y:
 pub extern "c" fn cuda_gemv_f32(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 
 pub extern "c" fn cuda_rmsnorm(x: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_add_rmsnorm(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rope(q: ?[*]f32, k: ?[*]f32, pos: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
 
 pub extern "c" fn cuda_geglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int, stream: CudaStream_t) void;
@@ -198,6 +199,19 @@ pub const CudaDevice = struct {
         use_unit_offset: bool,
     ) void {
         cuda_rmsnorm(d_x, d_weight, d_out, @intCast(n), eps, if (use_unit_offset) 1 else 0, self.stream);
+    }
+
+    pub fn addRmsNorm(
+        self: *const CudaDevice,
+        d_x: [*]f32,
+        d_residual: [*]const f32,
+        d_weight: ?[*]const f32,
+        d_out: [*]f32,
+        n: usize,
+        eps: f32,
+        use_unit_offset: bool,
+    ) void {
+        cuda_add_rmsnorm(d_x, d_residual, d_weight, d_out, @intCast(n), eps, if (use_unit_offset) 1 else 0, self.stream);
     }
 
     pub fn rope(

@@ -785,9 +785,19 @@ pub const TransformerModel = struct {
                 }
             }
 
-            // KV Cache Handling (with Cross-Layer Sharing for Gemma 4)
-            const is_kv_shared = (p.arch == .gemma4 and layer_idx >= 15);
-            const donor_layer: usize = if (is_kv_shared) (if (layer.head_dim >= 512) 14 else 13) else layer_idx;
+            // KV Cache Handling (with Cross-Layer Sharing for Gemma 4 & hybrid architectures)
+            const is_kv_shared = (p.arch == .gemma4 and layer.attn_k == null);
+            var donor_layer: usize = layer_idx;
+            if (is_kv_shared) {
+                var l = layer_idx;
+                while (l > 0) {
+                    l -= 1;
+                    if (self.layers[l].attn_k != null and self.layers[l].head_dim == layer.head_dim) {
+                        donor_layer = l;
+                        break;
+                    }
+                }
+            }
 
             if (!is_kv_shared) {
                 if (layer.attn_k) |t_k| {

@@ -446,8 +446,18 @@ pub const CudaGpuModel = struct {
                 self.device.gemv(t_q.qtype, t_q.buf.ptr, d_xb_ptr, d_q_ptr, n_heads * head_size, dim);
             }
 
-            const is_kv_shared = (p.arch == .gemma4 and layer_idx >= 15);
-            const donor_layer: usize = if (is_kv_shared) (if (layer.head_dim >= 512) 14 else 13) else layer_idx;
+            const is_kv_shared = (p.arch == .gemma4 and layer.attn_k == null);
+            var donor_layer: usize = layer_idx;
+            if (is_kv_shared) {
+                var l = layer_idx;
+                while (l > 0) {
+                    l -= 1;
+                    if (self.layers[l].attn_k != null and self.layers[l].head_dim == layer.head_dim) {
+                        donor_layer = l;
+                        break;
+                    }
+                }
+            }
 
             if (!is_kv_shared) {
                 if (layer.attn_k) |t_k| {
@@ -490,12 +500,11 @@ pub const CudaGpuModel = struct {
                 self.device.rmsNorm(d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             }
 
-            self.device.add(d_x_ptr, d_xb_ptr, dim);
-
             if (layer.pre_feedforward_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
-                self.device.rmsNorm(d_x_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                self.device.addRmsNorm(d_x_ptr, d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             } else {
+                self.device.add(d_x_ptr, d_xb_ptr, dim);
                 _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
             }
 

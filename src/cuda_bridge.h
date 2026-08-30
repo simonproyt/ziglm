@@ -31,6 +31,7 @@ void cuda_gemv_f32(const float* weights, const float* x, float* y, int rows, int
 
 // Normalization & Embeddings
 void cuda_rmsnorm(const float* x, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
+void cuda_add_rmsnorm(float* x, const float* residual, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, float freq_base, CudaStream_t stream);
 
 // Activations & Elementwise Math
