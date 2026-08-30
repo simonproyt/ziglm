@@ -134,10 +134,13 @@ flowchart TD
 ```
 
 </details>
+## CUDA
+the current cuda backend is kinda experimental so i havent done a lot of benchmarking stuff yet so its probably unoptimized and i need to work on it
 
 # Dependencies 
 - a zig complier (if you want to compile everything from source)
 - imagemagick/convert/ffmpeg for image converion for multimodal models
+- nvcc for compiling the cuda kernels
 
 
 more coming soontm               

@@ -190,7 +190,7 @@ pub const Image = struct {
             try out_list.appendSlice(allocator, buf[0..n]);
         }
 
-        var status: u32 = 0;
+        var status: c_int = 0;
         _ = std.posix.system.waitpid(@intCast(pid), &status, 0);
 
         if (out_list.items.len >= 2 and out_list.items[0] == 'P' and out_list.items[1] == '6') {

@@ -120,7 +120,7 @@ pub const Video = struct {
             try out_list.appendSlice(allocator, buf[0..n]);
         }
 
-        var status: u32 = 0;
+        var status: c_int = 0;
         _ = std.posix.system.waitpid(@intCast(pid), &status, 0);
 
         var frames_list: std.ArrayList(VideoFrame) = .empty;

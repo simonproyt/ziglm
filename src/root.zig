@@ -18,6 +18,7 @@ pub const vision = @import("vision.zig");
 pub const audio = @import("audio.zig");
 pub const video = @import("video.zig");
 pub const backend = @import("backend.zig");
+pub const cuda = @import("cuda.zig");
 
 // Direct public exports for ergonomic library usage
 pub const Engine = engine.Engine;
@@ -38,6 +39,7 @@ pub const AudioData = audio.AudioData;
 pub const LogMelSpectrogram = audio.LogMelSpectrogram;
 pub const Video = video.Video;
 pub const Backend = backend.Backend;
+pub const CudaDevice = cuda.CudaDevice;
 
 test {
     _ = types;
@@ -58,4 +60,5 @@ test {
     _ = audio;
     _ = video;
     _ = backend;
+    _ = cuda;
 }

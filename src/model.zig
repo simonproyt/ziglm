@@ -953,9 +953,10 @@ pub const TransformerModel = struct {
             }
 
             // D. End-of-layer scaling
-            const scalar = layer.layer_scalar;
-            if (p.arch == .gemma4) {
-                for (bufs.x) |*v| v.* *= scalar;
+            if (layer.layer_scalar != 1.0) {
+                for (0..dim) |d| {
+                    bufs.x[d] *= layer.layer_scalar;
+                }
             }
         }
 

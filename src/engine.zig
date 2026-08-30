@@ -22,6 +22,10 @@ const vision = @import("vision.zig");
 const VisionEncoder = vision.VisionEncoder;
 const audio = @import("audio.zig");
 const video = @import("video.zig");
+const cuda_mod = @import("cuda.zig");
+const CudaDevice = cuda_mod.CudaDevice;
+const cuda_model = @import("cuda_model.zig");
+const CudaGpuModel = cuda_model.CudaGpuModel;
 
 pub const ModelFormat = enum {
     gguf,
@@ -33,6 +37,7 @@ pub const EngineOptions = struct {
     max_seq_len: ?usize = null,
     seed: u64 = 42,
     mmproj_path: ?[]const u8 = null,
+    use_gpu: bool = false,
 };
 
 pub const TokenCallback = *const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool;
@@ -55,6 +60,8 @@ pub const Engine = struct {
     buffers: *ModelBuffers,
     sampler: *Sampler,
     thread_pool: *ThreadPool,
+    cuda_device: ?*CudaDevice = null,
+    gpu_model: ?*CudaGpuModel = null,
     max_seq_len: usize,
     params: ModelParams,
 
@@ -132,6 +139,25 @@ pub const Engine = struct {
         const thread_pool = try ThreadPool.init(allocator, options.num_threads);
         errdefer thread_pool.deinit();
 
+        var cuda_device: ?*CudaDevice = null;
+        var gpu_model: ?*CudaGpuModel = null;
+        if (options.use_gpu) {
+            cuda_device = CudaDevice.init(allocator) catch |err| blk: {
+                std.debug.print("⚠️  CUDA GPU initialization failed ({s}), falling back to CPU.\n", .{@errorName(err)});
+                break :blk null;
+            };
+            if (cuda_device) |cd| {
+                std.debug.print("🚀 CUDA GPU Acceleration active: {s} ({d} MB VRAM)\n", .{ cd.getName(), cd.total_vram_bytes / 1024 / 1024 });
+                gpu_model = CudaGpuModel.init(allocator, cd, model) catch |err| blk: {
+                    std.debug.print("⚠️  Failed to offload Transformer weights to GPU ({s}), falling back to CPU.\n", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (gpu_model != null) {
+                    std.debug.print("⚡ Successfully offloaded all Transformer layers to GPU VRAM!\n", .{});
+                }
+            }
+        }
+
         const self = try allocator.create(Engine);
         self.* = .{
             .allocator = allocator,
@@ -145,6 +171,8 @@ pub const Engine = struct {
             .buffers = buffers,
             .sampler = sampler,
             .thread_pool = thread_pool,
+            .cuda_device = cuda_device,
+            .gpu_model = gpu_model,
             .max_seq_len = max_seq,
             .params = gguf_file.params,
         };
@@ -222,11 +250,31 @@ pub const Engine = struct {
         const thread_pool = try ThreadPool.init(allocator, options.num_threads);
         errdefer thread_pool.deinit();
 
+        var cuda_device: ?*CudaDevice = null;
+        var gpu_model: ?*CudaGpuModel = null;
+        if (options.use_gpu) {
+            cuda_device = CudaDevice.init(allocator) catch |err| blk: {
+                std.debug.print("⚠️  CUDA GPU initialization failed ({s}), falling back to CPU.\n", .{@errorName(err)});
+                break :blk null;
+            };
+            if (cuda_device) |cd| {
+                std.debug.print("🚀 CUDA GPU Acceleration active: {s} ({d} MB VRAM)\n", .{ cd.getName(), cd.total_vram_bytes / 1024 / 1024 });
+                gpu_model = CudaGpuModel.init(allocator, cd, model) catch |err| blk: {
+                    std.debug.print("⚠️  Failed to offload Transformer weights to GPU ({s}), falling back to CPU.\n", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (gpu_model != null) {
+                    std.debug.print("⚡ Successfully offloaded all Transformer layers to GPU VRAM!\n", .{});
+                }
+            }
+        }
+
         const self = try allocator.create(Engine);
         self.* = .{
             .allocator = allocator,
             .format = .safetensors,
             .gguf_file = null,
+            .mmproj_gguf_file = null,
             .safetensors_file = st_file,
             .tokenizer = tokenizer,
             .model = model,
@@ -234,6 +282,8 @@ pub const Engine = struct {
             .buffers = buffers,
             .sampler = sampler,
             .thread_pool = thread_pool,
+            .cuda_device = cuda_device,
+            .gpu_model = gpu_model,
             .max_seq_len = max_seq,
             .params = params,
         };
@@ -242,6 +292,8 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        if (self.gpu_model) |gm| gm.deinit();
+        if (self.cuda_device) |cd| cd.deinit();
         self.thread_pool.deinit();
         self.sampler.deinit();
         self.buffers.deinit();
@@ -258,6 +310,36 @@ pub const Engine = struct {
         self.kv_cache.reset();
     }
 
+    pub fn forwardTokenOrEmbedding(
+        self: *Engine,
+        custom_embedding: ?[]const f32,
+        token_id: u32,
+        pos: usize,
+        is_last_token: bool,
+    ) ![]const f32 {
+        if (self.gpu_model) |gm| {
+            return try gm.forward(
+                self.model,
+                token_id,
+                pos,
+                self.kv_cache,
+                self.buffers,
+                custom_embedding,
+                is_last_token,
+            );
+        } else {
+            return try self.model.forwardWithEmbedding(
+                custom_embedding,
+                token_id,
+                pos,
+                self.kv_cache,
+                self.buffers,
+                self.thread_pool,
+                is_last_token,
+            );
+        }
+    }
+
     pub fn prefill(self: *Engine, tokens: []const u32) ![]const f32 {
         if (tokens.len == 0) return error.EmptyPrompt;
         if (tokens.len > self.max_seq_len) return error.PromptExceedsContext;
@@ -265,28 +347,14 @@ pub const Engine = struct {
         var last_logits: []const f32 = undefined;
         for (tokens, 0..) |tok, pos| {
             const is_last = (pos == tokens.len - 1);
-            last_logits = try self.model.forward(
-                tok,
-                pos,
-                self.kv_cache,
-                self.buffers,
-                self.thread_pool,
-                is_last,
-            );
+            last_logits = try self.forwardTokenOrEmbedding(null, tok, pos, is_last);
         }
         return last_logits;
     }
 
     pub fn decode(self: *Engine, token: u32, pos: usize) ![]const f32 {
         if (pos >= self.max_seq_len) return error.ContextFull;
-        return try self.model.forward(
-            token,
-            pos,
-            self.kv_cache,
-            self.buffers,
-            self.thread_pool,
-            true,
-        );
+        return try self.forwardTokenOrEmbedding(null, token, pos, true);
     }
 
     pub fn encodeImage(self: *Engine, image_path: []const u8) ![]f32 {
@@ -301,11 +369,40 @@ pub const Engine = struct {
         }
     }
 
-    pub fn encodeVideo(self: *Engine, video_path: []const u8, max_frames: usize) !struct { embeddings: []f32, total_patches: usize, num_frames: usize } {
+    pub fn encodeAudio(self: *Engine, audio_path: []const u8) ![]f32 {
+        var audio_data = try audio.loadWav(self.allocator, audio_path);
+        defer audio_data.deinit(self.allocator);
+
+        var mel_gen = try audio.LogMelSpectrogram.init(self.allocator, 128, 512, 160, 16000);
+        defer mel_gen.deinit();
+
+        const spec = try mel_gen.compute(audio_data.samples);
+        defer self.allocator.free(spec);
+
+        const dim = self.model.params.embedding_length;
+        if (self.model.audio_encoder) |*ae| {
+            return try ae.encode(self.allocator, spec, self.thread_pool);
+        }
+
+        const n_frames = spec.len / 80;
+        const embeddings = try self.allocator.alloc(f32, n_frames * dim);
+        @memset(embeddings, 0.0);
+
+        for (0..n_frames) |f| {
+            const frame_spec = spec[f * 80 .. (f + 1) * 80];
+            const emb_frame = embeddings[f * dim .. (f + 1) * dim];
+            for (0..dim) |d| {
+                emb_frame[d] = frame_spec[d % 80] * 0.1;
+            }
+        }
+
+        return embeddings;
+    }
+
+    pub fn encodeVideo(self: *Engine, video_path: []const u8, max_frames: usize) !struct { embeddings: []f32, num_frames: usize } {
         const vid = try video.Video.load(self.allocator, video_path, max_frames);
         defer vid.deinit();
 
-        const dim = self.model.params.embedding_length;
         var total_embeddings: std.ArrayList(f32) = .empty;
         errdefer total_embeddings.deinit(self.allocator);
 
@@ -323,45 +420,7 @@ pub const Engine = struct {
         const embs = try total_embeddings.toOwnedSlice(self.allocator);
         return .{
             .embeddings = embs,
-            .total_patches = embs.len / dim,
             .num_frames = vid.frames.len,
-        };
-    }
-
-    pub fn encodeAudio(self: *Engine, audio_path: []const u8) !struct { embeddings: []f32, total_frames: usize } {
-        var audio_data = try audio.loadWav(self.allocator, audio_path);
-        defer audio_data.deinit(self.allocator);
-
-        var mel_gen = try audio.LogMelSpectrogram.init(self.allocator, 128, 512, 160, 16000);
-        defer mel_gen.deinit();
-
-        const spec = try mel_gen.compute(audio_data.samples);
-        defer self.allocator.free(spec);
-
-        const dim = self.model.params.embedding_length;
-        if (self.model.audio_encoder) |*ae| {
-            const embs = try ae.encode(self.allocator, spec, self.thread_pool);
-            return .{
-                .embeddings = embs,
-                .total_frames = embs.len / dim,
-            };
-        }
-
-        const n_frames = spec.len / 80;
-        const embeddings = try self.allocator.alloc(f32, n_frames * dim);
-        @memset(embeddings, 0.0);
-
-        for (0..n_frames) |f| {
-            const frame_spec = spec[f * 80 .. (f + 1) * 80];
-            const emb_frame = embeddings[f * dim .. (f + 1) * dim];
-            for (0..dim) |d| {
-                emb_frame[d] = frame_spec[d % 80] * 0.1;
-            }
-        }
-
-        return .{
-            .embeddings = embeddings,
-            .total_frames = n_frames,
         };
     }
 
@@ -370,32 +429,19 @@ pub const Engine = struct {
         pos: usize,
     };
 
-    pub const MultimodalKind = enum {
-        image,
-        audio,
-        video,
-    };
-
-    pub fn prefillMultimodal(
+    pub fn generateWithMediaEmbeddings(
         self: *Engine,
-        tokens: []const u32,
-        image_embeddings: ?[]const f32,
-        image_patch_count: usize,
-    ) !PrefillResult {
-        return self.prefillMultimodalWithKind(tokens, image_embeddings, image_patch_count, .image, 1);
-    }
-
-    pub fn prefillMultimodalWithKind(
-        self: *Engine,
-        tokens: []const u32,
+        prompt: []const u8,
         embeddings: ?[]const f32,
         item_count: usize,
-        kind: MultimodalKind,
+        kind: types.MultimodalKind,
         num_frames: usize,
     ) !PrefillResult {
-        if (tokens.len == 0 and item_count == 0) return error.EmptyPrompt;
+        const tokens = try self.tokenizer.encode(self.allocator, prompt, true);
+        defer self.allocator.free(tokens);
 
-        // Scan tokens for placeholder matching the modality
+        if (tokens.len == 0) return error.EmptyPrompt;
+
         var placeholder_pos: ?usize = null;
         for (tokens, 0..) |tok, idx| {
             const s = self.tokenizer.decode(tok);
@@ -435,34 +481,34 @@ pub const Engine = struct {
                 switch (kind) {
                     .image => {
                         // 1. Beginning of Image: <|image> (255999)
-                        last_logits = try self.model.forwardWithEmbedding(null, 255999, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        last_logits = try self.forwardTokenOrEmbedding(null, 255999, pos, false);
                         pos += 1;
 
                         // 2. Image patch embeddings (258880)
                         for (0..item_count) |p| {
                             const patch_emb = emb[p * dim .. (p + 1) * dim];
-                            last_logits = try self.model.forwardWithEmbedding(patch_emb, 258880, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            last_logits = try self.forwardTokenOrEmbedding(patch_emb, 258880, pos, false);
                             pos += 1;
                         }
 
                         // 3. End of Image: <image|> (258882)
-                        last_logits = try self.model.forwardWithEmbedding(null, 258882, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        last_logits = try self.forwardTokenOrEmbedding(null, 258882, pos, false);
                         pos += 1;
                     },
                     .audio => {
                         // 1. Beginning of Audio: <|audio> (256000)
-                        last_logits = try self.model.forwardWithEmbedding(null, 256000, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        last_logits = try self.forwardTokenOrEmbedding(null, 256000, pos, false);
                         pos += 1;
 
                         // 2. Audio frame embeddings (258881)
                         for (0..item_count) |f| {
                             const frame_emb = emb[f * dim .. (f + 1) * dim];
-                            last_logits = try self.model.forwardWithEmbedding(frame_emb, 258881, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            last_logits = try self.forwardTokenOrEmbedding(frame_emb, 258881, pos, false);
                             pos += 1;
                         }
 
                         // 3. End of Audio: <audio|> (258883)
-                        last_logits = try self.model.forwardWithEmbedding(null, 258883, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                        last_logits = try self.forwardTokenOrEmbedding(null, 258883, pos, false);
                         pos += 1;
                     },
                     .video => {
@@ -476,25 +522,25 @@ pub const Engine = struct {
                             const ts_toks = self.tokenizer.encode(self.allocator, ts_str, false) catch &[_]u32{};
                             defer if (ts_toks.len > 0) self.allocator.free(ts_toks);
                             for (ts_toks) |t_tok| {
-                                last_logits = try self.model.forwardWithEmbedding(null, t_tok, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                                last_logits = try self.forwardTokenOrEmbedding(null, t_tok, pos, false);
                                 pos += 1;
                             }
 
                             // Frame start: <|image> (255999)
-                            last_logits = try self.model.forwardWithEmbedding(null, 255999, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            last_logits = try self.forwardTokenOrEmbedding(null, 255999, pos, false);
                             pos += 1;
 
                             for (0..patches_per_frame) |p| {
                                 const p_idx = f_idx * patches_per_frame + p;
                                 if (p_idx < item_count) {
                                     const patch_emb = emb[p_idx * dim .. (p_idx + 1) * dim];
-                                    last_logits = try self.model.forwardWithEmbedding(patch_emb, 258884, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                                    last_logits = try self.forwardTokenOrEmbedding(patch_emb, 258884, pos, false);
                                     pos += 1;
                                 }
                             }
 
                             // Frame end: <image|> (258882)
-                            last_logits = try self.model.forwardWithEmbedding(null, 258882, pos, self.kv_cache, self.buffers, self.thread_pool, false);
+                            last_logits = try self.forwardTokenOrEmbedding(null, 258882, pos, false);
                             pos += 1;
                         }
                     },
@@ -507,13 +553,10 @@ pub const Engine = struct {
             }
 
             const is_last = (idx == tokens.len - 1);
-            last_logits = try self.model.forwardWithEmbedding(
+            last_logits = try self.forwardTokenOrEmbedding(
                 null,
                 tok,
                 pos,
-                self.kv_cache,
-                self.buffers,
-                self.thread_pool,
                 is_last,
             );
             pos += 1;
@@ -556,7 +599,10 @@ pub const Engine = struct {
 
         // 1. Tokenize prompt with turn wrapper if needed
         const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
-            try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|image|>{s}<turn|>\n<|turn>model\n", .{prompt})
+            (if (image_path != null)
+                try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|image|>{s}<turn|>\n<|turn>model\n", .{prompt})
+            else
+                try std.fmt.allocPrint(self.allocator, "<|turn>user\n{s}<turn|>\n<|turn>model\n", .{prompt}))
         else
             try self.allocator.dupe(u8, prompt);
         defer self.allocator.free(formatted_prompt);
@@ -575,7 +621,7 @@ pub const Engine = struct {
 
         // 2. Prefill phase
         const t_prefill_start = getTimestampNs();
-        const prefill_res = try self.prefillMultimodalWithKind(prompt_tokens, image_embeddings, image_patches, .image, 1);
+        const prefill_res = try self.generateWithMediaEmbeddings(formatted_prompt, image_embeddings, image_patches, .image, 1);
         var logits = prefill_res.logits;
         const t_prefill_end = getTimestampNs();
         stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
@@ -665,10 +711,11 @@ pub const Engine = struct {
 
         var stats = GenerationStats{};
         const t_start = getTimestampNs();
+        const dim = self.model.params.embedding_length;
 
         const vid_enc = try self.encodeVideo(video_path.?, if (max_frames > 0) max_frames else 2);
         const video_embeddings = vid_enc.embeddings;
-        const video_patches = vid_enc.total_patches;
+        const video_patches = vid_enc.embeddings.len / dim;
         defer self.allocator.free(video_embeddings);
 
         const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
@@ -690,7 +737,7 @@ pub const Engine = struct {
         self.reset();
 
         const t_prefill_start = getTimestampNs();
-        const prefill_res = try self.prefillMultimodalWithKind(prompt_tokens, video_embeddings, video_patches, .video, vid_enc.num_frames);
+        const prefill_res = try self.generateWithMediaEmbeddings(formatted_prompt, video_embeddings, video_patches, .video, vid_enc.num_frames);
         var logits = prefill_res.logits;
         const t_prefill_end = getTimestampNs();
         stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
@@ -777,10 +824,10 @@ pub const Engine = struct {
 
         var stats = GenerationStats{};
         const t_start = getTimestampNs();
+        const dim = self.model.params.embedding_length;
 
-        const aud_enc = try self.encodeAudio(audio_path.?);
-        const audio_embeddings = aud_enc.embeddings;
-        const audio_frames = aud_enc.total_frames;
+        const audio_embeddings = try self.encodeAudio(audio_path.?);
+        const audio_frames = audio_embeddings.len / dim;
         defer self.allocator.free(audio_embeddings);
 
         const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
@@ -802,7 +849,7 @@ pub const Engine = struct {
         self.reset();
 
         const t_prefill_start = getTimestampNs();
-        const prefill_res = try self.prefillMultimodalWithKind(prompt_tokens, audio_embeddings, audio_frames, .audio, 1);
+        const prefill_res = try self.generateWithMediaEmbeddings(formatted_prompt, audio_embeddings, audio_frames, .audio, 1);
         var logits = prefill_res.logits;
         const t_prefill_end = getTimestampNs();
         stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;

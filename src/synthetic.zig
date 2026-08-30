@@ -23,7 +23,7 @@ fn writeAllBytes(fd: std.posix.fd_t, bytes: []const u8) !void {
         const rc = std.posix.system.write(fd, bytes[written..].ptr, bytes.len - written);
         const err = std.posix.errno(rc);
         if (err != .SUCCESS) return error.WriteFailed;
-        written += rc;
+        written += @as(usize, @intCast(rc));
     }
 }
 

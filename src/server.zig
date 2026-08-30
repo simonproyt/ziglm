@@ -45,7 +45,7 @@ pub const Server = struct {
             const rc = std.posix.system.write(fd, bytes[written..].ptr, bytes.len - written);
             const err = std.posix.errno(rc);
             if (err != .SUCCESS) return error.SocketWriteFailed;
-            written += rc;
+            written += @as(usize, @intCast(rc));
         }
     }
 

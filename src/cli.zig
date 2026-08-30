@@ -48,6 +48,10 @@ pub fn printUsage() void {
         \\        --max-frames <int>  Max video frames to sample (default: 32)
         \\        --mmproj <path>     Path to external multimodal projector (mmproj.gguf)
         \\
+        \\  HARDWARE & ACCELERATION OPTIONS:
+        \\        --gpu, --cuda       Enable NVIDIA CUDA GPU acceleration
+        \\        --device <string>   Compute device: cpu, cuda, auto (default: auto)
+        \\
         \\  SERVER & TEST OPTIONS:
         \\        --port <int>        HTTP server port (default: 8080)
         \\        --create-sample <f> Output path for generated test GGUF
@@ -93,6 +97,8 @@ pub const CliArgs = struct {
     video_path: ?[]const u8 = null,
     audio_path: ?[]const u8 = null,
     mmproj_path: ?[]const u8 = null,
+    use_gpu: bool = false,
+    device: []const u8 = "auto",
     port: u16 = 8080,
     seed: u64 = 42,
     echo_prompt: bool = false,
@@ -140,6 +146,15 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
             args.echo_prompt = true;
         } else if (std.mem.eql(u8, arg, "--greedy")) {
             args.temperature = 0.0;
+        } else if (std.mem.eql(u8, arg, "--gpu") or std.mem.eql(u8, arg, "--cuda")) {
+            args.use_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--device")) {
+            if (arg_it.next()) |dev| {
+                args.device = dev;
+                if (std.mem.eql(u8, dev, "cuda") or std.mem.eql(u8, dev, "gpu")) {
+                    args.use_gpu = true;
+                }
+            }
         } else if (std.mem.eql(u8, arg, "--image")) {
             args.image_path = arg_it.next();
         } else if (std.mem.eql(u8, arg, "--video")) {
@@ -317,6 +332,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
             .num_threads = args.threads,
             .seed = args.seed,
             .mmproj_path = args.mmproj_path,
+            .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
 
@@ -371,6 +387,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
             .num_threads = args.threads,
             .seed = args.seed,
             .mmproj_path = args.mmproj_path,
+            .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
 
@@ -456,6 +473,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
             .num_threads = args.threads,
             .seed = args.seed,
             .mmproj_path = args.mmproj_path,
+            .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
 
@@ -473,6 +491,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
             .num_threads = args.threads,
             .seed = args.seed,
             .mmproj_path = args.mmproj_path,
+            .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
 

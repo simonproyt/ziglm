@@ -1,4 +1,9 @@
 const std = @import("std");
+pub const MultimodalKind = enum {
+    image,
+    audio,
+    video,
+};
 
 /// GGML Tensor Data Types matching the GGUF specification
 pub const GGMLType = enum(u32) {
