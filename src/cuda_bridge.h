@@ -38,6 +38,7 @@ void cuda_geglu(const float* gate, const float* up, float* out, int n, CudaStrea
 void cuda_swiglu(const float* gate, const float* up, float* out, int n, CudaStream_t stream);
 void cuda_add(float* x, const float* residual, int n, CudaStream_t stream);
 void cuda_scale(float* x, float scale, int n, CudaStream_t stream);
+void cuda_tanh_softcap(float* x, float cap, int n, CudaStream_t stream);
 
 // GPU-Resident KV Cache
 void cuda_kv_cache_put(
@@ -73,6 +74,7 @@ void cuda_attention_forward(
 
 // Gemma Per-Layer Embedding Gate & Fusion
 void cuda_ple_gate_gelu(const float* ple_gate_in, const float* ple_slice, float* ple_buf_out, int ple_dim, CudaStream_t stream);
+void cuda_ple_ctx_fuse(float* ctx_ple_buf, const float* ctx_scratch, int n, int add_token_embd, CudaStream_t stream);
 
 #ifdef __cplusplus
 }

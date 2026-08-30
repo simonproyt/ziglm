@@ -33,6 +33,7 @@ pub extern "c" fn cuda_geglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, 
 pub extern "c" fn cuda_swiglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_add(x: [*]f32, residual: [*]const f32, n: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_scale(x: [*]f32, scale: f32, n: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_tanh_softcap(x: [*]f32, cap: f32, n: c_int, stream: CudaStream_t) void;
 
 pub extern "c" fn cuda_kv_cache_put(
     k_cache: [*]f32,
@@ -69,6 +70,14 @@ pub extern "c" fn cuda_ple_gate_gelu(
     ple_slice: [*]const f32,
     ple_buf_out: [*]f32,
     ple_dim: c_int,
+    stream: CudaStream_t,
+) void;
+
+pub extern "c" fn cuda_ple_ctx_fuse(
+    ctx_ple_buf: [*]f32,
+    ctx_scratch: [*]const f32,
+    n: c_int,
+    add_token_embd: c_int,
     stream: CudaStream_t,
 ) void;
 
@@ -284,6 +293,16 @@ pub const CudaDevice = struct {
         cuda_ple_gate_gelu(d_ple_gate, d_ple_slice, d_ple_buf, @intCast(ple_dim), self.stream);
     }
 
+    pub fn pleCtxFuse(
+        self: *const CudaDevice,
+        d_ctx_ple_buf: [*]f32,
+        d_ctx_scratch: [*]const f32,
+        n: usize,
+        add_token_embd: bool,
+    ) void {
+        cuda_ple_ctx_fuse(d_ctx_ple_buf, d_ctx_scratch, @intCast(n), if (add_token_embd) 1 else 0, self.stream);
+    }
+
     pub fn add(
         self: *const CudaDevice,
         d_x: [*]f32,
@@ -300,5 +319,14 @@ pub const CudaDevice = struct {
         n: usize,
     ) void {
         cuda_scale(d_x, s, @intCast(n), self.stream);
+    }
+
+    pub fn tanhSoftcap(
+        self: *const CudaDevice,
+        d_x: [*]f32,
+        cap: f32,
+        n: usize,
+    ) void {
+        cuda_tanh_softcap(d_x, cap, @intCast(n), self.stream);
     }
 };

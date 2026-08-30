@@ -1,5 +1,6 @@
 #include "cuda_bridge.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -80,25 +81,7 @@ extern "C" int cuda_stream_sync(CudaStream_t stream) {
 // ============================================================================
 
 __device__ __forceinline__ float f16_to_f32(unsigned short h) {
-    unsigned int sign = ((unsigned int)h & 0x8000) << 16;
-    unsigned int exp = ((unsigned int)h & 0x7c00) >> 10;
-    unsigned int mant = ((unsigned int)h & 0x03ff);
-
-    if (exp == 0) {
-        if (mant == 0) return __int_as_float(sign);
-        while ((mant & 0x0400) == 0) {
-            mant <<= 1;
-            exp--;
-        }
-        exp++;
-        mant &= ~0x0400;
-    } else if (exp == 31) {
-        return __int_as_float(sign | 0x7f800000 | (mant << 13));
-    }
-
-    exp = exp + (127 - 15);
-    mant = mant << 13;
-    return __int_as_float(sign | (exp << 23) | mant);
+    return __half2float(*(const __half*)&h);
 }
 
 __device__ __forceinline__ float bf16_to_f32(unsigned short b) {
@@ -110,7 +93,7 @@ __device__ __forceinline__ float bf16_to_f32(unsigned short b) {
 // Quantized GEMV Kernels
 // ============================================================================
 
-// Q4_0: 18-byte blocks (2-byte f16 scale + 16-byte nibbles = 32 weights)
+// Q4_0: 18-byte blocks (2-byte f16 scale + 16-byte nibbles = 32 weights, 100% coalesced 32-thread parallelization)
 __global__ void k_gemv_q4_0(
     const unsigned char* __restrict__ weights,
     const float* __restrict__ x,
@@ -124,24 +107,21 @@ __global__ void k_gemv_q4_0(
     int lane = threadIdx.x; // 0..31
     int num_blocks = cols / 32;
     const unsigned char* row_weights = weights + (size_t)row * num_blocks * 18;
+    int total_bytes = num_blocks * 16;
 
     float sum = 0.0f;
-    for (int b = lane; b < num_blocks; b += 32) {
-        const unsigned char* block_ptr = row_weights + b * 18;
-        unsigned short scale_f16 = *(const unsigned short*)block_ptr;
-        float d = f16_to_f32(scale_f16);
+    for (int k = lane; k < total_bytes; k += 32) {
+        int b = k / 16;
+        int i = k % 16;
 
-        const unsigned char* qs = block_ptr + 2;
+        const unsigned char* block_ptr = row_weights + b * 18;
+        float d = f16_to_f32(*(const unsigned short*)block_ptr);
+        unsigned char byte = block_ptr[2 + i];
+        int q0 = (int)(byte & 0x0F) - 8;
+        int q1 = (int)(byte >> 4) - 8;
         const float* x_block = x + b * 32;
 
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            unsigned char byte = qs[i];
-            int q0 = (int)(byte & 0x0F) - 8;
-            int q1 = (int)(byte >> 4) - 8;
-            sum += (float)q0 * d * x_block[i];
-            sum += (float)q1 * d * x_block[i + 16];
-        }
+        sum += d * ((float)q0 * x_block[i] + (float)q1 * x_block[i + 16]);
     }
 
     #pragma unroll
@@ -154,7 +134,7 @@ __global__ void k_gemv_q4_0(
     }
 }
 
-// Q8_0: 34-byte blocks (2-byte f16 scale + 32 int8 weights)
+// Q8_0: 34-byte blocks (2-byte f16 scale + 32 int8 weights, 100% coalesced 32-thread parallelization)
 __global__ void k_gemv_q8_0(
     const unsigned char* __restrict__ weights,
     const float* __restrict__ x,
@@ -170,18 +150,15 @@ __global__ void k_gemv_q8_0(
     const unsigned char* row_weights = weights + (size_t)row * num_blocks * 34;
 
     float sum = 0.0f;
-    for (int b = lane; b < num_blocks; b += 32) {
+    for (int k = lane; k < cols; k += 32) {
+        int b = k / 32;
+        int i = k % 32;
+
         const unsigned char* block_ptr = row_weights + b * 34;
-        unsigned short scale_f16 = *(const unsigned short*)block_ptr;
-        float d = f16_to_f32(scale_f16);
-
+        float d = f16_to_f32(*(const unsigned short*)block_ptr);
         const signed char* qs = (const signed char*)(block_ptr + 2);
-        const float* x_block = x + b * 32;
 
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            sum += (float)qs[i] * d * x_block[i];
-        }
+        sum += d * ((float)qs[i] * x[k]);
     }
 
     #pragma unroll
@@ -239,14 +216,26 @@ __global__ void k_gemv_q4_k(
             const float* x_sub0 = x_sb + j * 64;
             const float* x_sub1 = x_sb + j * 64 + 32;
 
+            float acc_q0 = 0.0f;
+            float acc_x0 = 0.0f;
+            float acc_q1 = 0.0f;
+            float acc_x1 = 0.0f;
+
             #pragma unroll
             for (int l = 0; l < 32; ++l) {
                 unsigned char q = q_sub[l];
                 float q0 = (float)(q & 0x0F);
                 float q1 = (float)(q >> 4);
-                sum += (q0 * d0 - m0) * x_sub0[l];
-                sum += (q1 * d1 - m1) * x_sub1[l];
+                float x0 = x_sub0[l];
+                float x1 = x_sub1[l];
+
+                acc_q0 += q0 * x0;
+                acc_x0 += x0;
+                acc_q1 += q1 * x1;
+                acc_x1 += x1;
             }
+
+            sum += (acc_q0 * d0 - acc_x0 * m0) + (acc_q1 * d1 - acc_x1 * m1);
         }
     }
 
@@ -260,7 +249,7 @@ __global__ void k_gemv_q4_k(
     }
 }
 
-// Q6_K GEMV (256-element superblocks = 210 bytes)
+// Q6_K GEMV (256-element superblocks = 210 bytes, 100% coalesced 32-thread parallelization)
 __global__ void k_gemv_q6_k(
     const unsigned char* __restrict__ weights,
     const float* __restrict__ x,
@@ -271,44 +260,44 @@ __global__ void k_gemv_q6_k(
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= rows) return;
 
-    int lane = threadIdx.x;
+    int lane = threadIdx.x; // 0..31
     int num_superblocks = cols / 256;
     const unsigned char* row_weights = weights + (size_t)row * num_superblocks * 210;
+    int total_l_steps = num_superblocks * 64; // 64 elements of (q1,q2,q3,q4) per superblock
 
     float sum = 0.0f;
-    for (int sb = lane; sb < num_superblocks; sb += 32) {
+    for (int k = lane; k < total_l_steps; k += 32) {
+        int sb = k / 64;
+        int rem = k % 64;
+        int n = rem / 32;
+        int l = rem % 32;
+        int is = l / 16;
+
         const unsigned char* block = row_weights + sb * 210;
-        const unsigned char* ql = block + 0;
-        const unsigned char* qh = block + 128;
-        const signed char* scales = (const signed char*)(block + 192);
+        const unsigned char* ql = block + 0 + n * 64;
+        const unsigned char* qh = block + 128 + n * 32;
+        const signed char* scales = (const signed char*)(block + 192 + n * 8);
         float d = f16_to_f32(*(const unsigned short*)(block + 208));
-        const float* x_sb = x + sb * 256;
+        const float* x_sb = x + sb * 256 + n * 128;
 
-        #pragma unroll
-        for (int n = 0; n < 2; ++n) {
-            int ql_offset = n * 64;
-            int qh_offset = n * 32;
-            int sc_offset = n * 8;
-            int dst_offset = n * 128;
+        unsigned char ql_l = ql[l];
+        unsigned char ql_l32 = ql[l + 32];
+        unsigned char qh_l = qh[l];
 
-            #pragma unroll
-            for (int l = 0; l < 32; ++l) {
-                int is = l / 16;
-                unsigned char ql_l = ql[ql_offset + l];
-                unsigned char ql_l32 = ql[ql_offset + l + 32];
-                unsigned char qh_l = qh[qh_offset + l];
+        int q1 = (int)((ql_l & 0x0F) | (((qh_l >> 0) & 3) << 4)) - 32;
+        int q2 = (int)((ql_l32 & 0x0F) | (((qh_l >> 2) & 3) << 4)) - 32;
+        int q3 = (int)((ql_l >> 4) | (((qh_l >> 4) & 3) << 4)) - 32;
+        int q4 = (int)((ql_l32 >> 4) | (((qh_l >> 6) & 3) << 4)) - 32;
 
-                int q1 = (int)((ql_l & 0x0F) | (((qh_l >> 0) & 3) << 4)) - 32;
-                int q2 = (int)((ql_l32 & 0x0F) | (((qh_l >> 2) & 3) << 4)) - 32;
-                int q3 = (int)((ql_l >> 4) | (((qh_l >> 4) & 3) << 4)) - 32;
-                int q4 = (int)((ql_l32 >> 4) | (((qh_l >> 6) & 3) << 4)) - 32;
+        float d_sc0 = d * (float)scales[is + 0];
+        float d_sc1 = d * (float)scales[is + 2];
+        float d_sc2 = d * (float)scales[is + 4];
+        float d_sc3 = d * (float)scales[is + 6];
 
-                sum += d * (float)scales[sc_offset + is + 0] * (float)q1 * x_sb[dst_offset + l + 0];
-                sum += d * (float)scales[sc_offset + is + 2] * (float)q2 * x_sb[dst_offset + l + 32];
-                sum += d * (float)scales[sc_offset + is + 4] * (float)q3 * x_sb[dst_offset + l + 64];
-                sum += d * (float)scales[sc_offset + is + 6] * (float)q4 * x_sb[dst_offset + l + 96];
-            }
-        }
+        sum += (float)q1 * d_sc0 * x_sb[l + 0];
+        sum += (float)q2 * d_sc1 * x_sb[l + 32];
+        sum += (float)q3 * d_sc2 * x_sb[l + 64];
+        sum += (float)q4 * d_sc3 * x_sb[l + 96];
     }
 
     #pragma unroll
@@ -408,46 +397,46 @@ __global__ void k_gemv_f32(
     }
 }
 
-// GEMV Host Dispatchers
+// GEMV Host Dispatchers (8 warps = 256 threads per block)
 extern "C" void cuda_gemv_q4_0(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
-    dim3 block(32, 4);
-    dim3 grid((rows + 3) / 4);
+    dim3 block(32, 8);
+    dim3 grid((rows + 7) / 8);
     k_gemv_q4_0<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned char*)weights, x, y, rows, cols);
 }
 
 extern "C" void cuda_gemv_q8_0(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
-    dim3 block(32, 4);
-    dim3 grid((rows + 3) / 4);
+    dim3 block(32, 8);
+    dim3 grid((rows + 7) / 8);
     k_gemv_q8_0<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned char*)weights, x, y, rows, cols);
 }
 
 extern "C" void cuda_gemv_q4_k(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
-    dim3 block(32, 4);
-    dim3 grid((rows + 3) / 4);
+    dim3 block(32, 8);
+    dim3 grid((rows + 7) / 8);
     k_gemv_q4_k<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned char*)weights, x, y, rows, cols);
 }
 
 extern "C" void cuda_gemv_q6_k(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
-    dim3 block(32, 4);
-    dim3 grid((rows + 3) / 4);
+    dim3 block(32, 8);
+    dim3 grid((rows + 7) / 8);
     k_gemv_q6_k<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned char*)weights, x, y, rows, cols);
 }
 
 extern "C" void cuda_gemv_f16(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
-    dim3 block(32, 4);
-    dim3 grid((rows + 3) / 4);
+    dim3 block(32, 8);
+    dim3 grid((rows + 7) / 8);
     k_gemv_f16<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned short*)weights, x, y, rows, cols);
 }
 
 extern "C" void cuda_gemv_bf16(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
-    dim3 block(32, 4);
-    dim3 grid((rows + 3) / 4);
+    dim3 block(32, 8);
+    dim3 grid((rows + 7) / 8);
     k_gemv_bf16<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned short*)weights, x, y, rows, cols);
 }
 
 extern "C" void cuda_gemv_f32(const float* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
-    dim3 block(32, 4);
-    dim3 grid((rows + 3) / 4);
+    dim3 block(32, 8);
+    dim3 grid((rows + 7) / 8);
     k_gemv_f32<<<grid, block, 0, (cudaStream_t)stream>>>((const float*)weights, x, y, rows, cols);
 }
 
@@ -609,6 +598,19 @@ extern "C" void cuda_scale(float* x, float scale, int n, CudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     k_scale<<<blocks, threads, 0, (cudaStream_t)stream>>>(x, scale, n);
+}
+
+__global__ void k_tanh_softcap(float* __restrict__ x, float cap, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        x[idx] = cap * tanhf(x[idx] / cap);
+    }
+}
+
+extern "C" void cuda_tanh_softcap(float* x, float cap, int n, CudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    k_tanh_softcap<<<blocks, threads, 0, (cudaStream_t)stream>>>(x, cap, n);
 }
 
 // ============================================================================
@@ -828,4 +830,34 @@ extern "C" void cuda_ple_gate_gelu(
     int threads = 256;
     int blocks = (ple_dim + threads - 1) / threads;
     k_ple_gate_gelu<<<blocks, threads, 0, (cudaStream_t)stream>>>(ple_gate_in, ple_slice, ple_buf_out, ple_dim);
+}
+
+__global__ void k_ple_ctx_fuse(
+    float* __restrict__ ctx_ple_buf,
+    const float* __restrict__ ctx_scratch,
+    int n,
+    int add_token_embd
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float scratch = ctx_scratch[idx];
+        if (add_token_embd) {
+            const float inv_sqrt_2 = 0.70710678118f;
+            ctx_ple_buf[idx] = (ctx_ple_buf[idx] + scratch) * inv_sqrt_2;
+        } else {
+            ctx_ple_buf[idx] = scratch;
+        }
+    }
+}
+
+extern "C" void cuda_ple_ctx_fuse(
+    float* ctx_ple_buf,
+    const float* ctx_scratch,
+    int n,
+    int add_token_embd,
+    CudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    k_ple_ctx_fuse<<<blocks, threads, 0, (cudaStream_t)stream>>>(ctx_ple_buf, ctx_scratch, n, add_token_embd);
 }

@@ -124,8 +124,9 @@ pub const CudaGpuModel = struct {
 
     // Per-Layer Embedding Context Projection weights on GPU
     per_layer_model_projection: ?CudaGpuTensor = null,
+    per_layer_projection_norm: ?CudaGpuNorm = null,
 
-    // Device execution buffers
+    // Device temporary buffers
     d_x: CudaBuffer,
     d_xb: CudaBuffer,
     d_q: CudaBuffer,
@@ -139,6 +140,7 @@ pub const CudaGpuModel = struct {
     d_ple_gate: CudaBuffer,
     d_ple_buf: CudaBuffer,
     d_ctx_ple_buf: CudaBuffer,
+    d_ctx_scratch: CudaBuffer,
     d_logits: CudaBuffer,
 
     // GPU-Resident KV Cache
@@ -181,6 +183,7 @@ pub const CudaGpuModel = struct {
         const d_ple_gate = try device.alloc(256 * @sizeOf(f32));
         const d_ple_buf = try device.alloc(256 * @sizeOf(f32));
         const d_ctx_ple_buf = try device.alloc(cpu_model.layers.len * 256 * @sizeOf(f32));
+        const d_ctx_scratch = try device.alloc(cpu_model.layers.len * 256 * @sizeOf(f32));
         const d_logits = try device.alloc(p.vocab_size * @sizeOf(f32));
 
         // GPU KV Cache: [num_layers, max_seq, max_kv_heads * max_head_dim]
@@ -225,13 +228,13 @@ pub const CudaGpuModel = struct {
                 gpu_layers[i].post_per_layer_input_norm = try CudaGpuNorm.upload(device, norm);
             }
 
+            if (l.attn_q_norm) |norm| gpu_layers[i].attn_q_norm = try CudaGpuNorm.upload(device, norm);
+            if (l.attn_k_norm) |norm| gpu_layers[i].attn_k_norm = try CudaGpuNorm.upload(device, norm);
+
             if (l.attn_q) |t| gpu_layers[i].attn_q = try CudaGpuTensor.upload(device, t, n_heads * head_size, dim);
             if (l.attn_k) |t| gpu_layers[i].attn_k = try CudaGpuTensor.upload(device, t, n_kv_heads * head_size, dim);
             if (l.attn_v) |t| gpu_layers[i].attn_v = try CudaGpuTensor.upload(device, t, n_kv_heads * head_size, dim);
             if (l.attn_output) |t| gpu_layers[i].attn_output = try CudaGpuTensor.upload(device, t, dim, n_heads * head_size);
-
-            if (l.attn_q_norm) |norm| gpu_layers[i].attn_q_norm = try CudaGpuNorm.upload(device, norm);
-            if (l.attn_k_norm) |norm| gpu_layers[i].attn_k_norm = try CudaGpuNorm.upload(device, norm);
 
             if (l.ffn_gate) |t| gpu_layers[i].ffn_gate = try CudaGpuTensor.upload(device, t, inter_size, dim);
             if (l.ffn_up) |t| gpu_layers[i].ffn_up = try CudaGpuTensor.upload(device, t, inter_size, dim);
@@ -260,6 +263,11 @@ pub const CudaGpuModel = struct {
             gpu_ctx_proj = try CudaGpuTensor.upload(device, t, cpu_model.layers.len * 256, dim);
         }
 
+        var gpu_ctx_norm: ?CudaGpuNorm = null;
+        if (cpu_model.per_layer_projection_norm) |norm| {
+            gpu_ctx_norm = try CudaGpuNorm.upload(device, norm);
+        }
+
         device.sync();
 
         const self = try allocator.create(CudaGpuModel);
@@ -271,6 +279,7 @@ pub const CudaGpuModel = struct {
             .output = gpu_output,
             .output_norm = gpu_output_norm,
             .per_layer_model_projection = gpu_ctx_proj,
+            .per_layer_projection_norm = gpu_ctx_norm,
             .d_x = d_x,
             .d_xb = d_xb,
             .d_q = d_q,
@@ -284,6 +293,7 @@ pub const CudaGpuModel = struct {
             .d_ple_gate = d_ple_gate,
             .d_ple_buf = d_ple_buf,
             .d_ctx_ple_buf = d_ctx_ple_buf,
+            .d_ctx_scratch = d_ctx_scratch,
             .d_logits = d_logits,
             .d_k_cache = d_k_cache,
             .d_v_cache = d_v_cache,
@@ -304,6 +314,7 @@ pub const CudaGpuModel = struct {
         if (self.output) |*t| t.deinit();
         if (self.output_norm) |*n| n.deinit();
         if (self.per_layer_model_projection) |*t| t.deinit();
+        if (self.per_layer_projection_norm) |*n| n.deinit();
 
         self.d_x.deinit();
         self.d_xb.deinit();
@@ -318,6 +329,7 @@ pub const CudaGpuModel = struct {
         self.d_ple_gate.deinit();
         self.d_ple_buf.deinit();
         self.d_ctx_ple_buf.deinit();
+        self.d_ctx_scratch.deinit();
         self.d_logits.deinit();
         self.d_k_cache.deinit();
         self.d_v_cache.deinit();
@@ -332,36 +344,35 @@ pub const CudaGpuModel = struct {
         cpu_model: *const TransformerModel,
         token_id: u32,
         pos: usize,
-        kv_cache: *KVCache,
+        _: *KVCache,
         bufs: *ModelBuffers,
         custom_embedding: ?[]const f32,
         is_last_token: bool,
     ) ![]const f32 {
-        _ = kv_cache;
         const p = self.params;
         const dim = p.embedding_length;
 
-        // 1. Embedding lookup & scaling
-        if (custom_embedding) |emb| {
-            @memcpy(self.host_x[0..@min(dim, emb.len)], emb[0..@min(dim, emb.len)]);
-            if (emb.len < dim) {
-                @memset(self.host_x[emb.len..dim], 0.0);
-            }
+        // 1. Embedding lookup and upload
+        if (custom_embedding) |embd| {
+            @memcpy(self.host_x[0..dim], embd[0..dim]);
         } else {
-            const token_row = cpu_model.token_embd.getRow(token_id);
-            quant.dequantizeRow(cpu_model.token_embd.type, token_row, self.host_x, dim);
-            const token_scale = if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4)
+            const row_bytes = cpu_model.token_embd.getRow(token_id);
+            quant.dequantizeRow(cpu_model.token_embd.type, row_bytes, self.host_x[0..dim], dim);
+            const embd_scale = if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4)
                 @sqrt(@as(f32, @floatFromInt(dim)))
             else
                 1.0;
-            for (self.host_x) |*v| v.* *= token_scale;
+            for (self.host_x[0..dim]) |*v| v.* *= embd_scale;
         }
 
         // Upload embedding to GPU d_x
         const host_x_bytes: []const u8 = std.mem.sliceAsBytes(self.host_x);
         try self.d_x.upload(host_x_bytes, self.device.stream);
 
-        // PLE precomputation (Token identity + Context projection)
+        const d_x_ptr: [*]f32 = @ptrCast(@alignCast(self.d_x.ptr));
+        const d_xb_ptr: [*]f32 = @ptrCast(@alignCast(self.d_xb.ptr));
+
+        // PLE precomputation on GPU
         if (cpu_model.embed_tokens_per_layer) |ple_tab| {
             const ple_dim: usize = 256;
             const total_ple_dim = self.layers.len * ple_dim;
@@ -374,34 +385,35 @@ pub const CudaGpuModel = struct {
                 @memset(bufs.ctx_ple_buf[0..total_ple_dim], 0.0);
             }
 
-            if (cpu_model.per_layer_model_projection) |ctx_proj_t| {
-                const inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
-                for (0..dim) |d| bufs.xb[d] = self.host_x[d] * inv_sqrt_dim;
-                math.gemv(null, ctx_proj_t.type, ctx_proj_t.data, bufs.xb, bufs.ctx_scratch[0..total_ple_dim], total_ple_dim, dim);
-                if (cpu_model.per_layer_projection_norm) |norm_slice| {
-                    const inv_sqrt_2: f32 = 1.0 / @sqrt(2.0);
-                    for (0..self.layers.len) |l_idx| {
-                        const slice = bufs.ctx_scratch[l_idx * ple_dim .. (l_idx + 1) * ple_dim];
-                        math.rmsNorm(slice, norm_slice, slice, p.layer_norm_rms_epsilon, false);
-                        if (custom_embedding == null) {
-                            for (0..ple_dim) |d| {
-                                bufs.ctx_ple_buf[l_idx * ple_dim + d] = (bufs.ctx_ple_buf[l_idx * ple_dim + d] + slice[d]) * inv_sqrt_2;
-                            }
-                        } else {
-                            for (0..ple_dim) |d| {
-                                bufs.ctx_ple_buf[l_idx * ple_dim + d] = slice[d];
-                            }
-                        }
-                    }
-                }
-            }
-
             const ple_bytes: []const u8 = std.mem.sliceAsBytes(bufs.ctx_ple_buf[0..total_ple_dim]);
             try self.d_ctx_ple_buf.upload(ple_bytes, self.device.stream);
+
+            if (self.per_layer_model_projection) |ctx_proj| {
+                const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+                const d_ctx_scratch_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_scratch.ptr));
+                const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
+
+                // Scale d_x into d_xb: d_xb = d_x * inv_sqrt_dim on GPU
+                _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
+                self.device.scale(d_xb_ptr, inv_sqrt_dim, dim);
+
+                // GPU GEMV: ctx_scratch = ctx_proj * d_xb (8960 rows x 1536 cols in parallel on GPU)
+                self.device.gemv(ctx_proj.qtype, ctx_proj.buf.ptr, d_xb_ptr, d_ctx_scratch_ptr, total_ple_dim, dim);
+
+                // Normalization on GPU
+                if (self.per_layer_projection_norm) |norm| {
+                    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                    for (0..self.layers.len) |l_idx| {
+                        const slice_ptr = d_ctx_scratch_ptr + l_idx * ple_dim;
+                        self.device.rmsNorm(slice_ptr, norm_ptr, slice_ptr, ple_dim, p.layer_norm_rms_epsilon, false);
+                    }
+                }
+
+                // Fusion on GPU
+                self.device.pleCtxFuse(d_ctx_ple_ptr, d_ctx_scratch_ptr, total_ple_dim, custom_embedding == null);
+            }
         }
 
-        const d_x_ptr: [*]f32 = @ptrCast(@alignCast(self.d_x.ptr));
-        const d_xb_ptr: [*]f32 = @ptrCast(@alignCast(self.d_xb.ptr));
         const d_q_ptr: [*]f32 = @ptrCast(@alignCast(self.d_q.ptr));
         const d_k_ptr: [*]f32 = @ptrCast(@alignCast(self.d_k.ptr));
         const d_v_ptr: [*]f32 = @ptrCast(@alignCast(self.d_v.ptr));
@@ -418,11 +430,7 @@ pub const CudaGpuModel = struct {
 
         // 2. Transformer layers forward (100% on GPU, ZERO host transfers!)
         for (self.layers, 0..) |layer, layer_idx| {
-            const head_size = layer.head_dim;
-            const n_heads = layer.n_heads;
-            const n_kv_heads = layer.n_kv_heads;
-
-            // A. Pre-attention norm
+            // A. Pre-Attention Norm
             if (layer.input_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
                 self.device.rmsNorm(d_x_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
@@ -430,24 +438,14 @@ pub const CudaGpuModel = struct {
                 _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
             }
 
-            // Q Projection
+            const head_size = layer.head_dim;
+            const n_heads = layer.n_heads;
+            const n_kv_heads = layer.n_kv_heads;
+
             if (layer.attn_q) |t_q| {
                 self.device.gemv(t_q.qtype, t_q.buf.ptr, d_xb_ptr, d_q_ptr, n_heads * head_size, dim);
             }
 
-            // Q Norm
-            if (layer.attn_q_norm) |q_norm| {
-                const q_norm_ptr: [*]const f32 = @ptrCast(@alignCast(q_norm.buf.ptr));
-                for (0..n_heads) |h| {
-                    const q_head_ptr = d_q_ptr + h * head_size;
-                    self.device.rmsNorm(q_head_ptr, q_norm_ptr, q_head_ptr, head_size, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
-                }
-            }
-
-            // RoPE on Q (split half)
-            self.device.rope(d_q_ptr, null, pos, n_heads, 0, head_size, layer.rope_theta);
-
-            // KV Cache Handling
             const is_kv_shared = (p.arch == .gemma4 and layer_idx >= 15);
             const donor_layer: usize = if (is_kv_shared) (if (layer.head_dim >= 512) 14 else 13) else layer_idx;
 
@@ -474,46 +472,26 @@ pub const CudaGpuModel = struct {
                     }
                 }
 
-                // RoPE on K (split half)
                 self.device.rope(null, d_k_ptr, pos, 0, n_kv_heads, head_size, layer.rope_theta);
-
-                // Store K and V directly into GPU KV Cache
                 self.device.kvCachePut(d_k_cache_ptr, d_v_cache_ptr, d_k_ptr, d_v_ptr, layer_idx, pos, self.max_seq_len, n_kv_heads, head_size);
             }
 
-            // GPU-Resident Multi-Head Attention Forward
+            self.device.rope(d_q_ptr, null, pos, n_heads, 0, head_size, layer.rope_theta);
+            
             const attn_scale: f32 = if (p.arch == .gemma4) 1.0 else 1.0 / @sqrt(@as(f32, @floatFromInt(head_size)));
-            self.device.attentionForward(
-                d_q_ptr,
-                d_k_cache_ptr,
-                d_v_cache_ptr,
-                d_attn_out_ptr,
-                donor_layer,
-                pos,
-                self.max_seq_len,
-                n_heads,
-                n_kv_heads,
-                head_size,
-                attn_scale,
-                p.attn_logit_softcapping,
-                layer.sliding_window,
-            );
+            self.device.attentionForward(d_q_ptr, d_k_cache_ptr, d_v_cache_ptr, d_attn_out_ptr, donor_layer, pos, self.max_seq_len, n_heads, n_kv_heads, head_size, attn_scale, p.attn_logit_softcapping, layer.sliding_window);
 
-            // Output projection GEMV: attn_out -> xb
             if (layer.attn_output) |t_out| {
                 self.device.gemv(t_out.qtype, t_out.buf.ptr, d_attn_out_ptr, d_xb_ptr, dim, n_heads * head_size);
             }
 
-            // Post-attention norm (applied to xb with dim)
             if (layer.post_attention_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
                 self.device.rmsNorm(d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             }
 
-            // Residual add: x += xb
             self.device.add(d_x_ptr, d_xb_ptr, dim);
 
-            // B. Pre-feedforward norm
             if (layer.pre_feedforward_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
                 self.device.rmsNorm(d_x_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
@@ -521,8 +499,8 @@ pub const CudaGpuModel = struct {
                 _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
             }
 
-            // FFN Gate & Up projections
             const inter_dim = if (layer.ffn_gate) |g| g.rows else dim * 4;
+
             if (layer.ffn_gate) |t_gate| {
                 self.device.gemv(t_gate.qtype, t_gate.buf.ptr, d_xb_ptr, d_gate_ptr, inter_dim, dim);
             }
@@ -530,45 +508,34 @@ pub const CudaGpuModel = struct {
                 self.device.gemv(t_up.qtype, t_up.buf.ptr, d_xb_ptr, d_up_ptr, inter_dim, dim);
             }
 
-            // GeGLU activation: act = gelu(gate) * up
             self.device.geglu(d_gate_ptr, d_up_ptr, d_act_ptr, inter_dim);
 
-            // FFN Down projection: act -> ffn_out
             if (layer.ffn_down) |t_down| {
                 self.device.gemv(t_down.qtype, t_down.buf.ptr, d_act_ptr, d_ffn_out_ptr, dim, inter_dim);
             }
 
-            // Post-feedforward norm (if any)
             if (layer.post_feedforward_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
                 self.device.rmsNorm(d_ffn_out_ptr, norm_ptr, d_ffn_out_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             }
 
-            // Residual add: x += ffn_out
             self.device.add(d_x_ptr, d_ffn_out_ptr, dim);
 
-            // C. Per-Layer Embedding Injection (PLE) on GPU
             if (layer.per_layer_input_gate != null and layer.per_layer_projection != null) {
                 const ple_dim: usize = 256;
                 const ple_slice_ptr = d_ctx_ple_ptr + layer_idx * ple_dim;
-
                 const t_gate = layer.per_layer_input_gate.?;
                 self.device.gemv(t_gate.qtype, t_gate.buf.ptr, d_x_ptr, d_ple_gate_ptr, ple_dim, dim);
-
                 self.device.pleGateGelu(d_ple_gate_ptr, ple_slice_ptr, d_ple_buf_ptr, ple_dim);
-
                 const t_proj = layer.per_layer_projection.?;
                 self.device.gemv(t_proj.qtype, t_proj.buf.ptr, d_ple_buf_ptr, d_xb_ptr, dim, ple_dim);
-
                 if (layer.post_per_layer_input_norm) |norm| {
                     const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
                     self.device.rmsNorm(d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, false);
                 }
-
                 self.device.add(d_x_ptr, d_xb_ptr, dim);
             }
 
-            // D. End-of-layer scaling
             if (layer.scale != 1.0) {
                 self.device.scale(d_x_ptr, layer.scale, dim);
             }
@@ -582,7 +549,6 @@ pub const CudaGpuModel = struct {
             _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
         }
 
-        // If not last token in prefill, return empty without downloading logits
         if (!is_last_token) {
             return self.host_logits[0..0];
         }
@@ -593,23 +559,13 @@ pub const CudaGpuModel = struct {
             self.device.gemv(t_out.qtype, t_out.buf.ptr, d_xb_ptr, d_logits_ptr, p.vocab_size, dim);
         }
 
-        // Final Logit Softcapping
         if (p.final_logit_softcapping > 0.0) {
-            const cap = p.final_logit_softcapping;
-            self.device.scale(d_logits_ptr, 1.0 / cap, p.vocab_size);
+            self.device.tanhSoftcap(d_logits_ptr, p.final_logit_softcapping, p.vocab_size);
         }
 
-        // Download logits to host
         const logits_bytes: []u8 = std.mem.sliceAsBytes(self.host_logits);
         try self.d_logits.download(logits_bytes, self.device.stream);
         self.device.sync();
-
-        if (p.final_logit_softcapping > 0.0) {
-            const cap = p.final_logit_softcapping;
-            for (self.host_logits) |*v| {
-                v.* = cap * std.math.tanh(v.*);
-            }
-        }
 
         return self.host_logits;
     }

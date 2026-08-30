@@ -134,6 +134,7 @@ flowchart TD
 ```
 
 </details>
+
 ## CUDA
 the current cuda backend is kinda experimental so i havent done a lot of benchmarking stuff yet so its probably unoptimized and i need to work on it
 
