@@ -6,13 +6,15 @@ curently cpu only but i might make a cuda backend later also i only been able to
 - gemma 4 and its variants with curently only image multimodal working but sound and video might be added in the future
 
 
-#### How to compile and run 
+#### How to try it out
 1. first you need to clone the repo and get the zig compile for your os of choice but this has been only tested on linux so idk if it will work on anything else
 2. you need to build it via 
 ```sh 
 zig build -Doptimize=ReleaseFast -Dcpu=native
 
 ```
+or you can download the precompiled binary and cuda kernels from the releases tab but for the best cpu performance you need to compile it your self 
+
 3. now you can try out models that you downloaded 
 ```sh 
 ./zig-out/bin/ziglm run -m <path_to_the_model_folder> -p "<prompt>" --greedy -n <number_of_tokens_to_generate>
@@ -144,4 +146,4 @@ the current cuda backend is kinda experimental so i havent done a lot of benchma
 - nvcc for compiling the cuda kernels
 
 
-more coming soontm               
+more coming soontm

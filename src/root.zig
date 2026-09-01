@@ -19,6 +19,8 @@ pub const audio = @import("audio.zig");
 pub const video = @import("video.zig");
 pub const backend = @import("backend.zig");
 pub const cuda = @import("cuda.zig");
+pub const cuda_model = @import("cuda_model.zig");
+pub const safetensors = @import("safetensors.zig");
 
 // Direct public exports for ergonomic library usage
 pub const Engine = engine.Engine;

@@ -269,6 +269,7 @@ pub const ModelParams = struct {
     expert_count: usize = 0, // MoE
     expert_used_count: usize = 0, // MoE
     sliding_window: usize = 0, // Sliding window attention
+    num_kv_shared_layers: usize = 0, // Cross-layer KV sharing (e.g. Gemma 4)
 
     pub fn initComputed(self: *ModelParams) void {
         if (self.head_count > 0 and self.head_size == 0) {

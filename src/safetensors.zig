@@ -578,6 +578,9 @@ pub fn parseHFConfig(allocator: std.mem.Allocator, config_path: []const u8) !Mod
         if (cfg.get("head_dim")) |v| {
             if (v == .integer and v.integer > 0) params.head_size = @intCast(v.integer);
         }
+        if (cfg.get("num_kv_shared_layers")) |v| {
+            if (v == .integer and v.integer > 0) params.num_kv_shared_layers = @intCast(v.integer);
+        }
         if (cfg.get("final_logit_softcapping")) |v| {
             if (v == .float) params.final_logit_softcapping = @floatCast(v.float);
             if (v == .integer) params.final_logit_softcapping = @floatFromInt(v.integer);

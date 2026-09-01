@@ -446,13 +446,21 @@ pub const CudaGpuModel = struct {
                 self.device.gemv(t_q.qtype, t_q.buf.ptr, d_xb_ptr, d_q_ptr, n_heads * head_size, dim);
             }
 
-            const is_kv_shared = (p.arch == .gemma4 and layer.attn_k == null);
+            // KV Cache Handling (with Cross-Layer Sharing for Gemma 4 & hybrid architectures)
+            const unshared_count: usize = if (p.num_kv_shared_layers > 0)
+                (p.block_count - p.num_kv_shared_layers)
+            else if (p.arch == .gemma4)
+                (if (p.block_count == 42) 24 else 15)
+            else
+                p.block_count;
+
+            const is_kv_shared = (p.arch == .gemma4 and (layer.attn_k == null or layer_idx >= unshared_count));
             var donor_layer: usize = layer_idx;
             if (is_kv_shared) {
-                var l = layer_idx;
+                var l = unshared_count;
                 while (l > 0) {
                     l -= 1;
-                    if (self.layers[l].attn_k != null and self.layers[l].head_dim == layer.head_dim) {
+                    if (self.layers[l].head_dim == layer.head_dim) {
                         donor_layer = l;
                         break;
                     }

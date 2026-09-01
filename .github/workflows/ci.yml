@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  format:
+    name: Code Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      - name: Check formatting
+        run: zig fmt --check src/
+
+  test-cpu:
+    name: CPU Test Suite (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      - name: Run Test Suite
+        run: zig build test --summary all
+
+  build-cuda:
+    name: CUDA Kernel Compilation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda-version: '13.0.0'
+          method: 'network'
+      - name: Compile CUDA Bridge Object (nvcc)
+        run: |
+          nvcc -c src/cuda_bridge.cu -o src/cuda_bridge.o -O3 \
+            -arch=compute_75 \
+            -Xcompiler -fPIC -Isrc

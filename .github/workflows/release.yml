@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    name: Build Linux Release Binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      - uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda-version: '13.3.0'
+          method: 'network'
+      - name: Build Optimized Release Binary
+        run: |
+          nvcc -c src/cuda_bridge.cu -o src/cuda_bridge.o -O3 -arch=compute_75 -Xcompiler -fPIC -Isrc
+          zig build -Doptimize=ReleaseFast
+      - name: Upload Release Binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zig-out/bin/*
