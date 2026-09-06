@@ -219,7 +219,7 @@ pub const GGUFFile = struct {
             .FLOAT64 => .{ .FLOAT64 = @bitCast(try self.readU64(offset)) },
             .ARRAY => blk: {
                 const arr_type_u32 = try self.readU32(offset);
-                const arr_type: GGUFValueType = @enumFromInt(arr_type_u32);
+                const arr_type: GGUFValueType = @fromBackingInt(@intCast(arr_type_u32));
                 const arr_len = try self.readU64(offset);
                 const start_data = offset.*;
 
@@ -261,7 +261,7 @@ pub const GGUFFile = struct {
         for (0..self.metadata_count) |i| {
             const key = try self.readString(&offset);
             const val_type_u32 = try self.readU32(&offset);
-            const val_type: GGUFValueType = @enumFromInt(val_type_u32);
+            const val_type: GGUFValueType = @fromBackingInt(@intCast(val_type_u32));
             const value = try self.parseValue(&offset, val_type);
             self.metadata[i] = .{ .key = key, .value = value };
 
@@ -283,7 +283,7 @@ pub const GGUFFile = struct {
             }
 
             const qtype_u32 = try self.readU32(&offset);
-            const qtype: GGMLType = @enumFromInt(qtype_u32);
+            const qtype: GGMLType = @fromBackingInt(@intCast(qtype_u32));
             const tensor_offset = try self.readU64(&offset);
 
             self.tensors[i] = .{
@@ -515,7 +515,7 @@ test "GGUF parsing in-memory validation" {
     try bw.writeU64(1);
 
     try bw.writeString("general.architecture");
-    try bw.writeU32(@intFromEnum(GGUFValueType.STRING));
+    try bw.writeU32(@backingInt(GGUFValueType.STRING));
     try bw.writeString("llama");
 
     const written_bytes = buffer[0..bw.pos];

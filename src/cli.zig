@@ -308,7 +308,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var l_count: usize = 0;
         for (gguf_file.tensors) |t| {
             if (std.mem.indexOf(u8, t.name, "blk") == null) {
-                std.debug.print("  [GLOBAL] {s:<42} {s:<8} (id={d}) [{d}, {d}] ({d} bytes)\n", .{ t.name, t.type.name(), @intFromEnum(t.type), t.shape[0], t.shape[1], t.sizeBytes() });
+                std.debug.print("  [GLOBAL] {s:<42} {s:<8} (id={d}) [{d}, {d}] ({d} bytes)\n", .{ t.name, t.type.name(), @backingInt(t.type), t.shape[0], t.shape[1], t.sizeBytes() });
             }
             if (std.mem.startsWith(u8, t.name, "a.")) {
                 a_count += 1;

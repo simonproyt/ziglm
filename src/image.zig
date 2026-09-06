@@ -133,8 +133,11 @@ pub const Image = struct {
                 _ = std.posix.system.close(dev_null_fd);
             }
 
-            var path_z_buf: [1024]u8 = undefined;
-            const path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{actual_path}) catch std.posix.system.exit(1);
+            var path_z_buf: [1024:0]u8 = undefined;
+            if (actual_path.len >= path_z_buf.len) std.posix.system.exit(1);
+            @memcpy(path_z_buf[0..actual_path.len], actual_path);
+            path_z_buf[actual_path.len] = 0;
+            const path_z: [:0]const u8 = path_z_buf[0..actual_path.len :0];
 
             const argv_magick = [_:null]?[*:0]const u8{
                 "magick",

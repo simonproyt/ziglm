@@ -77,11 +77,15 @@ pub const Video = struct {
                 _ = std.posix.system.close(dev_null_fd);
             }
 
-            var path_z_buf: [1024]u8 = undefined;
-            const path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{video_path}) catch std.posix.system.exit(1);
+            var path_z_buf: [1024:0]u8 = undefined;
+            if (video_path.len >= path_z_buf.len) std.posix.system.exit(1);
+            @memcpy(path_z_buf[0..video_path.len], video_path);
+            path_z_buf[video_path.len] = 0;
+            const path_z: [:0]const u8 = path_z_buf[0..video_path.len :0];
 
             var vframes_buf: [16]u8 = undefined;
-            const vframes_str = std.fmt.bufPrintZ(&vframes_buf, "{d}", .{max_frames}) catch "8";
+            const vframes_slice = std.fmt.bufPrint(&vframes_buf, "{d}\x00", .{max_frames}) catch "8\x00";
+            const vframes_str: [:0]const u8 = vframes_slice[0 .. vframes_slice.len - 1 :0];
 
             const argv = [_:null]?[*:0]const u8{
                 "ffmpeg",

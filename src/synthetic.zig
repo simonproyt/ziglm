@@ -55,61 +55,61 @@ pub fn generateSampleGGUF(allocator: std.mem.Allocator, file_path: []const u8, c
 
     // 2. Metadata Key-Values
     try bw.writeString("general.architecture");
-    try bw.writeU32(@intFromEnum(GGUFValueType.STRING));
+    try bw.writeU32(@backingInt(GGUFValueType.STRING));
     try bw.writeString(config.arch);
 
     var key_buf: [64]u8 = undefined;
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.block_count", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(@intCast(config.block_count));
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.context_length", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(@intCast(config.context_length));
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.embedding_length", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(@intCast(config.embedding_length));
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.feed_forward_length", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(@intCast(config.feed_forward_length));
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.attention.head_count", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(@intCast(config.head_count));
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.attention.head_count_kv", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(@intCast(config.head_count_kv));
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.attention.layer_norm_rms_epsilon", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.FLOAT32));
+    try bw.writeU32(@backingInt(GGUFValueType.FLOAT32));
     try bw.writeF32(1e-5);
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.rope.freq_base", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.FLOAT32));
+    try bw.writeU32(@backingInt(GGUFValueType.FLOAT32));
     try bw.writeF32(10000.0);
 
     try bw.writeString(try std.fmt.bufPrint(&key_buf, "{s}.rope.dimension_count", .{config.arch}));
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(@intCast(config.embedding_length / config.head_count));
 
     try bw.writeString("tokenizer.ggml.model");
-    try bw.writeU32(@intFromEnum(GGUFValueType.STRING));
+    try bw.writeU32(@backingInt(GGUFValueType.STRING));
     try bw.writeString("gpt2");
 
     try bw.writeString("tokenizer.ggml.bos_token_id");
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(0);
 
     try bw.writeString("tokenizer.ggml.eos_token_id");
-    try bw.writeU32(@intFromEnum(GGUFValueType.UINT32));
+    try bw.writeU32(@backingInt(GGUFValueType.UINT32));
     try bw.writeU32(1);
 
     try bw.writeString("tokenizer.ggml.tokens");
-    try bw.writeU32(@intFromEnum(GGUFValueType.ARRAY));
-    try bw.writeU32(@intFromEnum(GGUFValueType.STRING));
+    try bw.writeU32(@backingInt(GGUFValueType.ARRAY));
+    try bw.writeU32(@backingInt(GGUFValueType.STRING));
     try bw.writeU64(config.vocab_size);
 
     const sample_tokens = [_][]const u8{
@@ -132,8 +132,8 @@ pub fn generateSampleGGUF(allocator: std.mem.Allocator, file_path: []const u8, c
     }
 
     try bw.writeString("tokenizer.ggml.merges");
-    try bw.writeU32(@intFromEnum(GGUFValueType.ARRAY));
-    try bw.writeU32(@intFromEnum(GGUFValueType.STRING));
+    try bw.writeU32(@backingInt(GGUFValueType.ARRAY));
+    try bw.writeU32(@backingInt(GGUFValueType.STRING));
     try bw.writeU64(2);
     try bw.writeString("t h");
     try bw.writeString("Ġ t");
@@ -212,7 +212,7 @@ pub fn generateSampleGGUF(allocator: std.mem.Allocator, file_path: []const u8, c
         try bw.writeU32(2);
         try bw.writeU64(t.shape[0]);
         try bw.writeU64(t.shape[1]);
-        try bw.writeU32(@intFromEnum(t.qtype));
+        try bw.writeU32(@backingInt(t.qtype));
         try bw.writeU64(current_offset);
         current_offset += t.size_bytes;
     }

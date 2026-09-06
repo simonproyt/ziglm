@@ -9,7 +9,7 @@ pub const KVCache = struct {
     current_pos: usize = 0,
 
     // Contiguous memory buffer: [block_count * 2 * max_seq_len * head_count_kv * head_size]
-    buffer: []f32,
+    buffer: []align(64) f32,
     layer_stride: usize, // 2 * max_seq_len * head_count_kv * head_size
     pos_stride: usize, // head_count_kv * head_size
     head_stride: usize, // head_size
