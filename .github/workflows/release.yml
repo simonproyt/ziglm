@@ -13,19 +13,23 @@ jobs:
     name: Build Linux Release Binary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - uses: Jimver/cuda-toolkit@v0.2.36
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '13.3.0'
           method: 'network'
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
       - name: Build Optimized Release Binary
-        run: |
-          nvcc -c src/cuda_bridge.cu -o src/cuda_bridge.o -O3 -arch=compute_75 -Xcompiler -fPIC -Isrc
-          zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast
+
       - name: Upload Release Binary
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           files: zig-out/bin/*

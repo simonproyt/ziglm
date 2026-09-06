@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
         "/opt/cuda";
 
     const nvcc_exe = b.option([]const u8, "nvcc", "Path to nvcc compiler") orelse "nvcc";
+    const cuda_arch = b.option([]const u8, "cuda-arch", "Target CUDA architecture ('all', 'native', or specific e.g. 'sm_75')") orelse "all";
 
     // Compile CUDA C Bridge using nvcc
     const nvcc_cmd = b.addSystemCommand(&.{
@@ -46,10 +47,22 @@ pub fn build(b: *std.Build) void {
         "-O3",
         "-Xcompiler",
         "-fPIC",
-        "-arch=compute_75",
         "-Isrc",
         b.fmt("-I{s}/include", .{cuda_root}),
     });
+
+    if (std.mem.eql(u8, cuda_arch, "all")) {
+        nvcc_cmd.addArgs(&.{
+            "-gencode=arch=compute_75,code=sm_75",
+            "-gencode=arch=compute_80,code=sm_80",
+            "-gencode=arch=compute_86,code=sm_86",
+            "-gencode=arch=compute_89,code=sm_89",
+            "-gencode=arch=compute_90,code=sm_90",
+            "-gencode=arch=compute_90,code=compute_90",
+        });
+    } else {
+        nvcc_cmd.addArg(b.fmt("-arch={s}", .{cuda_arch}));
+    }
 
     const mod = b.addModule("ziglm", .{
         .root_source_file = b.path("src/root.zig"),
