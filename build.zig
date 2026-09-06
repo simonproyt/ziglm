@@ -27,9 +27,21 @@ pub fn build(b: *std.Build) void {
     // addModule defines a module that we intend to make available for importing
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
+    const cuda_root = b.option([]const u8, "cuda-path", "Path to CUDA toolkit installation") orelse
+        b.graph.environ_map.get("CUDA_PATH") orelse
+        b.graph.environ_map.get("CUDA_HOME") orelse
+        "/opt/cuda";
+
+    const nvcc_exe = b.findProgram(&.{"nvcc"}, &.{
+        b.fmt("{s}/bin", .{cuda_root}),
+        "/opt/cuda/bin",
+        "/usr/local/cuda/bin",
+        "/usr/bin",
+    }) catch "nvcc";
+
     // Compile CUDA C Bridge using nvcc
     const nvcc_cmd = b.addSystemCommand(&.{
-        "/opt/cuda/bin/nvcc",
+        nvcc_exe,
         "-c",
     });
     nvcc_cmd.addFileArg(b.path("src/cuda_bridge.cu"));
@@ -41,7 +53,9 @@ pub fn build(b: *std.Build) void {
         "-fPIC",
         "-arch=compute_75",
         "-Isrc",
+        b.fmt("-I{s}/include", .{cuda_root}),
         "-I/opt/cuda/include",
+        "-I/usr/local/cuda/include",
     });
 
     const mod = b.addModule("ziglm", .{
@@ -50,7 +64,10 @@ pub fn build(b: *std.Build) void {
     });
 
     mod.addObjectFile(cuda_obj);
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib64", .{cuda_root}) });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{cuda_root}) });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/cuda/lib64" });
+    mod.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64" });
     mod.linkSystemLibrary("cudart", .{});
     mod.linkSystemLibrary("stdc++", .{});
     mod.linkSystemLibrary("c", .{});
@@ -66,7 +83,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib64", .{cuda_root}) });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{cuda_root}) });
     exe.root_module.addLibraryPath(.{ .cwd_relative = "/opt/cuda/lib64" });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64" });
     exe.root_module.linkSystemLibrary("cudart", .{});
     exe.root_module.linkSystemLibrary("stdc++", .{});
     exe.root_module.linkSystemLibrary("c", .{});
@@ -79,8 +99,10 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    if (@hasField(std.Build, "args")) {
+        if (@field(b, "args")) |args| {
+            run_cmd.addArgs(args);
+        }
     }
 
     const mod_tests = b.addTest(.{
