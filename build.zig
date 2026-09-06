@@ -32,12 +32,7 @@ pub fn build(b: *std.Build) void {
         b.graph.environ_map.get("CUDA_HOME") orelse
         "/opt/cuda";
 
-    const nvcc_exe = b.findProgram(&.{"nvcc"}, &.{
-        b.fmt("{s}/bin", .{cuda_root}),
-        "/opt/cuda/bin",
-        "/usr/local/cuda/bin",
-        "/usr/bin",
-    }) catch "nvcc";
+    const nvcc_exe = b.option([]const u8, "nvcc", "Path to nvcc compiler") orelse "nvcc";
 
     // Compile CUDA C Bridge using nvcc
     const nvcc_cmd = b.addSystemCommand(&.{
@@ -54,8 +49,6 @@ pub fn build(b: *std.Build) void {
         "-arch=compute_75",
         "-Isrc",
         b.fmt("-I{s}/include", .{cuda_root}),
-        "-I/opt/cuda/include",
-        "-I/usr/local/cuda/include",
     });
 
     const mod = b.addModule("ziglm", .{
@@ -65,9 +58,6 @@ pub fn build(b: *std.Build) void {
 
     mod.addObjectFile(cuda_obj);
     mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib64", .{cuda_root}) });
-    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{cuda_root}) });
-    mod.addLibraryPath(.{ .cwd_relative = "/opt/cuda/lib64" });
-    mod.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64" });
     mod.linkSystemLibrary("cudart", .{});
     mod.linkSystemLibrary("stdc++", .{});
     mod.linkSystemLibrary("c", .{});
@@ -84,9 +74,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib64", .{cuda_root}) });
-    exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{cuda_root}) });
-    exe.root_module.addLibraryPath(.{ .cwd_relative = "/opt/cuda/lib64" });
-    exe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64" });
     exe.root_module.linkSystemLibrary("cudart", .{});
     exe.root_module.linkSystemLibrary("stdc++", .{});
     exe.root_module.linkSystemLibrary("c", .{});
