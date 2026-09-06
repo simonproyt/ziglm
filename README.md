@@ -5,6 +5,14 @@ curently cpu only but i might make a cuda backend later also i only been able to
 - smollm2-360m
 - gemma 4 and its variants with curently only image multimodal working but sound and video might be added in the future
 
+## System requirements 
+
+#### for cpu inference:
+in the current action pipeline i compile it for x86_64_v3 so if you have an older cpu it will probably throw an illegal instrustion error even if 
+you try to offload stuff to the gpu so i would recommend you to compile it yourself if you have an older cpu.
+
+#### for cuda inference:
+currently the kernels are being compiled with cuda 13.3 and kernels for every compute capability from touring and up is provided  so it should work on rtx 20/1650 and up.
 
 #### How to try it out
 1. first you need to clone the repo and get the zig compile for your os of choice but this has been only tested on linux so idk if it will work on anything else

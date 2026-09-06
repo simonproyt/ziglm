@@ -27,7 +27,7 @@ jobs:
           version: master
 
       - name: Build Optimized Release Binary
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3
 
       - name: Upload Release Binary
         uses: softprops/action-gh-release@v2
