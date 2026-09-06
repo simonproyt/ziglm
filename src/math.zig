@@ -202,7 +202,7 @@ pub fn dotQ8_0F32(a_bytes: []const u8, b: []const f32, n_elements: usize) f32 {
         const qs0_1: @Vector(16, i8) = blk0.qs[16..32].*;
         const qs1_0: @Vector(16, i8) = blk1.qs[0..16].*;
         const qs1_1: @Vector(16, i8) = blk1.qs[16..32].*;
-        
+
         const vq0_0: Vec = @floatFromInt(@as(@Vector(16, i32), qs0_0));
         const vq0_1: Vec = @floatFromInt(@as(@Vector(16, i32), qs0_1));
         const vq1_0: Vec = @floatFromInt(@as(@Vector(16, i32), qs1_0));

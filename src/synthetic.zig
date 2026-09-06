@@ -113,11 +113,12 @@ pub fn generateSampleGGUF(allocator: std.mem.Allocator, file_path: []const u8, c
     try bw.writeU64(config.vocab_size);
 
     const sample_tokens = [_][]const u8{
-        "<s>", "</s>", "<unk>", "Hello", "world", "!",
-        "The", "capital", "of", "France", "is", "Paris",
-        "A", "B", "C", "D", "E", "F", "G", "H",
-        "I", "J", "K", "L", "M", "N", "O", "P",
-        "Q", "R", "S", "T",
+        "<s>", "</s>",    "<unk>", "Hello",  "world", "!",
+        "The", "capital", "of",    "France", "is",    "Paris",
+        "A",   "B",       "C",     "D",      "E",     "F",
+        "G",   "H",       "I",     "J",      "K",     "L",
+        "M",   "N",       "O",     "P",      "Q",     "R",
+        "S",   "T",
     };
 
     for (0..config.vocab_size) |i| {
@@ -223,7 +224,7 @@ pub fn generateSampleGGUF(allocator: std.mem.Allocator, file_path: []const u8, c
     const align_boundary: usize = 32;
     const pad = (align_boundary - (bw.pos % align_boundary)) % align_boundary;
     if (pad > 0) {
-        const zeros = [_]u8{0} ** 32;
+        const zeros: [32]u8 = @splat(0);
         try writeAllBytes(fd, zeros[0..pad]);
     }
 

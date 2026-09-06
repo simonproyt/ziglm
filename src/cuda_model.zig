@@ -495,7 +495,7 @@ pub const CudaGpuModel = struct {
             }
 
             self.device.rope(d_q_ptr, null, pos, n_heads, 0, head_size, layer.rope_theta);
-            
+
             const attn_scale: f32 = if (p.arch == .gemma4) 1.0 else 1.0 / @sqrt(@as(f32, @floatFromInt(head_size)));
             self.device.attentionForward(d_q_ptr, d_k_cache_ptr, d_v_cache_ptr, d_attn_out_ptr, donor_layer, pos, self.max_seq_len, n_heads, n_kv_heads, head_size, attn_scale, p.attn_logit_softcapping, layer.sliding_window);
 

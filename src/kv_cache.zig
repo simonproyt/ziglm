@@ -103,8 +103,8 @@ test "KVCache put and retrieve" {
     var cache = try KVCache.init(allocator, 2, 4, 8, 16);
     defer cache.deinit();
 
-    var k = [_]f32{ 1.0 } ** 32;
-    var v = [_]f32{ 2.0 } ** 32;
+    var k: [32]f32 = @splat(1.0);
+    var v: [32]f32 = @splat(2.0);
     k[0] = 42.0;
     v[0] = 99.0;
 

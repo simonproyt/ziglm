@@ -205,81 +205,81 @@ pub const LogMelSpectrogram = struct {
         self.allocator.free(self.mel_filters);
     }
 
-const BIT_REV_512: [512]u16 = blk: {
-    @setEvalBranchQuota(10000);
-    var table: [512]u16 = undefined;
-    for (0..512) |i| {
-        var n = i;
-        var rev: u16 = 0;
-        for (0..9) |_| {
-            rev = (rev << 1) | @as(u16, @intCast(n & 1));
-            n >>= 1;
+    const BIT_REV_512: [512]u16 = blk: {
+        @setEvalBranchQuota(10000);
+        var table: [512]u16 = undefined;
+        for (0..512) |i| {
+            var n = i;
+            var rev: u16 = 0;
+            for (0..9) |_| {
+                rev = (rev << 1) | @as(u16, @intCast(n & 1));
+                n >>= 1;
+            }
+            table[i] = rev;
         }
-        table[i] = rev;
-    }
-    break :blk table;
-};
+        break :blk table;
+    };
 
-const TWIDDLE_COS_512: [256]f32 = blk: {
-    @setEvalBranchQuota(10000);
-    var cos_tab: [256]f32 = undefined;
-    for (0..256) |k| {
-        const theta = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / 512.0;
-        cos_tab[k] = @cos(theta);
-    }
-    break :blk cos_tab;
-};
+    const TWIDDLE_COS_512: [256]f32 = blk: {
+        @setEvalBranchQuota(10000);
+        var cos_tab: [256]f32 = undefined;
+        for (0..256) |k| {
+            const theta = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / 512.0;
+            cos_tab[k] = @cos(theta);
+        }
+        break :blk cos_tab;
+    };
 
-const TWIDDLE_SIN_512: [256]f32 = blk: {
-    @setEvalBranchQuota(10000);
-    var sin_tab: [256]f32 = undefined;
-    for (0..256) |k| {
-        const theta = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / 512.0;
-        sin_tab[k] = @sin(theta);
-    }
-    break :blk sin_tab;
-};
+    const TWIDDLE_SIN_512: [256]f32 = blk: {
+        @setEvalBranchQuota(10000);
+        var sin_tab: [256]f32 = undefined;
+        for (0..256) |k| {
+            const theta = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / 512.0;
+            sin_tab[k] = @sin(theta);
+        }
+        break :blk sin_tab;
+    };
 
-fn fft512(in_real: *const [512]f32, out_power_spectrum: *[257]f32) void {
-    var real: [512]f32 = undefined;
-    var imag: [512]f32 = undefined;
+    fn fft512(in_real: *const [512]f32, out_power_spectrum: *[257]f32) void {
+        var real: [512]f32 = undefined;
+        var imag: [512]f32 = undefined;
 
-    // 1. Bit-reversal permutation
-    for (0..512) |i| {
-        real[i] = in_real[BIT_REV_512[i]];
-        imag[i] = 0.0;
-    }
+        // 1. Bit-reversal permutation
+        for (0..512) |i| {
+            real[i] = in_real[BIT_REV_512[i]];
+            imag[i] = 0.0;
+        }
 
-    // 2. Cooley-Tukey Radix-2 butterfly stages
-    var len: usize = 2;
-    while (len <= 512) : (len <<= 1) {
-        const half = len >> 1;
-        const step = 512 / len;
-        var i: usize = 0;
-        while (i < 512) : (i += len) {
-            for (0..half) |k| {
-                const tw_idx = k * step;
-                const w_re = TWIDDLE_COS_512[tw_idx];
-                const w_im = TWIDDLE_SIN_512[tw_idx];
+        // 2. Cooley-Tukey Radix-2 butterfly stages
+        var len: usize = 2;
+        while (len <= 512) : (len <<= 1) {
+            const half = len >> 1;
+            const step = 512 / len;
+            var i: usize = 0;
+            while (i < 512) : (i += len) {
+                for (0..half) |k| {
+                    const tw_idx = k * step;
+                    const w_re = TWIDDLE_COS_512[tw_idx];
+                    const w_im = TWIDDLE_SIN_512[tw_idx];
 
-                const u_re = real[i + k];
-                const u_im = imag[i + k];
-                const v_re = real[i + k + half] * w_re - imag[i + k + half] * w_im;
-                const v_im = real[i + k + half] * w_im + imag[i + k + half] * w_re;
+                    const u_re = real[i + k];
+                    const u_im = imag[i + k];
+                    const v_re = real[i + k + half] * w_re - imag[i + k + half] * w_im;
+                    const v_im = real[i + k + half] * w_im + imag[i + k + half] * w_re;
 
-                real[i + k] = u_re + v_re;
-                imag[i + k] = u_im + v_im;
-                real[i + k + half] = u_re - v_re;
-                imag[i + k + half] = u_im - v_im;
+                    real[i + k] = u_re + v_re;
+                    imag[i + k] = u_im + v_im;
+                    real[i + k + half] = u_re - v_re;
+                    imag[i + k + half] = u_im - v_im;
+                }
             }
         }
-    }
 
-    // 3. Power spectrum for 0..256 (Nyquist)
-    for (0..257) |k| {
-        out_power_spectrum[k] = real[k] * real[k] + imag[k] * imag[k];
+        // 3. Power spectrum for 0..256 (Nyquist)
+        for (0..257) |k| {
+            out_power_spectrum[k] = real[k] * real[k] + imag[k] * imag[k];
+        }
     }
-}
 
     pub fn compute(self: *const LogMelSpectrogram, samples: []const f32) ![]f32 {
         if (samples.len < self.frame_length) return error.AudioTooShort;
@@ -347,7 +347,7 @@ pub const AudioLayerWeights = struct {
     ffn_up: ?types.Tensor = null,
     ffn_down: ?types.Tensor = null,
     ffn_post_norm: ?[]const f32 = null,
-    
+
     // Attention
     attn_pre_norm: ?[]const f32 = null,
     attn_q: ?types.Tensor = null,
@@ -357,20 +357,20 @@ pub const AudioLayerWeights = struct {
     per_dim_scale: ?[]const f32 = null,
     attn_out: ?types.Tensor = null,
     attn_post_norm: ?[]const f32 = null,
-    
+
     // Conv
     norm_conv: ?[]const f32 = null,
     conv_pw1: ?types.Tensor = null,
     conv_dw: ?types.Tensor = null,
     conv_norm: ?[]const f32 = null,
     conv_pw2: ?types.Tensor = null,
-    
+
     // FFN 1
     ffn_norm_1: ?[]const f32 = null,
     ffn_up_1: ?types.Tensor = null,
     ffn_down_1: ?types.Tensor = null,
     ffn_post_norm_1: ?[]const f32 = null,
-    
+
     // Final LN
     ln2: ?[]const f32 = null,
 };
@@ -446,7 +446,7 @@ pub const AudioEncoder = struct {
         const conv0_out = try allocator.alloc(f32, t2 * 64 * 128);
         defer allocator.free(conv0_out);
         @memset(conv0_out, 0.0);
-        
+
         if (self.conv1d_0_weight) |w0| {
             const w_slice = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(w0.data)));
             for (0..t2) |t_out| {
@@ -492,7 +492,7 @@ pub const AudioEncoder = struct {
         const conv1_out = try allocator.alloc(f32, t4 * 32 * 32); // output: [T/4, 32_freq, 32_channels] -> 32*32=1024
         defer allocator.free(conv1_out);
         @memset(conv1_out, 0.0);
-        
+
         if (self.conv1d_1_weight) |w1| {
             const w_slice = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(w1.data)));
             for (0..t4) |t_out| {
@@ -537,7 +537,7 @@ pub const AudioEncoder = struct {
         const states = try allocator.alloc(f32, target_frames * self.hidden_size);
         defer allocator.free(states);
         @memset(states, 0.0);
-        
+
         // Reshape [t4, 32_freq, 32_ch] -> [t4, 1024] -> linear project to states
         if (self.input_proj) |proj| {
             // conv1_out is [t4, 32, 32] which is flat [t4, 1024].
@@ -546,7 +546,7 @@ pub const AudioEncoder = struct {
             @memcpy(states, conv1_out);
         }
 
-                // Now apply conformer layers
+        // Now apply conformer layers
         // Preallocate scratchpad working buffers once for all 12 Conformer layers
         const p_norm = try allocator.alloc(f32, target_frames * self.hidden_size);
         defer allocator.free(p_norm);
@@ -616,8 +616,12 @@ pub const AudioEncoder = struct {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                    var mean: f32 = 0;
+                    for (src) |v| mean += v;
+                    mean /= @as(f32, @floatFromInt(self.hidden_size));
+                    var var_: f32 = 0;
+                    for (src) |v| var_ += (v - mean) * (v - mean);
+                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
@@ -636,8 +640,12 @@ pub const AudioEncoder = struct {
                 if (layer.ffn_post_norm) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = p_ffn_down[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                        var mean: f32 = 0;
+                        for (src) |v| mean += v;
+                        mean /= @as(f32, @floatFromInt(self.hidden_size));
+                        var var_: f32 = 0;
+                        for (src) |v| var_ += (v - mean) * (v - mean);
+                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
                         const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                         for (src, 0..) |*v, d| states[t * self.hidden_size + d] += 0.5 * ((v.* - mean) * inv_std * pnorm[d]);
                     }
@@ -649,8 +657,12 @@ pub const AudioEncoder = struct {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                    var mean: f32 = 0;
+                    for (src) |v| mean += v;
+                    mean /= @as(f32, @floatFromInt(self.hidden_size));
+                    var var_: f32 = 0;
+                    for (src) |v| var_ += (v - mean) * (v - mean);
+                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
@@ -723,8 +735,12 @@ pub const AudioEncoder = struct {
                 if (layer.attn_post_norm) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = out_proj[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                        var mean: f32 = 0;
+                        for (src) |v| mean += v;
+                        mean /= @as(f32, @floatFromInt(self.hidden_size));
+                        var var_: f32 = 0;
+                        for (src) |v| var_ += (v - mean) * (v - mean);
+                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
                         const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                         for (src, 0..) |*v, d| states[t * self.hidden_size + d] += ((v.* - mean) * inv_std * pnorm[d]);
                     }
@@ -736,8 +752,12 @@ pub const AudioEncoder = struct {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                    var mean: f32 = 0;
+                    for (src) |v| mean += v;
+                    mean /= @as(f32, @floatFromInt(self.hidden_size));
+                    var var_: f32 = 0;
+                    for (src) |v| var_ += (v - mean) * (v - mean);
+                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
@@ -774,8 +794,12 @@ pub const AudioEncoder = struct {
                 if (layer.conv_norm) |cnorm| {
                     for (0..num_frames) |t| {
                         const src = dw_out[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                        var mean: f32 = 0;
+                        for (src) |v| mean += v;
+                        mean /= @as(f32, @floatFromInt(self.hidden_size));
+                        var var_: f32 = 0;
+                        for (src) |v| var_ += (v - mean) * (v - mean);
+                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
                         const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                         for (src, 0..) |*v, d| v.* = (v.* - mean) * inv_std * cnorm[d];
                     }
@@ -798,8 +822,12 @@ pub const AudioEncoder = struct {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                    var mean: f32 = 0;
+                    for (src) |v| mean += v;
+                    mean /= @as(f32, @floatFromInt(self.hidden_size));
+                    var var_: f32 = 0;
+                    for (src) |v| var_ += (v - mean) * (v - mean);
+                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
                 }
@@ -813,8 +841,12 @@ pub const AudioEncoder = struct {
                 if (layer.ffn_post_norm_1) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = p_ffn_down[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                        var mean: f32 = 0;
+                        for (src) |v| mean += v;
+                        mean /= @as(f32, @floatFromInt(self.hidden_size));
+                        var var_: f32 = 0;
+                        for (src) |v| var_ += (v - mean) * (v - mean);
+                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
                         const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                         for (src, 0..) |*v, d| states[t * self.hidden_size + d] += 0.5 * ((v.* - mean) * inv_std * pnorm[d]);
                     }
@@ -825,15 +857,19 @@ pub const AudioEncoder = struct {
             if (layer.ln2) |ln2| {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0; for (src) |v| mean += v; mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0; for (src) |v| var_ += (v - mean) * (v - mean); var_ /= @as(f32, @floatFromInt(self.hidden_size));
+                    var mean: f32 = 0;
+                    for (src) |v| mean += v;
+                    mean /= @as(f32, @floatFromInt(self.hidden_size));
+                    var var_: f32 = 0;
+                    for (src) |v| var_ += (v - mean) * (v - mean);
+                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
                     const inv_std = 1.0 / @sqrt(var_ + 1e-6);
                     for (src, 0..) |*v, d| v.* = (v.* - mean) * inv_std * ln2[d];
                 }
             }
         }
-const out_embeddings = try allocator.alloc(f32, target_frames * self.llm_dim);
-        
+        const out_embeddings = try allocator.alloc(f32, target_frames * self.llm_dim);
+
         // Output projection: conformer_states -> pre_encode_out (1024->1536) -> RMSNorm -> mm.a.input_projection (1536->1536)
         for (0..target_frames) |t| {
             const p_state = states[t * self.hidden_size .. (t + 1) * self.hidden_size];

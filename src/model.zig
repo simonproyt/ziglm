@@ -397,7 +397,7 @@ pub const TransformerModel = struct {
             layer.ffn_up = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_up.weight", .{l_idx}));
             layer.ffn_down = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_down.weight", .{l_idx}));
             layer.ffn_post_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_post_norm.weight", .{l_idx})), 1024);
-            
+
             layer.attn_pre_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_pre_norm.weight", .{l_idx})), 1024);
             layer.attn_k = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_k.weight", .{l_idx}));
             layer.attn_v = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_v.weight", .{l_idx}));
@@ -405,18 +405,18 @@ pub const TransformerModel = struct {
             layer.per_dim_scale = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.per_dim_scale.weight", .{l_idx})), 128);
             layer.attn_out = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_out.weight", .{l_idx}));
             layer.attn_post_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_post_norm.weight", .{l_idx})), 1024);
-            
+
             layer.norm_conv = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.norm_conv.weight", .{l_idx})), 1024);
             layer.conv_pw1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_pw1.weight", .{l_idx}));
             layer.conv_dw = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_dw.weight", .{l_idx}));
             layer.conv_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_norm.weight", .{l_idx})), 1024);
             layer.conv_pw2 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_pw2.weight", .{l_idx}));
-            
+
             layer.ffn_norm_1 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_norm_1.weight", .{l_idx})), 1024);
             layer.ffn_up_1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_up_1.weight", .{l_idx}));
             layer.ffn_down_1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_down_1.weight", .{l_idx}));
             layer.ffn_post_norm_1 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_post_norm_1.weight", .{l_idx})), 1024);
-            
+
             layer.ln2 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ln2.weight", .{l_idx})), 1024);
 
             try audio_layers.append(allocator, layer);
