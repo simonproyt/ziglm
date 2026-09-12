@@ -87,6 +87,7 @@ pub const CudaGpuLayer = struct {
     head_dim: usize = 0,
     n_heads: usize = 0,
     n_kv_heads: usize = 0,
+    rotary_dim: usize = 0,
     rope_theta: f32 = 10000.0,
     sliding_window: usize = 0,
 
@@ -147,6 +148,7 @@ pub const CudaGpuModel = struct {
     d_k_cache: CudaBuffer,
     d_v_cache: CudaBuffer,
     max_seq_len: usize = 4096,
+    max_kv_dim: usize = 0,
 
     // Host staging buffers
     host_x: []f32,
@@ -187,7 +189,8 @@ pub const CudaGpuModel = struct {
         const d_logits = try device.alloc(p.vocab_size * @sizeOf(f32));
 
         // GPU KV Cache: [num_layers, max_seq, max_kv_heads * max_head_dim]
-        const kv_total_floats = cpu_model.layers.len * max_seq * max_kv_heads * max_head_dim;
+        const max_kv_dim = max_kv_heads * max_head_dim;
+        const kv_total_floats = cpu_model.layers.len * max_seq * max_kv_dim;
         const d_k_cache = try device.alloc(kv_total_floats * @sizeOf(f32));
         const d_v_cache = try device.alloc(kv_total_floats * @sizeOf(f32));
 
@@ -208,6 +211,7 @@ pub const CudaGpuModel = struct {
                 .head_dim = head_size,
                 .n_heads = n_heads,
                 .n_kv_heads = n_kv_heads,
+                .rotary_dim = l.rotary_dim,
                 .rope_theta = l.rope_theta,
                 .sliding_window = l.sliding_window,
             };
@@ -298,6 +302,7 @@ pub const CudaGpuModel = struct {
             .d_k_cache = d_k_cache,
             .d_v_cache = d_v_cache,
             .max_seq_len = max_seq,
+            .max_kv_dim = max_kv_dim,
             .host_x = host_x,
             .host_logits = host_logits,
         };
@@ -446,6 +451,14 @@ pub const CudaGpuModel = struct {
                 self.device.gemv(t_q.qtype, t_q.buf.ptr, d_xb_ptr, d_q_ptr, n_heads * head_size, dim);
             }
 
+            if (layer.attn_q_norm) |q_norm| {
+                const q_norm_ptr: [*]const f32 = @ptrCast(@alignCast(q_norm.buf.ptr));
+                for (0..n_heads) |h| {
+                    const q_head_ptr = d_q_ptr + h * head_size;
+                    self.device.rmsNorm(q_head_ptr, q_norm_ptr, q_head_ptr, head_size, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                }
+            }
+
             // KV Cache Handling (with Cross-Layer Sharing for Gemma 4 & hybrid architectures)
             const unshared_count: usize = if (p.num_kv_shared_layers > 0)
                 (p.block_count - p.num_kv_shared_layers)
@@ -490,14 +503,15 @@ pub const CudaGpuModel = struct {
                     }
                 }
 
-                self.device.rope(null, d_k_ptr, pos, 0, n_kv_heads, head_size, layer.rope_theta);
-                self.device.kvCachePut(d_k_cache_ptr, d_v_cache_ptr, d_k_ptr, d_v_ptr, layer_idx, pos, self.max_seq_len, n_kv_heads, head_size);
+                self.device.rope(null, d_k_ptr, pos, 0, n_kv_heads, head_size, layer.rotary_dim, layer.rope_theta);
+                self.device.kvCachePut(d_k_cache_ptr, d_v_cache_ptr, d_k_ptr, d_v_ptr, layer_idx, pos, self.max_seq_len, n_kv_heads, head_size, self.max_kv_dim);
             }
 
-            self.device.rope(d_q_ptr, null, pos, n_heads, 0, head_size, layer.rope_theta);
+            self.device.rope(d_q_ptr, null, pos, n_heads, 0, head_size, layer.rotary_dim, layer.rope_theta);
 
+            const donor_kv_heads = self.layers[donor_layer].n_kv_heads;
             const attn_scale: f32 = if (p.arch == .gemma4) 1.0 else 1.0 / @sqrt(@as(f32, @floatFromInt(head_size)));
-            self.device.attentionForward(d_q_ptr, d_k_cache_ptr, d_v_cache_ptr, d_attn_out_ptr, donor_layer, pos, self.max_seq_len, n_heads, n_kv_heads, head_size, attn_scale, p.attn_logit_softcapping, layer.sliding_window);
+            self.device.attentionForward(d_q_ptr, d_k_cache_ptr, d_v_cache_ptr, d_attn_out_ptr, donor_layer, pos, self.max_seq_len, n_heads, donor_kv_heads, head_size, self.max_kv_dim, attn_scale, p.attn_logit_softcapping, layer.sliding_window);
 
             if (layer.attn_output) |t_out| {
                 self.device.gemv(t_out.qtype, t_out.buf.ptr, d_attn_out_ptr, d_xb_ptr, dim, n_heads * head_size);

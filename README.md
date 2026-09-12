@@ -1,5 +1,5 @@
 # An experinental zig based llm inference engine
-curently cpu only but i might make a cuda backend later also i only been able to test it on linux so it might behave diffrent on diffrent oses
+curently cpu and cuda only also i only been able to test it on linux so it might behave diffrent on diffrent oses
 
 #### Models tested
 - smollm2-360m

@@ -275,21 +275,23 @@ pub const LogMelSpectrogram = struct {
             }
         }
 
-        // 3. Power spectrum for 0..256 (Nyquist)
+        // 3. Magnitude spectrum for 0..256 (Nyquist) - Gemma4 uses magnitude (not power)
         for (0..257) |k| {
-            out_power_spectrum[k] = real[k] * real[k] + imag[k] * imag[k];
+            out_power_spectrum[k] = @sqrt(real[k] * real[k] + imag[k] * imag[k]);
         }
     }
 
     pub fn compute(self: *const LogMelSpectrogram, samples: []const f32) ![]f32 {
-        if (samples.len < self.frame_length) return error.AudioTooShort;
+        const pad_left = self.frame_length / 2; // 160 - semicausal padding matching Gemma4 feature extractor
+        if (samples.len + pad_left < self.frame_length) return error.AudioTooShort;
 
         const num_freq_bins = self.n_fft / 2 + 1;
-        const n_frames = (samples.len - self.frame_length) / self.hop_length + 1;
+        const padded_len = samples.len + pad_left;
+        const n_frames = (padded_len - self.frame_length) / self.hop_length + 1;
         const result = try self.allocator.alloc(f32, n_frames * self.n_mels);
         errdefer self.allocator.free(result);
 
-        // Precompute 320-point Periodic Hanning window
+        // Precompute 320-point Periodic Hanning window: 0.5*(1 - cos(2*pi*n/N))
         var window: [320]f32 = undefined;
         const fl_f = @as(f32, @floatFromInt(self.frame_length));
         for (0..self.frame_length) |i| {
@@ -298,27 +300,28 @@ pub const LogMelSpectrogram = struct {
         }
 
         var frame_buf: [512]f32 = undefined;
-        var power_spectrum: [257]f32 = undefined;
+        var mag_spectrum: [257]f32 = undefined;
 
         for (0..n_frames) |frame_idx| {
             const frame_start = frame_idx * self.hop_length;
-            const frame = samples[frame_start .. frame_start + self.frame_length];
 
-            // Apply 320-point window and zero-pad to 512
+            // Apply 320-point window to frame (accounting for left-pad of 160 zeros)
             for (0..self.frame_length) |n| {
-                frame_buf[n] = frame[n] * window[n];
+                const src_idx: isize = @as(isize, @intCast(frame_start + n)) - @as(isize, @intCast(pad_left));
+                const sample_val = if (src_idx >= 0 and src_idx < samples.len) samples[@intCast(src_idx)] else 0.0;
+                frame_buf[n] = sample_val * window[n];
             }
             @memset(frame_buf[self.frame_length..self.n_fft], 0.0);
 
-            // Compute 512-point Cooley-Tukey Radix-2 FFT
-            fft512(&frame_buf, &power_spectrum);
+            // Compute 512-point FFT and get magnitude spectrum
+            fft512(&frame_buf, &mag_spectrum);
 
             // Apply Mel Filterbanks & Natural Log with mel_floor=0.001
             for (0..self.n_mels) |m| {
                 var mel_energy: f32 = 0.0;
                 const filter_offset = m * num_freq_bins;
                 for (0..num_freq_bins) |k| {
-                    mel_energy += power_spectrum[k] * self.mel_filters[filter_offset + k];
+                    mel_energy += mag_spectrum[k] * self.mel_filters[filter_offset + k];
                 }
                 result[frame_idx * self.n_mels + m] = @log(@max(mel_energy, 0.001));
             }
@@ -341,34 +344,51 @@ const math = @import("math.zig");
 const quant = @import("quant.zig");
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
 
+pub const ClipBounds = struct {
+    in_min: f32 = -std.math.inf(f32),
+    in_max: f32 = std.math.inf(f32),
+    out_min: f32 = -std.math.inf(f32),
+    out_max: f32 = std.math.inf(f32),
+};
+
 pub const AudioLayerWeights = struct {
     // FFN 0
     ffn_norm: ?[]const f32 = null,
     ffn_up: ?types.Tensor = null,
+    ffn_up_clip: ?ClipBounds = null,
     ffn_down: ?types.Tensor = null,
+    ffn_down_clip: ?ClipBounds = null,
     ffn_post_norm: ?[]const f32 = null,
 
     // Attention
     attn_pre_norm: ?[]const f32 = null,
     attn_q: ?types.Tensor = null,
+    attn_q_clip: ?ClipBounds = null,
     attn_k: ?types.Tensor = null,
+    attn_k_clip: ?ClipBounds = null,
     attn_v: ?types.Tensor = null,
+    attn_v_clip: ?ClipBounds = null,
     attn_k_rel: ?types.Tensor = null,
     per_dim_scale: ?[]const f32 = null,
     attn_out: ?types.Tensor = null,
+    attn_out_clip: ?ClipBounds = null,
     attn_post_norm: ?[]const f32 = null,
 
     // Conv
     norm_conv: ?[]const f32 = null,
     conv_pw1: ?types.Tensor = null,
+    conv_pw1_clip: ?ClipBounds = null,
     conv_dw: ?types.Tensor = null,
     conv_norm: ?[]const f32 = null,
     conv_pw2: ?types.Tensor = null,
+    conv_pw2_clip: ?ClipBounds = null,
 
     // FFN 1
     ffn_norm_1: ?[]const f32 = null,
     ffn_up_1: ?types.Tensor = null,
+    ffn_up_1_clip: ?ClipBounds = null,
     ffn_down_1: ?types.Tensor = null,
+    ffn_down_1_clip: ?ClipBounds = null,
     ffn_post_norm_1: ?[]const f32 = null,
 
     // Final LN
@@ -442,13 +462,18 @@ pub const AudioEncoder = struct {
         if (num_mel_frames == 0) return try allocator.alloc(f32, 0);
 
         // --- Subsampling ---
-        const t2 = num_mel_frames / 2;
+        // PyTorch Conv2D output size: floor((N + 2*padding - kernel_size) / stride) + 1
+        // With kernel=3, stride=2, padding=1: floor((N-1)/2) + 1
+        const t2 = (num_mel_frames - 1) / 2 + 1; // layer0 time output
         const conv0_out = try allocator.alloc(f32, t2 * 64 * 128);
         defer allocator.free(conv0_out);
         @memset(conv0_out, 0.0);
 
         if (self.conv1d_0_weight) |w0| {
-            const w_slice = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(w0.data)));
+            const w0_f32 = try allocator.alloc(f32, w0.elements());
+            defer allocator.free(w0_f32);
+            quant.dequantizeRow(w0.type, w0.data, w0_f32, w0.elements());
+
             for (0..t2) |t_out| {
                 for (0..64) |f_out| {
                     for (0..128) |oc| {
@@ -459,7 +484,7 @@ pub const AudioEncoder = struct {
                                 const f_in: isize = @as(isize, @intCast(f_out * 2)) + @as(isize, @intCast(kx)) - 1;
                                 if (t_in >= 0 and t_in < num_mel_frames and f_in >= 0 and f_in < 128) {
                                     const mel_val = mel_spec[@as(usize, @intCast(t_in)) * 128 + @as(usize, @intCast(f_in))];
-                                    sum += mel_val * w_slice[oc * 9 + ky * 3 + kx];
+                                    sum += mel_val * w0_f32[oc * 9 + ky * 3 + kx];
                                 }
                             }
                         }
@@ -470,9 +495,6 @@ pub const AudioEncoder = struct {
             if (self.conv1d_0_norm) |norm| {
                 for (0..t2 * 64) |i| {
                     const slice = conv0_out[i * 128 .. (i + 1) * 128];
-                    // LayerNorm with elementwise_affine=True (wait, bias=False!)
-                    // PyTorch LayerNorm has weight but bias=False in Gemma4
-                    // Let's implement standard LayerNorm: mean, var over the last dim
                     var mean: f32 = 0;
                     for (slice) |v| mean += v;
                     mean /= 128.0;
@@ -488,13 +510,16 @@ pub const AudioEncoder = struct {
             }
         }
 
-        const t4 = t2 / 2;
+        const t4 = (t2 - 1) / 2 + 1;
         const conv1_out = try allocator.alloc(f32, t4 * 32 * 32); // output: [T/4, 32_freq, 32_channels] -> 32*32=1024
         defer allocator.free(conv1_out);
         @memset(conv1_out, 0.0);
 
         if (self.conv1d_1_weight) |w1| {
-            const w_slice = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(w1.data)));
+            const w1_f32 = try allocator.alloc(f32, w1.elements());
+            defer allocator.free(w1_f32);
+            quant.dequantizeRow(w1.type, w1.data, w1_f32, w1.elements());
+
             for (0..t4) |t_out| {
                 for (0..32) |f_out| {
                     for (0..32) |oc| {
@@ -506,7 +531,7 @@ pub const AudioEncoder = struct {
                                 if (t_in >= 0 and t_in < t2 and f_in >= 0 and f_in < 64) {
                                     for (0..128) |ic| {
                                         const val = conv0_out[(@as(usize, @intCast(t_in)) * 64 + @as(usize, @intCast(f_in))) * 128 + ic];
-                                        sum += val * w_slice[(oc * 128 + ic) * 9 + ky * 3 + kx];
+                                        sum += val * w1_f32[(oc * 128 + ic) * 9 + ky * 3 + kx];
                                     }
                                 }
                             }
@@ -587,11 +612,13 @@ pub const AudioEncoder = struct {
         const pw2_out = try allocator.alloc(f32, target_frames * self.hidden_size);
         defer allocator.free(pw2_out);
 
-        // Precompute sinusoidal relative position embeddings (13 offsets: 0..12)
+        // Precompute sinusoidal relative position embeddings (13 offsets: distances 12..0)
+        // Matches Gemma4AudioRelPositionalEncoding: position_ids = arange(12, -1, -1)
+        // rel_pos_embed[0] = distance 12, rel_pos_embed[12] = distance 0
         var rel_pos_embed: [13 * 1024]f32 = undefined;
         const log_inc = @log(10000.0) / 511.0;
         for (0..13) |pos_id| {
-            const pid_f = @as(f32, @floatFromInt(pos_id));
+            const pid_f = @as(f32, @floatFromInt(12 - pos_id)); // descending: 12, 11, ..., 0
             for (0..512) |ts_idx| {
                 const inv_ts = @exp(-@as(f32, @floatFromInt(ts_idx)) * log_inc);
                 const scaled_time = pid_f * inv_ts;
@@ -607,6 +634,15 @@ pub const AudioEncoder = struct {
         const softcap: f32 = 50.0;
         const inv_softcap: f32 = 1.0 / 50.0;
 
+        // Helper for clippable linear layers
+        const clampSlice = struct {
+            fn f(slice: []f32, min_val: f32, max_val: f32) void {
+                for (slice) |*v| {
+                    v.* = std.math.clamp(v.*, min_val, max_val);
+                }
+            }
+        }.f;
+
         // Now apply conformer layers with zero heap allocations
         for (self.layers) |layer| {
             const num_frames = target_frames;
@@ -616,38 +652,36 @@ pub const AudioEncoder = struct {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0;
-                    for (src) |v| mean += v;
-                    mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0;
-                    for (src) |v| var_ += (v - mean) * (v - mean);
-                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                    const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                    for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
+                    // RMSNorm: no mean subtraction
+                    var sum_sq: f32 = 0;
+                    for (src) |v| sum_sq += v * v;
+                    const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                    for (src, 0..) |v, d| dst[d] = v * inv_rms * norm[d];
                 }
 
                 if (layer.ffn_up) |up| {
+                    if (layer.ffn_up_clip) |c| clampSlice(p_norm[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
                     math.gemm(pool, up.type, up.data, p_norm, p_ffn_up, num_frames, self.intermediate_size, self.hidden_size);
+                    if (layer.ffn_up_clip) |c| clampSlice(p_ffn_up[0 .. num_frames * self.intermediate_size], c.out_min, c.out_max);
                 }
 
                 // SiLU
                 for (p_ffn_up) |*v| v.* = v.* / (1.0 + @exp(-v.*));
 
                 if (layer.ffn_down) |down| {
+                    if (layer.ffn_down_clip) |c| clampSlice(p_ffn_up[0 .. num_frames * self.intermediate_size], c.in_min, c.in_max);
                     math.gemm(pool, down.type, down.data, p_ffn_up, p_ffn_down, num_frames, self.hidden_size, self.intermediate_size);
+                    if (layer.ffn_down_clip) |c| clampSlice(p_ffn_down[0 .. num_frames * self.hidden_size], c.out_min, c.out_max);
                 }
 
                 if (layer.ffn_post_norm) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = p_ffn_down[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0;
-                        for (src) |v| mean += v;
-                        mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0;
-                        for (src) |v| var_ += (v - mean) * (v - mean);
-                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                        const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                        for (src, 0..) |*v, d| states[t * self.hidden_size + d] += 0.5 * ((v.* - mean) * inv_std * pnorm[d]);
+                        // RMSNorm: no mean subtraction
+                        var sum_sq: f32 = 0;
+                        for (src) |v| sum_sq += v * v;
+                        const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                        for (src, 0..) |*v, d| states[t * self.hidden_size + d] += 0.5 * (v.* * inv_rms * pnorm[d]);
                     }
                 }
             }
@@ -657,19 +691,28 @@ pub const AudioEncoder = struct {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0;
-                    for (src) |v| mean += v;
-                    mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0;
-                    for (src) |v| var_ += (v - mean) * (v - mean);
-                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                    const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                    for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
+                    // RMSNorm: no mean subtraction
+                    var sum_sq: f32 = 0;
+                    for (src) |v| sum_sq += v * v;
+                    const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                    for (src, 0..) |v, d| dst[d] = v * inv_rms * norm[d];
                 }
 
-                if (layer.attn_q) |t| math.gemm(pool, t.type, t.data, p_norm, q_buf, num_frames, self.hidden_size, self.hidden_size);
-                if (layer.attn_k) |t| math.gemm(pool, t.type, t.data, p_norm, k_buf, num_frames, self.hidden_size, self.hidden_size);
-                if (layer.attn_v) |t| math.gemm(pool, t.type, t.data, p_norm, v_buf, num_frames, self.hidden_size, self.hidden_size);
+                if (layer.attn_q) |t| {
+                    if (layer.attn_q_clip) |c| clampSlice(p_norm[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
+                    math.gemm(pool, t.type, t.data, p_norm, q_buf, num_frames, self.hidden_size, self.hidden_size);
+                    if (layer.attn_q_clip) |c| clampSlice(q_buf[0 .. num_frames * self.hidden_size], c.out_min, c.out_max);
+                }
+                if (layer.attn_k) |t| {
+                    if (layer.attn_k_clip) |c| clampSlice(p_norm[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
+                    math.gemm(pool, t.type, t.data, p_norm, k_buf, num_frames, self.hidden_size, self.hidden_size);
+                    if (layer.attn_k_clip) |c| clampSlice(k_buf[0 .. num_frames * self.hidden_size], c.out_min, c.out_max);
+                }
+                if (layer.attn_v) |t| {
+                    if (layer.attn_v_clip) |c| clampSlice(p_norm[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
+                    math.gemm(pool, t.type, t.data, p_norm, v_buf, num_frames, self.hidden_size, self.hidden_size);
+                    if (layer.attn_v_clip) |c| clampSlice(v_buf[0 .. num_frames * self.hidden_size], c.out_min, c.out_max);
+                }
 
                 // Scale Q and K
                 for (0..num_frames) |t| {
@@ -692,14 +735,21 @@ pub const AudioEncoder = struct {
                 for (0..self.num_heads) |h| {
                     const h_offset = h * self.head_dim;
                     for (0..num_frames) |t_q| {
+                        // Local causal window: only attend to t_k in [t_q - 11, t_q] (12 frames max)
+                        const start_k: usize = if (t_q >= 11) t_q - 11 else 0;
+                        const end_k: usize = t_q + 1;
                         var max_score: f32 = -std.math.inf(f32);
 
-                        for (0..num_frames) |t_k| {
+                        for (start_k..end_k) |t_k| {
                             var ac_score: f32 = 0.0;
                             var bd_score: f32 = 0.0;
 
-                            const delta: usize = @min(@as(usize, @intCast(@abs(@as(isize, @intCast(t_q)) - @as(isize, @intCast(t_k))))), 12);
-                            const r_slice = rel_k_proj[delta * self.hidden_size + h_offset .. delta * self.hidden_size + h_offset + self.head_dim];
+                            // delta = t_q - t_k (0 = same pos, 11 = 11 behind)
+                            // rel_pos_embed[0] = distance 12, rel_pos_embed[12] = distance 0
+                            // so we want index (12 - delta)
+                            const delta: usize = t_q - t_k;
+                            const rel_idx: usize = 12 - delta;
+                            const r_slice = rel_k_proj[rel_idx * self.hidden_size + h_offset .. rel_idx * self.hidden_size + h_offset + self.head_dim];
 
                             for (0..self.head_dim) |d| {
                                 const q_val = q_buf[t_q * self.hidden_size + h_offset + d];
@@ -715,14 +765,14 @@ pub const AudioEncoder = struct {
                         }
 
                         var sum_exp: f32 = 0.0;
-                        for (0..num_frames) |t_k| {
+                        for (start_k..end_k) |t_k| {
                             scores[t_k] = @exp(scores[t_k] - max_score);
                             sum_exp += scores[t_k];
                         }
 
                         for (0..self.head_dim) |d| {
                             var val: f32 = 0.0;
-                            for (0..num_frames) |t_k| {
+                            for (start_k..end_k) |t_k| {
                                 val += (scores[t_k] / sum_exp) * v_buf[t_k * self.hidden_size + h_offset + d];
                             }
                             attn_out[t_q * self.hidden_size + h_offset + d] = val;
@@ -730,41 +780,43 @@ pub const AudioEncoder = struct {
                     }
                 }
 
-                if (layer.attn_out) |t| math.gemm(pool, t.type, t.data, attn_out, out_proj, num_frames, self.hidden_size, self.hidden_size);
+                if (layer.attn_out) |t| {
+                    if (layer.attn_out_clip) |c| clampSlice(attn_out[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
+                    math.gemm(pool, t.type, t.data, attn_out, out_proj, num_frames, self.hidden_size, self.hidden_size);
+                    if (layer.attn_out_clip) |c| clampSlice(out_proj[0 .. num_frames * self.hidden_size], c.out_min, c.out_max);
+                }
 
                 if (layer.attn_post_norm) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = out_proj[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0;
-                        for (src) |v| mean += v;
-                        mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0;
-                        for (src) |v| var_ += (v - mean) * (v - mean);
-                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                        const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                        for (src, 0..) |*v, d| states[t * self.hidden_size + d] += ((v.* - mean) * inv_std * pnorm[d]);
+                        // RMSNorm: no mean subtraction
+                        var sum_sq: f32 = 0;
+                        for (src) |v| sum_sq += v * v;
+                        const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                        for (src, 0..) |*v, d| states[t * self.hidden_size + d] += (v.* * inv_rms * pnorm[d]);
                     }
                 }
             }
 
-            // --- Conv Module ---
+            // --- Conv Module (LightConv1d) ---
             if (layer.norm_conv) |norm| {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0;
-                    for (src) |v| mean += v;
-                    mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0;
-                    for (src) |v| var_ += (v - mean) * (v - mean);
-                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                    const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                    for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
+                    // RMSNorm: no mean subtraction
+                    var sum_sq: f32 = 0;
+                    for (src) |v| sum_sq += v * v;
+                    const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                    for (src, 0..) |v, d| dst[d] = v * inv_rms * norm[d];
                 }
 
-                if (layer.conv_pw1) |pw1| math.gemm(pool, pw1.type, pw1.data, p_norm, pw1_out, num_frames, self.hidden_size * 2, self.hidden_size);
+                if (layer.conv_pw1) |pw1| {
+                    if (layer.conv_pw1_clip) |c| clampSlice(p_norm[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
+                    math.gemm(pool, pw1.type, pw1.data, p_norm, pw1_out, num_frames, self.hidden_size * 2, self.hidden_size);
+                    if (layer.conv_pw1_clip) |c| clampSlice(pw1_out[0 .. num_frames * self.hidden_size * 2], c.out_min, c.out_max);
+                }
 
-                // GLU
+                // GLU: first_half * sigmoid(second_half)
                 for (0..num_frames) |t| {
                     for (0..self.hidden_size) |d| {
                         const v1 = pw1_out[t * self.hidden_size * 2 + d];
@@ -773,16 +825,19 @@ pub const AudioEncoder = struct {
                     }
                 }
 
-                // 1D Depthwise Conv (kernel=5, causal: left_pad=4)
+                // 1D Depthwise Conv (kernel=5, causal left_pad=4)
+                // Weight layout from safetensors: [out_channels=1024, 1, kernel_size=5] → index [d*5 + k]
                 if (layer.conv_dw) |dw| {
-                    const w_slice = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(dw.data)));
+                    const dw_f32 = try allocator.alloc(f32, dw.elements());
+                    defer allocator.free(dw_f32);
+                    quant.dequantizeRow(dw.type, dw.data, dw_f32, dw.elements());
                     for (0..num_frames) |t| {
                         for (0..self.hidden_size) |d| {
                             var sum: f32 = 0;
                             for (0..5) |k| {
                                 const t_in: isize = @as(isize, @intCast(t)) + @as(isize, @intCast(k)) - 4;
                                 if (t_in >= 0 and t_in < num_frames) {
-                                    sum += glu_out[@as(usize, @intCast(t_in)) * self.hidden_size + d] * w_slice[k * self.hidden_size + d];
+                                    sum += glu_out[@as(usize, @intCast(t_in)) * self.hidden_size + d] * dw_f32[d * 5 + k];
                                 }
                             }
                             dw_out[t * self.hidden_size + d] = sum;
@@ -790,25 +845,25 @@ pub const AudioEncoder = struct {
                     }
                 }
 
-                // Conv Norm (LayerNorm)
+                // Conv Norm (RMSNorm)
                 if (layer.conv_norm) |cnorm| {
                     for (0..num_frames) |t| {
                         const src = dw_out[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0;
-                        for (src) |v| mean += v;
-                        mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0;
-                        for (src) |v| var_ += (v - mean) * (v - mean);
-                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                        const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                        for (src, 0..) |*v, d| v.* = (v.* - mean) * inv_std * cnorm[d];
+                        var sum_sq: f32 = 0;
+                        for (src) |v| sum_sq += v * v;
+                        const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                        for (src, 0..) |*v, d| v.* = v.* * inv_rms * cnorm[d];
                     }
                 }
 
                 // SiLU
                 for (dw_out) |*v| v.* = v.* / (1.0 + @exp(-v.*));
 
-                if (layer.conv_pw2) |pw2| math.gemm(pool, pw2.type, pw2.data, dw_out, pw2_out, num_frames, self.hidden_size, self.hidden_size);
+                if (layer.conv_pw2) |pw2| {
+                    if (layer.conv_pw2_clip) |c| clampSlice(dw_out[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
+                    math.gemm(pool, pw2.type, pw2.data, dw_out, pw2_out, num_frames, self.hidden_size, self.hidden_size);
+                    if (layer.conv_pw2_clip) |c| clampSlice(pw2_out[0 .. num_frames * self.hidden_size], c.out_min, c.out_max);
+                }
 
                 for (0..num_frames) |t| {
                     for (0..self.hidden_size) |d| {
@@ -822,49 +877,47 @@ pub const AudioEncoder = struct {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
                     const dst = p_norm[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0;
-                    for (src) |v| mean += v;
-                    mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0;
-                    for (src) |v| var_ += (v - mean) * (v - mean);
-                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                    const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                    for (src, 0..) |v, d| dst[d] = (v - mean) * inv_std * norm[d];
+                    // RMSNorm: no mean subtraction
+                    var sum_sq: f32 = 0;
+                    for (src) |v| sum_sq += v * v;
+                    const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                    for (src, 0..) |v, d| dst[d] = v * inv_rms * norm[d];
                 }
 
-                if (layer.ffn_up_1) |up| math.gemm(pool, up.type, up.data, p_norm, p_ffn_up, num_frames, self.intermediate_size, self.hidden_size);
+                if (layer.ffn_up_1) |up| {
+                    if (layer.ffn_up_1_clip) |c| clampSlice(p_norm[0 .. num_frames * self.hidden_size], c.in_min, c.in_max);
+                    math.gemm(pool, up.type, up.data, p_norm, p_ffn_up, num_frames, self.intermediate_size, self.hidden_size);
+                    if (layer.ffn_up_1_clip) |c| clampSlice(p_ffn_up[0 .. num_frames * self.intermediate_size], c.out_min, c.out_max);
+                }
 
                 for (p_ffn_up) |*v| v.* = v.* / (1.0 + @exp(-v.*));
 
-                if (layer.ffn_down_1) |down| math.gemm(pool, down.type, down.data, p_ffn_up, p_ffn_down, num_frames, self.hidden_size, self.intermediate_size);
+                if (layer.ffn_down_1) |down| {
+                    if (layer.ffn_down_1_clip) |c| clampSlice(p_ffn_up[0 .. num_frames * self.intermediate_size], c.in_min, c.in_max);
+                    math.gemm(pool, down.type, down.data, p_ffn_up, p_ffn_down, num_frames, self.hidden_size, self.intermediate_size);
+                    if (layer.ffn_down_1_clip) |c| clampSlice(p_ffn_down[0 .. num_frames * self.hidden_size], c.out_min, c.out_max);
+                }
 
                 if (layer.ffn_post_norm_1) |pnorm| {
                     for (0..num_frames) |t| {
                         const src = p_ffn_down[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                        var mean: f32 = 0;
-                        for (src) |v| mean += v;
-                        mean /= @as(f32, @floatFromInt(self.hidden_size));
-                        var var_: f32 = 0;
-                        for (src) |v| var_ += (v - mean) * (v - mean);
-                        var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                        const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                        for (src, 0..) |*v, d| states[t * self.hidden_size + d] += 0.5 * ((v.* - mean) * inv_std * pnorm[d]);
+                        // RMSNorm: no mean subtraction
+                        var sum_sq: f32 = 0;
+                        for (src) |v| sum_sq += v * v;
+                        const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                        for (src, 0..) |*v, d| states[t * self.hidden_size + d] += 0.5 * (v.* * inv_rms * pnorm[d]);
                     }
                 }
             }
 
-            // --- LN2 ---
+            // --- norm_out (RMSNorm applied in-place, no residual) ---
             if (layer.ln2) |ln2| {
                 for (0..num_frames) |t| {
                     const src = states[t * self.hidden_size .. (t + 1) * self.hidden_size];
-                    var mean: f32 = 0;
-                    for (src) |v| mean += v;
-                    mean /= @as(f32, @floatFromInt(self.hidden_size));
-                    var var_: f32 = 0;
-                    for (src) |v| var_ += (v - mean) * (v - mean);
-                    var_ /= @as(f32, @floatFromInt(self.hidden_size));
-                    const inv_std = 1.0 / @sqrt(var_ + 1e-6);
-                    for (src, 0..) |*v, d| v.* = (v.* - mean) * inv_std * ln2[d];
+                    var sum_sq: f32 = 0;
+                    for (src) |v| sum_sq += v * v;
+                    const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(self.hidden_size)) + 1e-6);
+                    for (src, 0..) |*v, d| v.* = v.* * inv_rms * ln2[d];
                 }
             }
         }

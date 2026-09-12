@@ -158,6 +158,25 @@ pub const TransformerModel = struct {
         return 1.0;
     }
 
+    fn loadClipBounds(st: anytype, prefix: []const u8) ?audio.ClipBounds {
+        var buf: [256]u8 = undefined;
+        const in_min_name = std.fmt.bufPrint(&buf, "{s}.input_min", .{prefix}) catch return null;
+        const t_in_min = st.getTensor(in_min_name) orelse return null;
+        var bounds = audio.ClipBounds{};
+        bounds.in_min = loadScalar(t_in_min);
+
+        const in_max_name = std.fmt.bufPrint(&buf, "{s}.input_max", .{prefix}) catch return null;
+        if (st.getTensor(in_max_name)) |t| bounds.in_max = loadScalar(t);
+
+        const out_min_name = std.fmt.bufPrint(&buf, "{s}.output_min", .{prefix}) catch return null;
+        if (st.getTensor(out_min_name)) |t| bounds.out_min = loadScalar(t);
+
+        const out_max_name = std.fmt.bufPrint(&buf, "{s}.output_max", .{prefix}) catch return null;
+        if (st.getTensor(out_max_name)) |t| bounds.out_max = loadScalar(t);
+
+        return bounds;
+    }
+
     pub fn load(allocator: std.mem.Allocator, gguf: *const GGUFFile) !*TransformerModel {
         const token_embd = gguf.getTensor("token_embd.weight") orelse return error.MissingTokenEmbeddingTensor;
         const out_norm_t = gguf.getTensor("output_norm.weight") orelse return error.MissingOutputNormTensor;
@@ -627,6 +646,135 @@ pub const TransformerModel = struct {
             VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj, v_layers_slice)
         else
             null;
+
+        // Load Audio Encoder from SafeTensors (Gemma 4 Conformer audio tower)
+        const a_conv0_w = st.getTensor("model.audio_tower.subsample_conv_projection.layer0.conv.weight");
+        const a_conv0_n = try loadNorm(allocator, st.getTensor("model.audio_tower.subsample_conv_projection.layer0.norm.weight"), 128);
+        const a_conv1_w = st.getTensor("model.audio_tower.subsample_conv_projection.layer1.conv.weight");
+        const a_conv1_n = try loadNorm(allocator, st.getTensor("model.audio_tower.subsample_conv_projection.layer1.norm.weight"), 32);
+        const a_inp_proj = st.getTensor("model.audio_tower.subsample_conv_projection.input_proj_linear.weight");
+        const a_pre_out = st.getTensor("model.audio_tower.output_proj.weight");
+        const a_pre_bias = try loadNorm(allocator, st.getTensor("model.audio_tower.output_proj.bias"), 1536);
+        const a_mm_proj = st.getTensor("model.embed_audio.embedding_projection.weight");
+
+        var audio_layers = std.ArrayList(audio.AudioLayerWeights).empty;
+        errdefer audio_layers.deinit(allocator);
+
+        for (0..12) |l_idx| {
+            var a_buf: [128]u8 = undefined;
+            var q_name_buf: [160]u8 = undefined;
+
+            const q_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.q_proj", .{l_idx}) catch break;
+            const q_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{q_prefix}) catch break;
+            const a_q_proj = st.getTensor(q_name);
+            if (a_q_proj == null) break;
+
+            var layer = audio.AudioLayerWeights{};
+            layer.attn_q = a_q_proj;
+            layer.attn_q_clip = loadClipBounds(st, q_prefix);
+
+            // FFN 1 (feed_forward1)
+            const ffn1_up_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.ffw_layer_1", .{l_idx}) catch break;
+            layer.ffn_up_clip = loadClipBounds(st, ffn1_up_prefix);
+            const ffn1_up_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn1_up_prefix}) catch break;
+            layer.ffn_up = st.getTensor(ffn1_up_name);
+
+            const ffn1_down_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.ffw_layer_2", .{l_idx}) catch break;
+            layer.ffn_down_clip = loadClipBounds(st, ffn1_down_prefix);
+            const ffn1_down_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn1_down_prefix}) catch break;
+            layer.ffn_down = st.getTensor(ffn1_down_name);
+
+            const ffn1_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.pre_layer_norm.weight", .{l_idx}) catch break;
+            layer.ffn_norm = try loadNorm(allocator, st.getTensor(ffn1_pre_name), 1024);
+            const ffn1_post_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.post_layer_norm.weight", .{l_idx}) catch break;
+            layer.ffn_post_norm = try loadNorm(allocator, st.getTensor(ffn1_post_name), 1024);
+
+            // Attention
+            const attn_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.norm_pre_attn.weight", .{l_idx}) catch break;
+            layer.attn_pre_norm = try loadNorm(allocator, st.getTensor(attn_pre_name), 1024);
+
+            const k_proj_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.k_proj", .{l_idx}) catch break;
+            layer.attn_k_clip = loadClipBounds(st, k_proj_prefix);
+            const k_proj_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{k_proj_prefix}) catch break;
+            layer.attn_k = st.getTensor(k_proj_name);
+
+            const v_proj_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.v_proj", .{l_idx}) catch break;
+            layer.attn_v_clip = loadClipBounds(st, v_proj_prefix);
+            const v_proj_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{v_proj_prefix}) catch break;
+            layer.attn_v = st.getTensor(v_proj_name);
+
+            const k_rel_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.relative_k_proj.weight", .{l_idx}) catch break;
+            layer.attn_k_rel = st.getTensor(k_rel_name);
+            const pds_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.per_dim_scale", .{l_idx}) catch break;
+            layer.per_dim_scale = try loadNorm(allocator, st.getTensor(pds_name), 128);
+
+            const attn_out_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.post", .{l_idx}) catch break;
+            layer.attn_out_clip = loadClipBounds(st, attn_out_prefix);
+            const attn_out_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{attn_out_prefix}) catch break;
+            layer.attn_out = st.getTensor(attn_out_name);
+
+            const attn_post_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.norm_post_attn.weight", .{l_idx}) catch break;
+            layer.attn_post_norm = try loadNorm(allocator, st.getTensor(attn_post_name), 1024);
+
+            // Conv Module (lconv1d)
+            const conv_norm_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.pre_layer_norm.weight", .{l_idx}) catch break;
+            layer.norm_conv = try loadNorm(allocator, st.getTensor(conv_norm_pre_name), 1024);
+
+            const conv_pw1_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.linear_start", .{l_idx}) catch break;
+            layer.conv_pw1_clip = loadClipBounds(st, conv_pw1_prefix);
+            const conv_pw1_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{conv_pw1_prefix}) catch break;
+            layer.conv_pw1 = st.getTensor(conv_pw1_name);
+
+            const conv_dw_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.depthwise_conv1d.weight", .{l_idx}) catch break;
+            layer.conv_dw = st.getTensor(conv_dw_name);
+            const conv_norm_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.conv_norm.weight", .{l_idx}) catch break;
+            layer.conv_norm = try loadNorm(allocator, st.getTensor(conv_norm_name), 1024);
+
+            const conv_pw2_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.linear_end", .{l_idx}) catch break;
+            layer.conv_pw2_clip = loadClipBounds(st, conv_pw2_prefix);
+            const conv_pw2_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{conv_pw2_prefix}) catch break;
+            layer.conv_pw2 = st.getTensor(conv_pw2_name);
+
+            // FFN 2 (feed_forward2)
+            const ffn2_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.pre_layer_norm.weight", .{l_idx}) catch break;
+            layer.ffn_norm_1 = try loadNorm(allocator, st.getTensor(ffn2_pre_name), 1024);
+
+            const ffn2_up_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.ffw_layer_1", .{l_idx}) catch break;
+            layer.ffn_up_1_clip = loadClipBounds(st, ffn2_up_prefix);
+            const ffn2_up_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn2_up_prefix}) catch break;
+            layer.ffn_up_1 = st.getTensor(ffn2_up_name);
+
+            const ffn2_down_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.ffw_layer_2", .{l_idx}) catch break;
+            layer.ffn_down_1_clip = loadClipBounds(st, ffn2_down_prefix);
+            const ffn2_down_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn2_down_prefix}) catch break;
+            layer.ffn_down_1 = st.getTensor(ffn2_down_name);
+
+            const ffn2_post_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.post_layer_norm.weight", .{l_idx}) catch break;
+            layer.ffn_post_norm_1 = try loadNorm(allocator, st.getTensor(ffn2_post_name), 1024);
+
+            // Final LN
+            const ln2_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.norm_out.weight", .{l_idx}) catch break;
+            layer.ln2 = try loadNorm(allocator, st.getTensor(ln2_name), 1024);
+
+            try audio_layers.append(allocator, layer);
+        }
+
+        const a_layers_slice = try audio_layers.toOwnedSlice(allocator);
+        if (a_conv0_w != null and a_layers_slice.len > 0) {
+            self.audio_encoder = audio.AudioEncoder.init(
+                allocator,
+                a_conv0_w,
+                a_conv0_n,
+                a_conv1_w,
+                a_conv1_n,
+                a_inp_proj,
+                a_pre_out,
+                a_pre_bias,
+                a_mm_proj,
+                a_layers_slice,
+            );
+            std.debug.print("  Loaded {d} Audio Conformer layers from SafeTensors\n", .{a_layers_slice.len});
+        }
 
         return self;
     }

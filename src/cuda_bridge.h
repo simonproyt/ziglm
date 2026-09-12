@@ -32,7 +32,7 @@ void cuda_gemv_f32(const float* weights, const float* x, float* y, int rows, int
 // Normalization & Embeddings
 void cuda_rmsnorm(const float* x, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_add_rmsnorm(float* x, const float* residual, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
-void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, float freq_base, CudaStream_t stream);
+void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
 
 // Activations & Elementwise Math
 void cuda_geglu(const float* gate, const float* up, float* out, int n, CudaStream_t stream);
@@ -52,6 +52,7 @@ void cuda_kv_cache_put(
     int max_seq,
     int n_kv_heads,
     int head_dim,
+    int max_kv_dim,
     CudaStream_t stream
 );
 
@@ -67,6 +68,7 @@ void cuda_attention_forward(
     int n_heads,
     int n_kv_heads,
     int head_dim,
+    int max_kv_dim,
     float attn_scale,
     float softcap,
     int sliding_window,

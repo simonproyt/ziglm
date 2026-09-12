@@ -28,7 +28,7 @@ pub extern "c" fn cuda_gemv_f32(weights: ?*const anyopaque, x: [*]const f32, y: 
 
 pub extern "c" fn cuda_rmsnorm(x: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_add_rmsnorm(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
-pub extern "c" fn cuda_rope(q: ?[*]f32, k: ?[*]f32, pos: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
+pub extern "c" fn cuda_rope(q: ?[*]f32, k: ?[*]f32, pos: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
 
 pub extern "c" fn cuda_geglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_swiglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int, stream: CudaStream_t) void;
@@ -46,6 +46,7 @@ pub extern "c" fn cuda_kv_cache_put(
     max_seq: c_int,
     n_kv_heads: c_int,
     head_dim: c_int,
+    max_kv_dim: c_int,
     stream: CudaStream_t,
 ) void;
 
@@ -60,6 +61,7 @@ pub extern "c" fn cuda_attention_forward(
     n_heads: c_int,
     n_kv_heads: c_int,
     head_dim: c_int,
+    max_kv_dim: c_int,
     attn_scale: f32,
     softcap: f32,
     sliding_window: c_int,
@@ -222,9 +224,10 @@ pub const CudaDevice = struct {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        rotary_dim: usize,
         freq_base: f32,
     ) void {
-        cuda_rope(d_q, d_k, @intCast(pos), @intCast(num_heads), @intCast(num_kv_heads), @intCast(head_dim), freq_base, self.stream);
+        cuda_rope(d_q, d_k, @intCast(pos), @intCast(num_heads), @intCast(num_kv_heads), @intCast(head_dim), @intCast(rotary_dim), freq_base, self.stream);
     }
 
     pub fn kvCachePut(
@@ -238,6 +241,7 @@ pub const CudaDevice = struct {
         max_seq: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        max_kv_dim: usize,
     ) void {
         cuda_kv_cache_put(
             d_k_cache,
@@ -249,6 +253,7 @@ pub const CudaDevice = struct {
             @intCast(max_seq),
             @intCast(n_kv_heads),
             @intCast(head_dim),
+            @intCast(max_kv_dim),
             self.stream,
         );
     }
@@ -265,6 +270,7 @@ pub const CudaDevice = struct {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        max_kv_dim: usize,
         attn_scale: f32,
         softcap: f32,
         sliding_window: usize,
@@ -280,6 +286,7 @@ pub const CudaDevice = struct {
             @intCast(n_heads),
             @intCast(n_kv_heads),
             @intCast(head_dim),
+            @intCast(max_kv_dim),
             attn_scale,
             softcap,
             @intCast(sliding_window),

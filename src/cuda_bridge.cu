@@ -540,14 +540,16 @@ __global__ void k_rope(
     int num_heads,
     int num_kv_heads,
     int head_dim,
+    int rotary_dim,
     float freq_base
 ) {
     int h = blockIdx.x; // head index
     int i = threadIdx.x; // index in [0, half_dim)
-    int half_dim = head_dim / 2;
+    int eff_rotary = (rotary_dim == 0 || rotary_dim > head_dim) ? head_dim : rotary_dim;
+    int half_dim = eff_rotary / 2;
     if (i >= half_dim) return;
 
-    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)eff_rotary);
     float val = (float)pos * freq;
     float cos_val = cosf(val);
     float sin_val = sinf(val);
@@ -571,11 +573,12 @@ __global__ void k_rope(
     }
 }
 
-extern "C" void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, float freq_base, CudaStream_t stream) {
+extern "C" void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream) {
     int max_heads = (num_heads > num_kv_heads) ? num_heads : num_kv_heads;
-    int half_dim = head_dim / 2;
+    int eff_rotary = (rotary_dim == 0 || rotary_dim > head_dim) ? head_dim : rotary_dim;
+    int half_dim = eff_rotary / 2;
     int threads = (half_dim < 256) ? half_dim : 256;
-    k_rope<<<max_heads, threads, 0, (cudaStream_t)stream>>>(q, k, pos, num_heads, num_kv_heads, head_dim, freq_base);
+    k_rope<<<max_heads, threads, 0, (cudaStream_t)stream>>>(q, k, pos, num_heads, num_kv_heads, head_dim, rotary_dim, freq_base);
 }
 
 __device__ __forceinline__ float gelu_f32(float x) {
@@ -696,13 +699,14 @@ extern "C" void cuda_kv_cache_put(
     int max_seq,
     int n_kv_heads,
     int head_dim,
+    int max_kv_dim,
     CudaStream_t stream
 ) {
     int kv_dim = n_kv_heads * head_dim;
     int threads = 256;
     int blocks = (kv_dim + threads - 1) / threads;
     k_kv_cache_put<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-        k_cache, v_cache, k, v, layer_idx, pos, max_seq, kv_dim, kv_dim
+        k_cache, v_cache, k, v, layer_idx, pos, max_seq, kv_dim, max_kv_dim
     );
 }
 
@@ -721,6 +725,7 @@ __global__ void k_attention_forward(
     int n_heads,
     int n_kv_heads,
     int head_dim,
+    int max_kv_dim,
     float attn_scale,
     float softcap,
     int sliding_window
@@ -730,7 +735,6 @@ __global__ void k_attention_forward(
 
     int gqa_group = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
     int kv_h = h / gqa_group;
-    int kv_dim = n_kv_heads * head_dim;
 
     const float* q_head = q + h * head_dim;
     float* out_head = out + h * head_dim;
@@ -759,7 +763,7 @@ __global__ void k_attention_forward(
     // 1. Compute dot products: Q_head . K[t]
     for (int i = tid; i < valid_tokens; i += blockDim.x) {
         int t = start_t + i;
-        size_t k_offset = ((size_t)donor_layer * max_seq + t) * kv_dim + kv_h * head_dim;
+        size_t k_offset = ((size_t)donor_layer * max_seq + t) * max_kv_dim + kv_h * head_dim;
         const float* k_vec = k_cache + k_offset;
 
         float dot = 0.0f;
@@ -820,7 +824,7 @@ __global__ void k_attention_forward(
         float acc = 0.0f;
         for (int i = 0; i < valid_tokens; ++i) {
             int t = start_t + i;
-            size_t v_offset = ((size_t)donor_layer * max_seq + t) * kv_dim + kv_h * head_dim;
+            size_t v_offset = ((size_t)donor_layer * max_seq + t) * max_kv_dim + kv_h * head_dim;
             acc += s_scores[i] * v_cache[v_offset + d];
         }
         out_head[d] = acc;
@@ -838,6 +842,7 @@ extern "C" void cuda_attention_forward(
     int n_heads,
     int n_kv_heads,
     int head_dim,
+    int max_kv_dim,
     float attn_scale,
     float softcap,
     int sliding_window,
@@ -850,7 +855,7 @@ extern "C" void cuda_attention_forward(
     int threads = 64;
     size_t shared_bytes = (valid_tokens + head_dim + threads) * sizeof(float);
     k_attention_forward<<<n_heads, threads, shared_bytes, (cudaStream_t)stream>>>(
-        q, k_cache, v_cache, out, donor_layer, pos, max_seq, n_heads, n_kv_heads, head_dim, attn_scale, softcap, sliding_window
+        q, k_cache, v_cache, out, donor_layer, pos, max_seq, n_heads, n_kv_heads, head_dim, max_kv_dim, attn_scale, softcap, sliding_window
     );
 }
 

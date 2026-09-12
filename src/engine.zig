@@ -466,6 +466,7 @@ pub const Engine = struct {
                 },
             }
         }
+        std.debug.print("generateWithMediaEmbeddings: tokens.len={d}, placeholder_pos={?d}\n", .{ tokens.len, placeholder_pos });
 
         const dim = self.model.params.embedding_length;
         var last_logits: []const f32 = undefined;
@@ -838,6 +839,9 @@ pub const Engine = struct {
 
         const prompt_tokens = try self.tokenizer.encode(self.allocator, formatted_prompt, true);
         defer self.allocator.free(prompt_tokens);
+
+        std.debug.print("formatted_prompt: {s}\n", .{formatted_prompt});
+        std.debug.print("prompt_tokens ({d}): {any}\n", .{ prompt_tokens.len, prompt_tokens });
 
         stats.prompt_tokens = prompt_tokens.len + audio_frames;
         if (stats.prompt_tokens == 0) return stats;

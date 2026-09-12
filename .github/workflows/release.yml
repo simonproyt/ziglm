@@ -24,7 +24,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          version: 0.16.0
 
       - name: Build Optimized Release Binary
         run: zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3
