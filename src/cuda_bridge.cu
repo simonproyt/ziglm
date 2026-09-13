@@ -35,19 +35,29 @@ extern "C" int cuda_free(void* ptr) {
 }
 
 extern "C" int cuda_memcpy_h2d(void* dst, const void* src, size_t bytes, CudaStream_t stream) {
+    cudaError_t err;
     if (stream) {
-        return (int)cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, (cudaStream_t)stream);
+        err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, (cudaStream_t)stream);
     } else {
-        return (int)cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+        err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
     }
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA ERROR] cuda_memcpy_h2d failed (dst=%p, src=%p, bytes=%zu): %s (%d)\n", dst, src, bytes, cudaGetErrorString(err), (int)err);
+    }
+    return (int)err;
 }
 
 extern "C" int cuda_memcpy_d2h(void* dst, const void* src, size_t bytes, CudaStream_t stream) {
+    cudaError_t err;
     if (stream) {
-        return (int)cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+        err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream);
     } else {
-        return (int)cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+        err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
     }
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA ERROR] cuda_memcpy_d2h failed (dst=%p, src=%p, bytes=%zu): %s (%d)\n", dst, src, bytes, cudaGetErrorString(err), (int)err);
+    }
+    return (int)err;
 }
 
 extern "C" int cuda_memcpy_d2d(void* dst, const void* src, size_t bytes, CudaStream_t stream) {
@@ -440,6 +450,296 @@ extern "C" void cuda_gemv_f32(const float* weights, const float* x, float* y, in
     k_gemv_f32<<<grid, block, 0, (cudaStream_t)stream>>>((const float*)weights, x, y, rows, cols);
 }
 
+extern "C" void cuda_gemv(int qtype, const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
+    if (qtype == 2) {
+        cuda_gemv_q4_0(weights, x, y, rows, cols, stream);
+    } else if (qtype == 8) {
+        cuda_gemv_q8_0(weights, x, y, rows, cols, stream);
+    } else if (qtype == 12) {
+        cuda_gemv_q4_k(weights, x, y, rows, cols, stream);
+    } else if (qtype == 14) {
+        cuda_gemv_q6_k(weights, x, y, rows, cols, stream);
+    } else if (qtype == 1) {
+        cuda_gemv_f16(weights, x, y, rows, cols, stream);
+    } else if (qtype == 30) {
+        cuda_gemv_bf16(weights, x, y, rows, cols, stream);
+    } else {
+        cuda_gemv_f32((const float*)weights, x, y, rows, cols, stream);
+    }
+}
+
+// ============================================================================
+// Batched GEMM Operations (Matrix * Matrix)
+// ============================================================================
+
+__global__ void k_gemm_q4_0(
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int batch_size,
+    int rows,
+    int cols
+) {
+    int row_base = blockIdx.x * 2;
+    int b_base = (blockIdx.y * blockDim.y + threadIdx.y) * 4;
+    if (b_base >= batch_size) return;
+
+    int lane = threadIdx.x;
+    int num_blocks = cols / 32;
+    int total_bytes = num_blocks * 16;
+
+    const unsigned char* row0_weights = (row_base < rows) ? (weights + (size_t)row_base * num_blocks * 18) : NULL;
+    const unsigned char* row1_weights = (row_base + 1 < rows) ? (weights + (size_t)(row_base + 1) * num_blocks * 18) : NULL;
+
+    float sum0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sum1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int k = lane; k < total_bytes; k += 32) {
+        int blk = k / 16;
+        int i = k % 16;
+
+        float x_vals[8];
+        #pragma unroll
+        for (int bi = 0; bi < 4; bi++) {
+            if (b_base + bi < batch_size) {
+                const float* x_block = X + (size_t)(b_base + bi) * cols + blk * 32;
+                x_vals[bi * 2 + 0] = x_block[i];
+                x_vals[bi * 2 + 1] = x_block[i + 16];
+            }
+        }
+
+        if (row0_weights) {
+            const unsigned char* block_ptr = row0_weights + blk * 18;
+            float d0 = f16_to_f32(*(const unsigned short*)block_ptr);
+            unsigned char byte0 = block_ptr[2 + i];
+            int q0_0 = (int)(byte0 & 0x0F) - 8;
+            int q0_1 = (int)(byte0 >> 4) - 8;
+            #pragma unroll
+            for (int bi = 0; bi < 4; bi++) {
+                if (b_base + bi < batch_size) {
+                    sum0[bi] += d0 * ((float)q0_0 * x_vals[bi * 2 + 0] + (float)q0_1 * x_vals[bi * 2 + 1]);
+                }
+            }
+        }
+
+        if (row1_weights) {
+            const unsigned char* block_ptr = row1_weights + blk * 18;
+            float d1 = f16_to_f32(*(const unsigned short*)block_ptr);
+            unsigned char byte1 = block_ptr[2 + i];
+            int q1_0 = (int)(byte1 & 0x0F) - 8;
+            int q1_1 = (int)(byte1 >> 4) - 8;
+            #pragma unroll
+            for (int bi = 0; bi < 4; bi++) {
+                if (b_base + bi < batch_size) {
+                    sum1[bi] += d1 * ((float)q1_0 * x_vals[bi * 2 + 0] + (float)q1_1 * x_vals[bi * 2 + 1]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int bi = 0; bi < 4; bi++) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum0[bi] += __shfl_down_sync(0xffffffff, sum0[bi], offset);
+            sum1[bi] += __shfl_down_sync(0xffffffff, sum1[bi], offset);
+        }
+
+        if (lane == 0 && (b_base + bi < batch_size)) {
+            if (row_base < rows) {
+                Y[(size_t)(b_base + bi) * rows + row_base] = sum0[bi];
+            }
+            if (row_base + 1 < rows) {
+                Y[(size_t)(b_base + bi) * rows + row_base + 1] = sum1[bi];
+            }
+        }
+    }
+}
+
+__global__ void k_gemm_q8_0(
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int batch_size,
+    int rows,
+    int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int b_base = (blockIdx.y * blockDim.y + threadIdx.y) * 4;
+    if (b_base >= batch_size) return;
+
+    int lane = threadIdx.x;
+    int num_blocks = cols / 32;
+    const unsigned char* row_weights = weights + (size_t)row * num_blocks * 34;
+
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < num_blocks; blk += 32) {
+        const unsigned char* block_ptr = row_weights + blk * 34;
+        float d = f16_to_f32(*(const unsigned short*)block_ptr);
+        const signed char* qs = (const signed char*)(block_ptr + 2);
+
+        #pragma unroll
+        for (int bi = 0; bi < 4; bi++) {
+            if (b_base + bi < batch_size) {
+                const float* x_blk = X + (size_t)(b_base + bi) * cols + blk * 32;
+                float local_sum = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 32; i++) {
+                    local_sum += (float)qs[i] * x_blk[i];
+                }
+                sum[bi] += d * local_sum;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int bi = 0; bi < 4; bi++) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum[bi] += __shfl_down_sync(0xffffffff, sum[bi], offset);
+        }
+        if (lane == 0 && (b_base + bi < batch_size)) {
+            Y[(size_t)(b_base + bi) * rows + row] = sum[bi];
+        }
+    }
+}
+
+__global__ void k_gemm_f16(
+    const unsigned short* __restrict__ weights,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int batch_size,
+    int rows,
+    int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int b_base = (blockIdx.y * blockDim.y + threadIdx.y) * 4;
+    if (b_base >= batch_size) return;
+
+    int lane = threadIdx.x;
+    const unsigned short* row_data = weights + (size_t)row * cols;
+
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int col = lane; col < cols; col += 32) {
+        float w = f16_to_f32(row_data[col]);
+        #pragma unroll
+        for (int bi = 0; bi < 4; bi++) {
+            if (b_base + bi < batch_size) {
+                sum[bi] += w * X[(size_t)(b_base + bi) * cols + col];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int bi = 0; bi < 4; bi++) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum[bi] += __shfl_down_sync(0xffffffff, sum[bi], offset);
+        }
+        if (lane == 0 && (b_base + bi < batch_size)) {
+            Y[(size_t)(b_base + bi) * rows + row] = sum[bi];
+        }
+    }
+}
+
+extern "C" void cuda_gemm_q4_0(
+    const void* weights,
+    const float* x,
+    float* y,
+    int batch_size,
+    int rows,
+    int cols,
+    CudaStream_t stream
+) {
+    if (batch_size <= 0 || rows <= 0 || cols <= 0) return;
+    if (batch_size == 1) {
+        cuda_gemv_q4_0(weights, x, y, rows, cols, stream);
+        return;
+    }
+    dim3 block(32, 4);
+    dim3 grid((rows + 1) / 2, (batch_size + 15) / 16);
+    k_gemm_q4_0<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const unsigned char*)weights, x, y, batch_size, rows, cols
+    );
+}
+
+extern "C" void cuda_gemm_q8_0(
+    const void* weights,
+    const float* x,
+    float* y,
+    int batch_size,
+    int rows,
+    int cols,
+    CudaStream_t stream
+) {
+    if (batch_size <= 0 || rows <= 0 || cols <= 0) return;
+    if (batch_size == 1) {
+        cuda_gemv_q8_0(weights, x, y, rows, cols, stream);
+        return;
+    }
+    dim3 block(32, 4);
+    dim3 grid(rows, (batch_size + 15) / 16);
+    k_gemm_q8_0<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const unsigned char*)weights, x, y, batch_size, rows, cols
+    );
+}
+
+extern "C" void cuda_gemm_f16(
+    const void* weights,
+    const float* x,
+    float* y,
+    int batch_size,
+    int rows,
+    int cols,
+    CudaStream_t stream
+) {
+    if (batch_size <= 0 || rows <= 0 || cols <= 0) return;
+    if (batch_size == 1) {
+        cuda_gemv_f16(weights, x, y, rows, cols, stream);
+        return;
+    }
+    dim3 block(32, 4);
+    dim3 grid(rows, (batch_size + 15) / 16);
+    k_gemm_f16<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const unsigned short*)weights, x, y, batch_size, rows, cols
+    );
+}
+
+extern "C" void cuda_gemm(
+    int qtype,
+    const void* weights,
+    const float* x,
+    float* y,
+    int batch_size,
+    int rows,
+    int cols,
+    CudaStream_t stream
+) {
+    if (batch_size <= 0 || rows <= 0 || cols <= 0) return;
+    if (batch_size == 1) {
+        cuda_gemv(qtype, weights, x, y, rows, cols, stream);
+        return;
+    }
+    if (qtype == 2) { // Q4_0
+        cuda_gemm_q4_0(weights, x, y, batch_size, rows, cols, stream);
+    } else if (qtype == 8) { // Q8_0
+        cuda_gemm_q8_0(weights, x, y, batch_size, rows, cols, stream);
+    } else if (qtype == 1) { // F16
+        cuda_gemm_f16(weights, x, y, batch_size, rows, cols, stream);
+    } else {
+        // Safe fallback for other types: run GEMV for each vector in batch
+        for (int b = 0; b < batch_size; b++) {
+            cuda_gemv(qtype, weights, x + (size_t)b * cols, y + (size_t)b * rows, rows, cols, stream);
+        }
+    }
+}
+
 // ============================================================================
 // Normalization & Elementwise Kernels
 // ============================================================================
@@ -481,6 +781,205 @@ __global__ void k_rmsnorm(
 
 extern "C" void cuda_rmsnorm(const float* x, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream) {
     k_rmsnorm<<<1, 256, 0, (cudaStream_t)stream>>>(x, weight, out, n, eps, use_unit_offset);
+}
+
+__global__ void k_rmsnorm_batched(
+    float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int head_dim,
+    int count,
+    float eps,
+    int use_unit_offset
+) {
+    int h = blockIdx.x;
+    if (h >= count) return;
+
+    int tid = threadIdx.x;
+    float* x_head = x + (size_t)h * head_dim;
+    float* out_head = out + (size_t)h * head_dim;
+
+    __shared__ float s_sum[256];
+    float local_sum = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = x_head[i];
+        local_sum += val * val;
+    }
+    s_sum[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float mean = s_sum[0] / (float)head_dim;
+    float inv_std = rsqrtf(mean + eps);
+
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float w = (weight != NULL) ? (weight[i] + (use_unit_offset ? 1.0f : 0.0f)) : 1.0f;
+        out_head[i] = x_head[i] * inv_std * w;
+    }
+}
+
+extern "C" void cuda_rmsnorm_batched(
+    float* x,
+    const float* weight,
+    float* out,
+    int head_dim,
+    int count,
+    float eps,
+    int use_unit_offset,
+    CudaStream_t stream
+) {
+    if (count <= 0 || head_dim <= 0) return;
+    int threads = (head_dim < 256) ? 32 * ((head_dim + 31) / 32) : 256;
+    if (threads > 256) threads = 256;
+    if (threads < 32) threads = 32;
+    k_rmsnorm_batched<<<count, threads, 0, (cudaStream_t)stream>>>(
+        x, weight, out, head_dim, count, eps, use_unit_offset
+    );
+}
+
+// ============================================================================
+// Embedding Lookup Kernels
+// ============================================================================
+
+__global__ void k_embed_lookup_q4_0(
+    const unsigned char* __restrict__ weights,
+    int token_id,
+    float* __restrict__ out,
+    int dim,
+    float scale
+) {
+    int num_blocks = dim / 32;
+    size_t row_offset = (size_t)token_id * (size_t)num_blocks * 18;
+    const unsigned char* row_weights = weights + row_offset;
+
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < num_blocks) {
+        const unsigned char* block_ptr = row_weights + b * 18;
+        float d = f16_to_f32(*(const unsigned short*)block_ptr) * scale;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            unsigned char byte = block_ptr[2 + i];
+            int q0 = (int)(byte & 0x0F) - 8;
+            int q1 = (int)(byte >> 4) - 8;
+            out[b * 32 + i] = (float)q0 * d;
+            out[b * 32 + i + 16] = (float)q1 * d;
+        }
+    }
+}
+
+__global__ void k_embed_lookup_q8_0(
+    const unsigned char* __restrict__ weights,
+    int token_id,
+    float* __restrict__ out,
+    int dim,
+    float scale
+) {
+    int num_blocks = dim / 32;
+    size_t row_offset = (size_t)token_id * (size_t)num_blocks * 34;
+    const unsigned char* row_weights = weights + row_offset;
+
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < num_blocks) {
+        const unsigned char* block_ptr = row_weights + b * 34;
+        float d = f16_to_f32(*(const unsigned short*)block_ptr) * scale;
+        const signed char* qs = (const signed char*)(block_ptr + 2);
+        #pragma unroll
+        for (int i = 0; i < 32; i++) {
+            out[b * 32 + i] = (float)qs[i] * d;
+        }
+    }
+}
+
+__global__ void k_embed_lookup_f32(
+    const float* __restrict__ weights,
+    int token_id,
+    float* __restrict__ out,
+    int dim,
+    float scale
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) {
+        out[i] = weights[(size_t)token_id * dim + i] * scale;
+    }
+}
+
+__global__ void k_embed_lookup_bf16(
+    const unsigned short* __restrict__ weights,
+    int token_id,
+    float* __restrict__ out,
+    int dim,
+    float scale
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) {
+        out[i] = bf16_to_f32(weights[(size_t)token_id * dim + i]) * scale;
+    }
+}
+
+__global__ void k_embed_lookup_f16(
+    const unsigned short* __restrict__ weights,
+    int token_id,
+    float* __restrict__ out,
+    int dim,
+    float scale
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) {
+        out[i] = f16_to_f32(weights[(size_t)token_id * dim + i]) * scale;
+    }
+}
+
+extern "C" void cuda_embed_lookup(
+    const void* emb_weights,
+    int qtype,
+    int token_id,
+    float* out,
+    int dim,
+    float scale,
+    CudaStream_t stream
+) {
+    if (!emb_weights || dim <= 0) return;
+    if (qtype == 2) { // Q4_0
+        int num_blocks = dim / 32;
+        int threads = (num_blocks < 256) ? 32 * ((num_blocks + 31) / 32) : 256;
+        if (threads < 32) threads = 32;
+        int blocks = (num_blocks + threads - 1) / threads;
+        k_embed_lookup_q4_0<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+            (const unsigned char*)emb_weights, token_id, out, dim, scale
+        );
+    } else if (qtype == 8) { // Q8_0
+        int num_blocks = dim / 32;
+        int threads = (num_blocks < 256) ? 32 * ((num_blocks + 31) / 32) : 256;
+        if (threads < 32) threads = 32;
+        int blocks = (num_blocks + threads - 1) / threads;
+        k_embed_lookup_q8_0<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+            (const unsigned char*)emb_weights, token_id, out, dim, scale
+        );
+    } else if (qtype == 30) { // BF16
+        int threads = 256;
+        int blocks = (dim + threads - 1) / threads;
+        k_embed_lookup_bf16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+            (const unsigned short*)emb_weights, token_id, out, dim, scale
+        );
+    } else if (qtype == 1) { // F16
+        int threads = 256;
+        int blocks = (dim + threads - 1) / threads;
+        k_embed_lookup_f16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+            (const unsigned short*)emb_weights, token_id, out, dim, scale
+        );
+    } else if (qtype == 0) { // F32
+        int threads = 256;
+        int blocks = (dim + threads - 1) / threads;
+        k_embed_lookup_f32<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+            (const float*)emb_weights, token_id, out, dim, scale
+        );
+    }
 }
 
 __global__ void k_add_rmsnorm(
@@ -579,6 +1078,76 @@ extern "C" void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv
     int half_dim = eff_rotary / 2;
     int threads = (half_dim < 256) ? half_dim : 256;
     k_rope<<<max_heads, threads, 0, (cudaStream_t)stream>>>(q, k, pos, num_heads, num_kv_heads, head_dim, rotary_dim, freq_base);
+}
+
+__global__ void k_rope_batched(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    int pos,
+    int batch_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float freq_base
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (b >= batch_size) return;
+
+    int i = threadIdx.x;
+    int eff_rotary = (rotary_dim == 0 || rotary_dim > head_dim) ? head_dim : rotary_dim;
+    int half_dim = eff_rotary / 2;
+    if (i >= half_dim) return;
+
+    int token_pos = pos + b;
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)eff_rotary);
+    float val = (float)token_pos * freq;
+    float cos_val = cosf(val);
+    float sin_val = sinf(val);
+
+    if (h < num_heads && q != NULL) {
+        size_t b_offset = (size_t)b * (num_heads * head_dim);
+        int offset0 = b_offset + h * head_dim + i;
+        int offset1 = offset0 + half_dim;
+        float q0 = q[offset0];
+        float q1 = q[offset1];
+        q[offset0] = q0 * cos_val - q1 * sin_val;
+        q[offset1] = q0 * sin_val + q1 * cos_val;
+    }
+
+    if (h < num_kv_heads && k != NULL) {
+        size_t b_offset = (size_t)b * (num_kv_heads * head_dim);
+        int offset0 = b_offset + h * head_dim + i;
+        int offset1 = offset0 + half_dim;
+        float k0 = k[offset0];
+        float k1 = k[offset1];
+        k[offset0] = k0 * cos_val - k1 * sin_val;
+        k[offset1] = k0 * sin_val + k1 * cos_val;
+    }
+}
+
+extern "C" void cuda_rope_batched(
+    float* q,
+    float* k,
+    int pos,
+    int batch_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float freq_base,
+    CudaStream_t stream
+) {
+    if (batch_size <= 0) return;
+    int max_heads = (num_heads > num_kv_heads) ? num_heads : num_kv_heads;
+    int eff_rotary = (rotary_dim == 0 || rotary_dim > head_dim) ? head_dim : rotary_dim;
+    int half_dim = eff_rotary / 2;
+    int threads = (half_dim < 256) ? half_dim : 256;
+    dim3 grid(max_heads, batch_size);
+    k_rope_batched<<<grid, threads, 0, (cudaStream_t)stream>>>(
+        q, k, pos, batch_size, num_heads, num_kv_heads, head_dim, rotary_dim, freq_base
+    );
 }
 
 __device__ __forceinline__ float gelu_f32(float x) {
@@ -707,6 +1276,51 @@ extern "C" void cuda_kv_cache_put(
     int blocks = (kv_dim + threads - 1) / threads;
     k_kv_cache_put<<<blocks, threads, 0, (cudaStream_t)stream>>>(
         k_cache, v_cache, k, v, layer_idx, pos, max_seq, kv_dim, max_kv_dim
+    );
+}
+
+__global__ void k_kv_cache_put_batched(
+    float* __restrict__ k_cache,
+    float* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int layer_idx,
+    int pos,
+    int batch_size,
+    int max_seq,
+    int kv_dim,
+    int max_kv_dim
+) {
+    int b = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < batch_size && idx < kv_dim) {
+        size_t cache_offset = ((size_t)layer_idx * max_seq + (pos + b)) * max_kv_dim + idx;
+        size_t src_offset = (size_t)b * kv_dim + idx;
+        k_cache[cache_offset] = k[src_offset];
+        v_cache[cache_offset] = v[src_offset];
+    }
+}
+
+extern "C" void cuda_kv_cache_put_batched(
+    float* k_cache,
+    float* v_cache,
+    const float* k,
+    const float* v,
+    int layer_idx,
+    int pos,
+    int batch_size,
+    int max_seq,
+    int n_kv_heads,
+    int head_dim,
+    int max_kv_dim,
+    CudaStream_t stream
+) {
+    if (batch_size <= 0) return;
+    int kv_dim = n_kv_heads * head_dim;
+    int threads = 256;
+    dim3 grid((kv_dim + threads - 1) / threads, batch_size);
+    k_kv_cache_put_batched<<<grid, threads, 0, (cudaStream_t)stream>>>(
+        k_cache, v_cache, k, v, layer_idx, pos, batch_size, max_seq, kv_dim, max_kv_dim
     );
 }
 
@@ -856,6 +1470,148 @@ extern "C" void cuda_attention_forward(
     size_t shared_bytes = (valid_tokens + head_dim + threads) * sizeof(float);
     k_attention_forward<<<n_heads, threads, shared_bytes, (cudaStream_t)stream>>>(
         q, k_cache, v_cache, out, donor_layer, pos, max_seq, n_heads, n_kv_heads, head_dim, max_kv_dim, attn_scale, softcap, sliding_window
+    );
+}
+
+__global__ void k_attention_batched(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out,
+    int donor_layer,
+    int pos,
+    int batch_size,
+    int max_seq,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_kv_dim,
+    float attn_scale,
+    float softcap,
+    int sliding_window,
+    int max_valid_tokens
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads || b >= batch_size) return;
+
+    int gqa_group = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
+    int kv_h = h / gqa_group;
+
+    const float* q_head = q + (size_t)b * (n_heads * head_dim) + h * head_dim;
+    float* out_head = out + (size_t)b * (n_heads * head_dim) + h * head_dim;
+
+    int token_pos = pos + b;
+    int seq_len = token_pos + 1;
+    int start_t = (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
+    int valid_tokens = seq_len - start_t;
+
+    extern __shared__ float s_mem[];
+    float* s_scores = s_mem;
+    float* s_q = s_scores + max_valid_tokens;
+    float* s_red = s_q + head_dim;
+
+    int tid = threadIdx.x;
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        s_q[d] = q_head[d];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < valid_tokens; i += blockDim.x) {
+        int t = start_t + i;
+        size_t k_offset = ((size_t)donor_layer * max_seq + t) * max_kv_dim + kv_h * head_dim;
+        const float* k_vec = k_cache + k_offset;
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += s_q[d] * k_vec[d];
+        }
+        dot *= attn_scale;
+        if (softcap > 0.0f) {
+            dot = softcap * tanhf(dot / softcap);
+        }
+        s_scores[i] = dot;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < valid_tokens; i += blockDim.x) {
+        if (s_scores[i] > local_max) local_max = s_scores[i];
+    }
+    s_red[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_red[tid + s] > s_red[tid]) s_red[tid] = s_red[tid + s];
+        }
+        __syncthreads();
+    }
+    float max_val = s_red[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < valid_tokens; i += blockDim.x) {
+        float ex = expf(s_scores[i] - max_val);
+        s_scores[i] = ex;
+        local_sum += ex;
+    }
+    s_red[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_red[tid] += s_red[tid + s];
+        }
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / (s_red[0] + 1e-9f);
+
+    for (int i = tid; i < valid_tokens; i += blockDim.x) {
+        s_scores[i] *= inv_sum;
+    }
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < valid_tokens; ++i) {
+            int t = start_t + i;
+            size_t v_offset = ((size_t)donor_layer * max_seq + t) * max_kv_dim + kv_h * head_dim;
+            acc += s_scores[i] * v_cache[v_offset + d];
+        }
+        out_head[d] = acc;
+    }
+}
+
+extern "C" void cuda_attention_batched(
+    const float* q,
+    const float* k_cache,
+    const float* v_cache,
+    float* out,
+    int donor_layer,
+    int pos,
+    int batch_size,
+    int max_seq,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_kv_dim,
+    float attn_scale,
+    float softcap,
+    int sliding_window,
+    CudaStream_t stream
+) {
+    if (batch_size <= 0) return;
+    if (batch_size == 1) {
+        cuda_attention_forward(q, k_cache, v_cache, out, donor_layer, pos, max_seq, n_heads, n_kv_heads, head_dim, max_kv_dim, attn_scale, softcap, sliding_window, stream);
+        return;
+    }
+    int max_valid_tokens = pos + batch_size;
+    int threads = 64;
+    size_t shared_bytes = (max_valid_tokens + head_dim + threads) * sizeof(float);
+    dim3 grid(n_heads, batch_size);
+    k_attention_batched<<<grid, threads, shared_bytes, (cudaStream_t)stream>>>(
+        q, k_cache, v_cache, out, donor_layer, pos, batch_size, max_seq, n_heads, n_kv_heads, head_dim, max_kv_dim, attn_scale, softcap, sliding_window, max_valid_tokens
     );
 }
 

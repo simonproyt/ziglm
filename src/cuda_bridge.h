@@ -28,11 +28,21 @@ void cuda_gemv_q6_k(const void* weights, const float* x, float* y, int rows, int
 void cuda_gemv_f16(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
 void cuda_gemv_bf16(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
 void cuda_gemv_f32(const float* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
+void cuda_gemv(int qtype, const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
+
+// Batched Quantized GEMM Operations (Matrix * Matrix)
+void cuda_gemm_q4_0(const void* weights, const float* x, float* y, int batch_size, int rows, int cols, CudaStream_t stream);
+void cuda_gemm_q8_0(const void* weights, const float* x, float* y, int batch_size, int rows, int cols, CudaStream_t stream);
+void cuda_gemm_f16(const void* weights, const float* x, float* y, int batch_size, int rows, int cols, CudaStream_t stream);
+void cuda_gemm(int qtype, const void* weights, const float* x, float* y, int batch_size, int rows, int cols, CudaStream_t stream);
 
 // Normalization & Embeddings
+void cuda_embed_lookup(const void* emb_weights, int qtype, int token_id, float* out, int dim, float scale, CudaStream_t stream);
 void cuda_rmsnorm(const float* x, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
+void cuda_rmsnorm_batched(float* x, const float* weight, float* out, int head_dim, int count, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_add_rmsnorm(float* x, const float* residual, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
+void cuda_rope_batched(float* q, float* k, int pos, int batch_size, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
 
 // Activations & Elementwise Math
 void cuda_geglu(const float* gate, const float* up, float* out, int n, CudaStream_t stream);
@@ -56,6 +66,21 @@ void cuda_kv_cache_put(
     CudaStream_t stream
 );
 
+void cuda_kv_cache_put_batched(
+    float* k_cache,
+    float* v_cache,
+    const float* k,
+    const float* v,
+    int layer_idx,
+    int pos,
+    int batch_size,
+    int max_seq,
+    int n_kv_heads,
+    int head_dim,
+    int max_kv_dim,
+    CudaStream_t stream
+);
+
 // GPU-Resident Multi-Head / Grouped-Query Attention
 void cuda_attention_forward(
     const float* q,
@@ -64,6 +89,25 @@ void cuda_attention_forward(
     float* out,
     int donor_layer,
     int pos,
+    int max_seq,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_kv_dim,
+    float attn_scale,
+    float softcap,
+    int sliding_window,
+    CudaStream_t stream
+);
+
+void cuda_attention_batched(
+    const float* q,
+    const float* k_cache,
+    const float* v_cache,
+    float* out,
+    int donor_layer,
+    int pos,
+    int batch_size,
     int max_seq,
     int n_heads,
     int n_kv_heads,

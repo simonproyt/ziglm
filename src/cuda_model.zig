@@ -122,6 +122,8 @@ pub const CudaGpuModel = struct {
     layers: []CudaGpuLayer,
     output: ?CudaGpuTensor = null,
     output_norm: ?CudaGpuNorm = null,
+    token_embd: ?CudaGpuTensor = null,
+    owns_token_embd: bool = false,
 
     // Per-Layer Embedding Context Projection weights on GPU
     per_layer_model_projection: ?CudaGpuTensor = null,
@@ -152,6 +154,7 @@ pub const CudaGpuModel = struct {
 
     // Host staging buffers
     host_x: []f32,
+    host_ple: []f32,
     host_logits: []f32,
 
     pub fn init(allocator: std.mem.Allocator, device: *CudaDevice, cpu_model: *const TransformerModel) !*CudaGpuModel {
@@ -172,20 +175,23 @@ pub const CudaGpuModel = struct {
         }
 
         // Allocate device buffers
-        const d_x = try device.alloc(dim * @sizeOf(f32));
-        const d_xb = try device.alloc(dim * @sizeOf(f32));
-        const d_q = try device.alloc(max_heads * max_head_dim * @sizeOf(f32));
-        const d_k = try device.alloc(max_kv_heads * max_head_dim * @sizeOf(f32));
-        const d_v = try device.alloc(max_kv_heads * max_head_dim * @sizeOf(f32));
-        const d_attn_out = try device.alloc(max_heads * max_head_dim * @sizeOf(f32));
-        const d_gate = try device.alloc(max_inter * @sizeOf(f32));
-        const d_up = try device.alloc(max_inter * @sizeOf(f32));
-        const d_act = try device.alloc(max_inter * @sizeOf(f32));
-        const d_ffn_out = try device.alloc(dim * @sizeOf(f32));
-        const d_ple_gate = try device.alloc(256 * @sizeOf(f32));
-        const d_ple_buf = try device.alloc(256 * @sizeOf(f32));
-        const d_ctx_ple_buf = try device.alloc(cpu_model.layers.len * 256 * @sizeOf(f32));
-        const d_ctx_scratch = try device.alloc(cpu_model.layers.len * 256 * @sizeOf(f32));
+        const max_batch: usize = 512;
+        const total_ple_dim = cpu_model.layers.len * 256;
+
+        const d_x = try device.alloc(max_batch * dim * @sizeOf(f32));
+        const d_xb = try device.alloc(max_batch * dim * @sizeOf(f32));
+        const d_q = try device.alloc(max_batch * max_heads * max_head_dim * @sizeOf(f32));
+        const d_k = try device.alloc(max_batch * max_kv_heads * max_head_dim * @sizeOf(f32));
+        const d_v = try device.alloc(max_batch * max_kv_heads * max_head_dim * @sizeOf(f32));
+        const d_attn_out = try device.alloc(max_batch * max_heads * max_head_dim * @sizeOf(f32));
+        const d_gate = try device.alloc(max_batch * max_inter * @sizeOf(f32));
+        const d_up = try device.alloc(max_batch * max_inter * @sizeOf(f32));
+        const d_act = try device.alloc(max_batch * max_inter * @sizeOf(f32));
+        const d_ffn_out = try device.alloc(max_batch * dim * @sizeOf(f32));
+        const d_ple_gate = try device.alloc(max_batch * 256 * @sizeOf(f32));
+        const d_ple_buf = try device.alloc(max_batch * 256 * @sizeOf(f32));
+        const d_ctx_ple_buf = try device.alloc(max_batch * total_ple_dim * @sizeOf(f32));
+        const d_ctx_scratch = try device.alloc(max_batch * total_ple_dim * @sizeOf(f32));
         const d_logits = try device.alloc(p.vocab_size * @sizeOf(f32));
 
         // GPU KV Cache: [num_layers, max_seq, max_kv_heads * max_head_dim]
@@ -195,7 +201,8 @@ pub const CudaGpuModel = struct {
         const d_v_cache = try device.alloc(kv_total_floats * @sizeOf(f32));
 
         // Host staging buffers
-        const host_x = try allocator.alloc(f32, dim);
+        const host_x = try allocator.alloc(f32, max_batch * dim);
+        const host_ple = try allocator.alloc(f32, max_batch * total_ple_dim);
         const host_logits = try allocator.alloc(f32, p.vocab_size);
 
         // Upload transformer layers
@@ -254,12 +261,27 @@ pub const CudaGpuModel = struct {
             gpu_output_norm = try CudaGpuNorm.upload(device, cpu_model.output_norm);
         }
 
-        // Upload Output Projection
+        // Upload Output Projection and Token Embeddings
+        const can_gpu_embed = switch (cpu_model.token_embd.type) {
+            .F32, .F16, .BF16, .Q4_0, .Q8_0 => true,
+            else => false,
+        };
+
         var gpu_output: ?CudaGpuTensor = null;
+        var gpu_token_embd: ?CudaGpuTensor = null;
+        var owns_token_embd = false;
         if (cpu_model.output) |t| {
             gpu_output = try CudaGpuTensor.upload(device, t, p.vocab_size, dim);
+            if (can_gpu_embed) {
+                gpu_token_embd = CudaGpuTensor.upload(device, cpu_model.token_embd, p.vocab_size, dim) catch null;
+                owns_token_embd = (gpu_token_embd != null);
+            }
         } else {
             gpu_output = try CudaGpuTensor.upload(device, cpu_model.token_embd, p.vocab_size, dim);
+            if (can_gpu_embed) {
+                gpu_token_embd = gpu_output;
+            }
+            owns_token_embd = false;
         }
 
         var gpu_ctx_proj: ?CudaGpuTensor = null;
@@ -282,6 +304,8 @@ pub const CudaGpuModel = struct {
             .layers = gpu_layers,
             .output = gpu_output,
             .output_norm = gpu_output_norm,
+            .token_embd = gpu_token_embd,
+            .owns_token_embd = owns_token_embd,
             .per_layer_model_projection = gpu_ctx_proj,
             .per_layer_projection_norm = gpu_ctx_norm,
             .d_x = d_x,
@@ -304,6 +328,7 @@ pub const CudaGpuModel = struct {
             .max_seq_len = max_seq,
             .max_kv_dim = max_kv_dim,
             .host_x = host_x,
+            .host_ple = host_ple,
             .host_logits = host_logits,
         };
 
@@ -317,6 +342,9 @@ pub const CudaGpuModel = struct {
         self.allocator.free(self.layers);
 
         if (self.output) |*t| t.deinit();
+        if (self.owns_token_embd) {
+            if (self.token_embd) |*t| t.deinit();
+        }
         if (self.output_norm) |*n| n.deinit();
         if (self.per_layer_model_projection) |*t| t.deinit();
         if (self.per_layer_projection_norm) |*n| n.deinit();
@@ -340,6 +368,7 @@ pub const CudaGpuModel = struct {
         self.d_v_cache.deinit();
 
         self.allocator.free(self.host_x);
+        self.allocator.free(self.host_ple);
         self.allocator.free(self.host_logits);
         self.allocator.destroy(self);
     }
@@ -357,9 +386,27 @@ pub const CudaGpuModel = struct {
         const p = self.params;
         const dim = p.embedding_length;
 
-        // 1. Embedding lookup and upload
+        const d_x_ptr: [*]f32 = @ptrCast(@alignCast(self.d_x.ptr));
+        const d_xb_ptr: [*]f32 = @ptrCast(@alignCast(self.d_xb.ptr));
+
+        // 1. Embedding lookup (100% on GPU if token_embd resident)
         if (custom_embedding) |embd| {
             @memcpy(self.host_x[0..dim], embd[0..dim]);
+            const host_x_bytes: []const u8 = std.mem.sliceAsBytes(self.host_x);
+            try self.d_x.upload(host_x_bytes, self.device.stream);
+        } else if (self.token_embd) |emb_tensor| {
+            const embd_scale: f32 = if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4)
+                @sqrt(@as(f32, @floatFromInt(dim)))
+            else
+                1.0;
+            self.device.embedLookup(
+                emb_tensor.buf.ptr,
+                emb_tensor.qtype,
+                token_id,
+                d_x_ptr,
+                dim,
+                embd_scale,
+            );
         } else {
             const row_bytes = cpu_model.token_embd.getRow(token_id);
             quant.dequantizeRow(cpu_model.token_embd.type, row_bytes, self.host_x[0..dim], dim);
@@ -368,19 +415,16 @@ pub const CudaGpuModel = struct {
             else
                 1.0;
             for (self.host_x[0..dim]) |*v| v.* *= embd_scale;
+            const host_x_bytes: []const u8 = std.mem.sliceAsBytes(self.host_x);
+            try self.d_x.upload(host_x_bytes, self.device.stream);
         }
-
-        // Upload embedding to GPU d_x
-        const host_x_bytes: []const u8 = std.mem.sliceAsBytes(self.host_x);
-        try self.d_x.upload(host_x_bytes, self.device.stream);
-
-        const d_x_ptr: [*]f32 = @ptrCast(@alignCast(self.d_x.ptr));
-        const d_xb_ptr: [*]f32 = @ptrCast(@alignCast(self.d_xb.ptr));
 
         // PLE precomputation on GPU
         if (cpu_model.embed_tokens_per_layer) |ple_tab| {
             const ple_dim: usize = 256;
             const total_ple_dim = self.layers.len * ple_dim;
+            const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
+
             if (custom_embedding == null and token_id < p.vocab_size) {
                 const ple_row = ple_tab.getRow(token_id);
                 quant.dequantizeRow(ple_tab.type, ple_row, bufs.ctx_ple_buf[0..total_ple_dim], total_ple_dim);
@@ -396,7 +440,6 @@ pub const CudaGpuModel = struct {
             if (self.per_layer_model_projection) |ctx_proj| {
                 const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
                 const d_ctx_scratch_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_scratch.ptr));
-                const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
 
                 // Scale d_x into d_xb: d_xb = d_x * inv_sqrt_dim on GPU
                 _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
@@ -405,13 +448,10 @@ pub const CudaGpuModel = struct {
                 // GPU GEMV: ctx_scratch = ctx_proj * d_xb (8960 rows x 1536 cols in parallel on GPU)
                 self.device.gemv(ctx_proj.qtype, ctx_proj.buf.ptr, d_xb_ptr, d_ctx_scratch_ptr, total_ple_dim, dim);
 
-                // Normalization on GPU
+                // Normalization on GPU (batched across all 35 layers in ONE kernel launch!)
                 if (self.per_layer_projection_norm) |norm| {
                     const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
-                    for (0..self.layers.len) |l_idx| {
-                        const slice_ptr = d_ctx_scratch_ptr + l_idx * ple_dim;
-                        self.device.rmsNorm(slice_ptr, norm_ptr, slice_ptr, ple_dim, p.layer_norm_rms_epsilon, false);
-                    }
+                    self.device.rmsNormBatched(d_ctx_scratch_ptr, norm_ptr, d_ctx_scratch_ptr, ple_dim, self.layers.len, p.layer_norm_rms_epsilon, false);
                 }
 
                 // Fusion on GPU
@@ -453,10 +493,7 @@ pub const CudaGpuModel = struct {
 
             if (layer.attn_q_norm) |q_norm| {
                 const q_norm_ptr: [*]const f32 = @ptrCast(@alignCast(q_norm.buf.ptr));
-                for (0..n_heads) |h| {
-                    const q_head_ptr = d_q_ptr + h * head_size;
-                    self.device.rmsNorm(q_head_ptr, q_norm_ptr, q_head_ptr, head_size, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
-                }
+                self.device.rmsNormBatched(d_q_ptr, q_norm_ptr, d_q_ptr, head_size, n_heads, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             }
 
             // KV Cache Handling (with Cross-Layer Sharing for Gemma 4 & hybrid architectures)
@@ -490,17 +527,11 @@ pub const CudaGpuModel = struct {
 
                 if (layer.attn_k_norm) |k_norm| {
                     const k_norm_ptr: [*]const f32 = @ptrCast(@alignCast(k_norm.buf.ptr));
-                    for (0..n_kv_heads) |h| {
-                        const k_head_ptr = d_k_ptr + h * head_size;
-                        self.device.rmsNorm(k_head_ptr, k_norm_ptr, k_head_ptr, head_size, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
-                    }
+                    self.device.rmsNormBatched(d_k_ptr, k_norm_ptr, d_k_ptr, head_size, n_kv_heads, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
                 }
 
                 if (p.arch == .gemma4) {
-                    for (0..n_kv_heads) |h| {
-                        const v_head_ptr = d_v_ptr + h * head_size;
-                        self.device.rmsNorm(v_head_ptr, null, v_head_ptr, head_size, p.layer_norm_rms_epsilon, false);
-                    }
+                    self.device.rmsNormBatched(d_v_ptr, null, d_v_ptr, head_size, n_kv_heads, p.layer_norm_rms_epsilon, false);
                 }
 
                 self.device.rope(null, d_k_ptr, pos, 0, n_kv_heads, head_size, layer.rotary_dim, layer.rope_theta);
@@ -600,6 +631,290 @@ pub const CudaGpuModel = struct {
 
         return self.host_logits;
     }
+
+    pub fn forwardBatch(
+        self: *CudaGpuModel,
+        cpu_model: *const TransformerModel,
+        tokens: []const u32,
+        pos: usize,
+        kv_cache: ?*KVCache,
+        bufs: *ModelBuffers,
+    ) ![]const f32 {
+        if (tokens.len == 0) return self.host_logits[0..0];
+        if (tokens.len == 1) {
+            return self.forward(cpu_model, tokens[0], pos, kv_cache.?, bufs, null, true);
+        }
+
+        const B = tokens.len;
+        const p = self.params;
+        const dim = p.embedding_length;
+        const d_x_ptr: [*]f32 = @ptrCast(@alignCast(self.d_x.ptr));
+        const d_xb_ptr: [*]f32 = @ptrCast(@alignCast(self.d_xb.ptr));
+
+        // 1. Embeddings lookup and batch upload
+        const embd_scale: f32 = if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4)
+            @sqrt(@as(f32, @floatFromInt(dim)))
+        else
+            1.0;
+
+        for (tokens, 0..) |tok, b| {
+            const dst = self.host_x[b * dim .. (b + 1) * dim];
+            const row_bytes = cpu_model.token_embd.getRow(tok);
+            quant.dequantizeRow(cpu_model.token_embd.type, row_bytes, dst, dim);
+            for (dst) |*v| v.* *= embd_scale;
+        }
+        try self.d_x.upload(std.mem.sliceAsBytes(self.host_x[0 .. B * dim]), self.device.stream);
+
+        // PLE precomputation for Gemma 4
+        const ple_dim: usize = 256;
+        const total_ple_dim = self.layers.len * ple_dim;
+        const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
+        const d_ctx_scratch_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_scratch.ptr));
+
+        if (cpu_model.embed_tokens_per_layer) |ple_tab| {
+            const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+            for (tokens, 0..) |tok, b| {
+                const dst = self.host_ple[b * total_ple_dim .. (b + 1) * total_ple_dim];
+                if (tok < p.vocab_size) {
+                    const ple_row = ple_tab.getRow(tok);
+                    quant.dequantizeRow(ple_tab.type, ple_row, dst, total_ple_dim);
+                    for (dst) |*v| v.* *= token_scale;
+                } else {
+                    @memset(dst, 0.0);
+                }
+            }
+            try self.d_ctx_ple_buf.upload(std.mem.sliceAsBytes(self.host_ple[0 .. B * total_ple_dim]), self.device.stream);
+
+            if (self.per_layer_model_projection) |ctx_proj| {
+                const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+                _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, B * dim * @sizeOf(f32), self.device.stream);
+                self.device.scale(d_xb_ptr, inv_sqrt_dim, B * dim);
+
+                // GPU Batched GEMM: ctx_scratch = ctx_proj * d_xb (B vectors in parallel on GPU)
+                self.device.gemm(ctx_proj.qtype, ctx_proj.buf.ptr, d_xb_ptr, d_ctx_scratch_ptr, B, total_ple_dim, dim);
+
+                // Batched RMSNorm across all B * layers.len
+                if (self.per_layer_projection_norm) |norm| {
+                    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                    self.device.rmsNormBatched(d_ctx_scratch_ptr, norm_ptr, d_ctx_scratch_ptr, ple_dim, B * self.layers.len, p.layer_norm_rms_epsilon, false);
+                }
+
+                // Fusion on GPU across B * total_ple_dim
+                self.device.pleCtxFuse(d_ctx_ple_ptr, d_ctx_scratch_ptr, B * total_ple_dim, true);
+            }
+        }
+
+        const d_q_ptr: [*]f32 = @ptrCast(@alignCast(self.d_q.ptr));
+        const d_k_ptr: [*]f32 = @ptrCast(@alignCast(self.d_k.ptr));
+        const d_v_ptr: [*]f32 = @ptrCast(@alignCast(self.d_v.ptr));
+        const d_attn_out_ptr: [*]f32 = @ptrCast(@alignCast(self.d_attn_out.ptr));
+        const d_gate_ptr: [*]f32 = @ptrCast(@alignCast(self.d_gate.ptr));
+        const d_up_ptr: [*]f32 = @ptrCast(@alignCast(self.d_up.ptr));
+        const d_act_ptr: [*]f32 = @ptrCast(@alignCast(self.d_act.ptr));
+        const d_ffn_out_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ffn_out.ptr));
+        const d_ple_gate_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ple_gate.ptr));
+        const d_ple_buf_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ple_buf.ptr));
+        const d_k_cache_ptr: [*]f32 = @ptrCast(@alignCast(self.d_k_cache.ptr));
+        const d_v_cache_ptr: [*]f32 = @ptrCast(@alignCast(self.d_v_cache.ptr));
+
+        // 2. Transformer layers forward (100% on GPU, ZERO host transfers!)
+        for (self.layers, 0..) |layer, layer_idx| {
+            // A. Pre-Attention Norm
+            if (layer.input_layernorm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNormBatched(d_x_ptr, norm_ptr, d_xb_ptr, dim, B, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            } else {
+                _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, B * dim * @sizeOf(f32), self.device.stream);
+            }
+
+            const head_size = layer.head_dim;
+            const n_heads = layer.n_heads;
+            const n_kv_heads = layer.n_kv_heads;
+
+            if (layer.attn_q) |t_q| {
+                self.device.gemm(t_q.qtype, t_q.buf.ptr, d_xb_ptr, d_q_ptr, B, n_heads * head_size, dim);
+            }
+
+            if (layer.attn_q_norm) |q_norm| {
+                const q_norm_ptr: [*]const f32 = @ptrCast(@alignCast(q_norm.buf.ptr));
+                self.device.rmsNormBatched(d_q_ptr, q_norm_ptr, d_q_ptr, head_size, B * n_heads, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            }
+
+            // KV Cache Handling (with Cross-Layer Sharing for Gemma 4 & hybrid architectures)
+            const unshared_count: usize = if (p.num_kv_shared_layers > 0)
+                (p.block_count - p.num_kv_shared_layers)
+            else if (p.arch == .gemma4)
+                (if (p.block_count == 42) 24 else 15)
+            else
+                p.block_count;
+
+            const is_kv_shared = (p.arch == .gemma4 and (layer.attn_k == null or layer_idx >= unshared_count));
+            var donor_layer: usize = layer_idx;
+            if (is_kv_shared) {
+                var l = unshared_count;
+                while (l > 0) {
+                    l -= 1;
+                    if (self.layers[l].head_dim == layer.head_dim) {
+                        donor_layer = l;
+                        break;
+                    }
+                }
+            } else {
+                if (layer.attn_k) |t_k| {
+                    self.device.gemm(t_k.qtype, t_k.buf.ptr, d_xb_ptr, d_k_ptr, B, n_kv_heads * head_size, dim);
+                }
+                if (layer.attn_v) |t_v| {
+                    self.device.gemm(t_v.qtype, t_v.buf.ptr, d_xb_ptr, d_v_ptr, B, n_kv_heads * head_size, dim);
+                }
+
+                if (layer.attn_k_norm) |k_norm| {
+                    const k_norm_ptr: [*]const f32 = @ptrCast(@alignCast(k_norm.buf.ptr));
+                    self.device.rmsNormBatched(d_k_ptr, k_norm_ptr, d_k_ptr, head_size, B * n_kv_heads, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                }
+
+                if (p.arch == .gemma4) {
+                    self.device.rmsNormBatched(d_v_ptr, null, d_v_ptr, head_size, B * n_kv_heads, p.layer_norm_rms_epsilon, false);
+                }
+
+                self.device.ropeBatched(null, d_k_ptr, pos, B, 0, n_kv_heads, head_size, layer.rotary_dim, layer.rope_theta);
+
+                // Store K and V into KV Cache for all B tokens
+                self.device.kvCachePutBatched(
+                    d_k_cache_ptr,
+                    d_v_cache_ptr,
+                    d_k_ptr,
+                    d_v_ptr,
+                    layer_idx,
+                    pos,
+                    B,
+                    self.max_seq_len,
+                    n_kv_heads,
+                    head_size,
+                    self.max_kv_dim,
+                );
+            }
+
+            self.device.ropeBatched(d_q_ptr, null, pos, B, n_heads, 0, head_size, layer.rotary_dim, layer.rope_theta);
+
+            // C. Multi-Head Attention (Batched across heads AND batch tokens)
+            const donor_kv_heads = self.layers[donor_layer].n_kv_heads;
+            const attn_scale: f32 = if (p.arch == .gemma4) 1.0 else 1.0 / @sqrt(@as(f32, @floatFromInt(head_size)));
+            self.device.attentionBatched(
+                d_q_ptr,
+                d_k_cache_ptr,
+                d_v_cache_ptr,
+                d_attn_out_ptr,
+                donor_layer,
+                pos,
+                B,
+                self.max_seq_len,
+                n_heads,
+                donor_kv_heads,
+                head_size,
+                self.max_kv_dim,
+                attn_scale,
+                p.attn_logit_softcapping,
+                layer.sliding_window,
+            );
+
+            // D. Attention Output Projection (GEMM)
+            if (layer.attn_output) |t_out| {
+                self.device.gemm(t_out.qtype, t_out.buf.ptr, d_attn_out_ptr, d_xb_ptr, B, dim, n_heads * head_size);
+            }
+
+            // Post-attention layernorm
+            if (layer.post_attention_layernorm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNormBatched(d_xb_ptr, norm_ptr, d_xb_ptr, dim, B, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            }
+
+            // Residual Add: X = X + Attn_Out
+            self.device.add(d_x_ptr, d_xb_ptr, B * dim);
+
+            // E. Feed-Forward Network
+            if (layer.pre_feedforward_layernorm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNormBatched(d_x_ptr, norm_ptr, d_xb_ptr, dim, B, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            } else {
+                _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, B * dim * @sizeOf(f32), self.device.stream);
+            }
+
+            const inter_size = if (layer.ffn_gate) |g| g.rows else dim * 4;
+
+            if (layer.ffn_gate) |t_gate| {
+                self.device.gemm(t_gate.qtype, t_gate.buf.ptr, d_xb_ptr, d_gate_ptr, B, inter_size, dim);
+            }
+            if (layer.ffn_up) |t_up| {
+                self.device.gemm(t_up.qtype, t_up.buf.ptr, d_xb_ptr, d_up_ptr, B, inter_size, dim);
+            }
+
+            self.device.geglu(d_gate_ptr, d_up_ptr, d_act_ptr, B * inter_size);
+
+            if (layer.ffn_down) |t_down| {
+                self.device.gemm(t_down.qtype, t_down.buf.ptr, d_act_ptr, d_ffn_out_ptr, B, dim, inter_size);
+            }
+
+            if (layer.post_feedforward_layernorm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNormBatched(d_ffn_out_ptr, norm_ptr, d_ffn_out_ptr, dim, B, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            }
+
+            // Residual Add: X = X + FFN_Out
+            self.device.add(d_x_ptr, d_ffn_out_ptr, B * dim);
+
+            // Gemma Per-Layer Embedding Branch (if present)
+            if (layer.per_layer_input_gate != null and layer.per_layer_projection != null) {
+                const t_gate = layer.per_layer_input_gate.?;
+                self.device.gemm(t_gate.qtype, t_gate.buf.ptr, d_x_ptr, d_ple_gate_ptr, B, 256, dim);
+
+                for (0..B) |b| {
+                    const ple_slice = d_ctx_ple_ptr + (b * self.layers.len + layer_idx) * 256;
+                    const ple_gate_b = d_ple_gate_ptr + b * 256;
+                    const ple_buf_b = d_ple_buf_ptr + b * 256;
+                    self.device.pleGateGelu(ple_gate_b, ple_slice, ple_buf_b, 256);
+                }
+
+                const t_proj = layer.per_layer_projection.?;
+                self.device.gemm(t_proj.qtype, t_proj.buf.ptr, d_ple_buf_ptr, d_xb_ptr, B, dim, 256);
+
+                if (layer.post_per_layer_input_norm) |norm| {
+                    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                    self.device.rmsNormBatched(d_xb_ptr, norm_ptr, d_xb_ptr, dim, B, p.layer_norm_rms_epsilon, false);
+                }
+
+                self.device.add(d_x_ptr, d_xb_ptr, B * dim);
+            }
+
+            if (layer.scale != 1.0) {
+                self.device.scale(d_x_ptr, layer.scale, B * dim);
+            }
+        }
+
+        // 3. Final Output Norm on the LAST token in the batch (at d_x + (B - 1) * dim)
+        const last_token_x_ptr = d_x_ptr + (B - 1) * dim;
+        if (self.output_norm) |norm| {
+            const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+            self.device.rmsNorm(last_token_x_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+        } else {
+            _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, last_token_x_ptr, dim * @sizeOf(f32), self.device.stream);
+        }
+
+        // 4. Output Logits Projection (LM Head) for the last token
+        const d_logits_ptr: [*]f32 = @ptrCast(@alignCast(self.d_logits.ptr));
+        if (self.output) |t_out| {
+            self.device.gemv(t_out.qtype, t_out.buf.ptr, d_xb_ptr, d_logits_ptr, p.vocab_size, dim);
+        }
+
+        if (p.final_logit_softcapping > 0.0) {
+            self.device.tanhSoftcap(d_logits_ptr, p.final_logit_softcapping, p.vocab_size);
+        }
+
+        const logits_bytes: []u8 = std.mem.sliceAsBytes(self.host_logits);
+        try self.d_logits.download(logits_bytes, self.device.stream);
+        self.device.sync();
+
+        return self.host_logits;
+    }
 };
 
 test "CudaGpuModel C ABI vs CPU TransformerModel forward numerical parity" {
@@ -653,4 +968,30 @@ test "CudaGpuModel C ABI vs CPU TransformerModel forward numerical parity" {
     }
     std.debug.print("CPU argmax: {d} ('{s}'), GPU argmax: {d} ('{s}')\n", .{ cpu_argmax, cpu_eng.tokenizer.decode(cpu_argmax), gpu_argmax, gpu_eng.tokenizer.decode(gpu_argmax) });
     try std.testing.expectEqual(cpu_argmax, gpu_argmax);
+
+    // Test forwardBatch vs sequential forward
+    const test_batch = [_]u32{ 100, 200, 300, 400 };
+    gpu_eng.reset();
+    var seq_final: [256000]f32 = undefined;
+    for (test_batch, 0..) |tok, p_idx| {
+        const l = try gpu_eng.gpu_model.?.forward(gpu_eng.model, tok, p_idx, gpu_eng.kv_cache, gpu_eng.buffers, null, p_idx == test_batch.len - 1);
+        if (p_idx == test_batch.len - 1) {
+            @memcpy(seq_final[0..l.len], l);
+        }
+    }
+
+    gpu_eng.reset();
+    const bat_logits = try gpu_eng.gpu_model.?.forwardBatch(gpu_eng.model, &test_batch, 0, gpu_eng.kv_cache, gpu_eng.buffers);
+
+    var batch_diff: f32 = 0.0;
+    var b_max_idx: usize = 0;
+    for (0..bat_logits.len) |i| {
+        const diff = @abs(seq_final[i] - bat_logits[i]);
+        if (diff > batch_diff) {
+            batch_diff = diff;
+            b_max_idx = i;
+        }
+    }
+    std.debug.print("[CUDA C ABI Batch Parity] Max diff: {d:.6} at index {d} (Seq: {d:.4}, Bat: {d:.4})\n", .{ batch_diff, b_max_idx, seq_final[b_max_idx], bat_logits[b_max_idx] });
+    try std.testing.expect(batch_diff < 0.001);
 }

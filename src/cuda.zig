@@ -25,10 +25,15 @@ pub extern "c" fn cuda_gemv_q6_k(weights: ?*const anyopaque, x: [*]const f32, y:
 pub extern "c" fn cuda_gemv_f16(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_gemv_bf16(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_gemv_f32(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_gemm_q4_0(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, batch_size: c_int, rows: c_int, cols: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_gemm(qtype: c_int, weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, batch_size: c_int, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 
+pub extern "c" fn cuda_embed_lookup(emb_weights: ?*const anyopaque, qtype: c_int, token_id: c_int, out: [*]f32, dim: c_int, scale: f32, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rmsnorm(x: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_rmsnorm_batched(x: [*]f32, weight: ?[*]const f32, out: [*]f32, head_dim: c_int, count: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_add_rmsnorm(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rope(q: ?[*]f32, k: ?[*]f32, pos: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
+pub extern "c" fn cuda_rope_batched(q: ?[*]f32, k: ?[*]f32, pos: c_int, batch_size: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
 
 pub extern "c" fn cuda_geglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_swiglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int, stream: CudaStream_t) void;
@@ -50,6 +55,21 @@ pub extern "c" fn cuda_kv_cache_put(
     stream: CudaStream_t,
 ) void;
 
+pub extern "c" fn cuda_kv_cache_put_batched(
+    k_cache: [*]f32,
+    v_cache: [*]f32,
+    k: [*]const f32,
+    v: [*]const f32,
+    layer_idx: c_int,
+    pos: c_int,
+    batch_size: c_int,
+    max_seq: c_int,
+    n_kv_heads: c_int,
+    head_dim: c_int,
+    max_kv_dim: c_int,
+    stream: CudaStream_t,
+) void;
+
 pub extern "c" fn cuda_attention_forward(
     q: [*]const f32,
     k_cache: [*]const f32,
@@ -57,6 +77,25 @@ pub extern "c" fn cuda_attention_forward(
     out: [*]f32,
     donor_layer: c_int,
     pos: c_int,
+    max_seq: c_int,
+    n_heads: c_int,
+    n_kv_heads: c_int,
+    head_dim: c_int,
+    max_kv_dim: c_int,
+    attn_scale: f32,
+    softcap: f32,
+    sliding_window: c_int,
+    stream: CudaStream_t,
+) void;
+
+pub extern "c" fn cuda_attention_batched(
+    q: [*]const f32,
+    k_cache: [*]const f32,
+    v_cache: [*]const f32,
+    out: [*]f32,
+    donor_layer: c_int,
+    pos: c_int,
+    batch_size: c_int,
     max_seq: c_int,
     n_heads: c_int,
     n_kv_heads: c_int,
@@ -191,6 +230,43 @@ pub const CudaDevice = struct {
         }
     }
 
+    pub fn gemmQ4_0(
+        self: *const CudaDevice,
+        d_weights: ?*const anyopaque,
+        d_x: [*]const f32,
+        d_y: [*]f32,
+        batch_size: usize,
+        rows: usize,
+        cols: usize,
+    ) void {
+        cuda_gemm_q4_0(d_weights, d_x, d_y, @intCast(batch_size), @intCast(rows), @intCast(cols), self.stream);
+    }
+
+    pub fn gemm(
+        self: *const CudaDevice,
+        qtype: GGMLType,
+        d_weights: ?*const anyopaque,
+        d_x: [*]const f32,
+        d_y: [*]f32,
+        batch_size: usize,
+        rows: usize,
+        cols: usize,
+    ) void {
+        cuda_gemm(@intCast(@intFromEnum(qtype)), d_weights, d_x, d_y, @intCast(batch_size), @intCast(rows), @intCast(cols), self.stream);
+    }
+
+    pub fn embedLookup(
+        self: *const CudaDevice,
+        d_weights: ?*const anyopaque,
+        qtype: GGMLType,
+        token_id: u32,
+        d_out: [*]f32,
+        dim: usize,
+        scale_factor: f32,
+    ) void {
+        cuda_embed_lookup(d_weights, @intCast(@intFromEnum(qtype)), @intCast(token_id), d_out, @intCast(dim), scale_factor, self.stream);
+    }
+
     pub fn rmsNorm(
         self: *const CudaDevice,
         d_x: [*]const f32,
@@ -201,6 +277,19 @@ pub const CudaDevice = struct {
         use_unit_offset: bool,
     ) void {
         cuda_rmsnorm(d_x, d_weight, d_out, @intCast(n), eps, if (use_unit_offset) 1 else 0, self.stream);
+    }
+
+    pub fn rmsNormBatched(
+        self: *const CudaDevice,
+        d_x: [*]f32,
+        d_weight: ?[*]const f32,
+        d_out: [*]f32,
+        head_dim: usize,
+        count: usize,
+        eps: f32,
+        use_unit_offset: bool,
+    ) void {
+        cuda_rmsnorm_batched(d_x, d_weight, d_out, @intCast(head_dim), @intCast(count), eps, if (use_unit_offset) 1 else 0, self.stream);
     }
 
     pub fn addRmsNorm(
@@ -230,6 +319,21 @@ pub const CudaDevice = struct {
         cuda_rope(d_q, d_k, @intCast(pos), @intCast(num_heads), @intCast(num_kv_heads), @intCast(head_dim), @intCast(rotary_dim), freq_base, self.stream);
     }
 
+    pub fn ropeBatched(
+        self: *const CudaDevice,
+        d_q: ?[*]f32,
+        d_k: ?[*]f32,
+        pos: usize,
+        batch_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        freq_base: f32,
+    ) void {
+        cuda_rope_batched(d_q, d_k, @intCast(pos), @intCast(batch_size), @intCast(num_heads), @intCast(num_kv_heads), @intCast(head_dim), @intCast(rotary_dim), freq_base, self.stream);
+    }
+
     pub fn kvCachePut(
         self: *const CudaDevice,
         d_k_cache: [*]f32,
@@ -250,6 +354,36 @@ pub const CudaDevice = struct {
             d_v,
             @intCast(layer_idx),
             @intCast(pos),
+            @intCast(max_seq),
+            @intCast(n_kv_heads),
+            @intCast(head_dim),
+            @intCast(max_kv_dim),
+            self.stream,
+        );
+    }
+
+    pub fn kvCachePutBatched(
+        self: *const CudaDevice,
+        d_k_cache: [*]f32,
+        d_v_cache: [*]f32,
+        d_k: [*]const f32,
+        d_v: [*]const f32,
+        layer_idx: usize,
+        pos: usize,
+        batch_size: usize,
+        max_seq: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_kv_dim: usize,
+    ) void {
+        cuda_kv_cache_put_batched(
+            d_k_cache,
+            d_v_cache,
+            d_k,
+            d_v,
+            @intCast(layer_idx),
+            @intCast(pos),
+            @intCast(batch_size),
             @intCast(max_seq),
             @intCast(n_kv_heads),
             @intCast(head_dim),
@@ -282,6 +416,44 @@ pub const CudaDevice = struct {
             d_out,
             @intCast(donor_layer),
             @intCast(pos),
+            @intCast(max_seq),
+            @intCast(n_heads),
+            @intCast(n_kv_heads),
+            @intCast(head_dim),
+            @intCast(max_kv_dim),
+            attn_scale,
+            softcap,
+            @intCast(sliding_window),
+            self.stream,
+        );
+    }
+
+    pub fn attentionBatched(
+        self: *const CudaDevice,
+        d_q: [*]const f32,
+        d_k_cache: [*]const f32,
+        d_v_cache: [*]const f32,
+        d_out: [*]f32,
+        donor_layer: usize,
+        pos: usize,
+        batch_size: usize,
+        max_seq: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_kv_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
+        sliding_window: usize,
+    ) void {
+        cuda_attention_batched(
+            d_q,
+            d_k_cache,
+            d_v_cache,
+            d_out,
+            @intCast(donor_layer),
+            @intCast(pos),
+            @intCast(batch_size),
             @intCast(max_seq),
             @intCast(n_heads),
             @intCast(n_kv_heads),

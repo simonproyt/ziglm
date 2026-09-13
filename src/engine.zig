@@ -344,6 +344,18 @@ pub const Engine = struct {
         if (tokens.len == 0) return error.EmptyPrompt;
         if (tokens.len > self.max_seq_len) return error.PromptExceedsContext;
 
+        if (self.gpu_model) |gm| {
+            var cur_pos: usize = 0;
+            var last_logits: []const f32 = undefined;
+            while (cur_pos < tokens.len) {
+                const chunk_len = @min(tokens.len - cur_pos, 512);
+                const chunk = tokens[cur_pos .. cur_pos + chunk_len];
+                last_logits = try gm.forwardBatch(self.model, chunk, cur_pos, self.kv_cache, self.buffers);
+                cur_pos += chunk_len;
+            }
+            return last_logits;
+        }
+
         var last_logits: []const f32 = undefined;
         for (tokens, 0..) |tok, pos| {
             const is_last = (pos == tokens.len - 1);
@@ -466,7 +478,6 @@ pub const Engine = struct {
                 },
             }
         }
-        std.debug.print("generateWithMediaEmbeddings: tokens.len={d}, placeholder_pos={?d}\n", .{ tokens.len, placeholder_pos });
 
         const dim = self.model.params.embedding_length;
         var last_logits: []const f32 = undefined;
@@ -475,6 +486,14 @@ pub const Engine = struct {
 
         const total_tokens_est = tokens.len + item_count + num_frames * 2 + 10;
         if (total_tokens_est > self.max_seq_len) return error.PromptExceedsContext;
+
+        if (embeddings == null) {
+            const last_l = try self.prefill(tokens);
+            return PrefillResult{
+                .logits = last_l,
+                .pos = tokens.len,
+            };
+        }
 
         for (tokens, 0..) |tok, idx| {
             if (embeddings != null and !inserted and (placeholder_pos == null or idx == placeholder_pos.?)) {
