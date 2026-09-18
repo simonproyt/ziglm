@@ -17,15 +17,12 @@ const ModelBuffers = model_mod.ModelBuffers;
 const KVCache = @import("kv_cache.zig").KVCache;
 const Sampler = @import("sampler.zig").Sampler;
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
-const Image = @import("image.zig").Image;
-const vision = @import("vision.zig");
-const VisionEncoder = vision.VisionEncoder;
-const audio = @import("audio.zig");
-const video = @import("video.zig");
 const cuda_mod = @import("cuda.zig");
 const CudaDevice = cuda_mod.CudaDevice;
+const quant = @import("quant.zig");
 const cuda_model = @import("cuda_model.zig");
 const CudaGpuModel = cuda_model.CudaGpuModel;
+const Backend = @import("backend.zig").Backend;
 
 pub const ModelFormat = enum {
     gguf,
@@ -36,7 +33,6 @@ pub const EngineOptions = struct {
     num_threads: ?usize = null,
     max_seq_len: ?usize = null,
     seed: u64 = 42,
-    mmproj_path: ?[]const u8 = null,
     use_gpu: bool = false,
 };
 
@@ -52,7 +48,6 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     format: ModelFormat,
     gguf_file: ?*GGUFFile = null,
-    mmproj_gguf_file: ?*GGUFFile = null,
     safetensors_file: ?*SafeTensorsFile = null,
     tokenizer: *Tokenizer,
     model: *TransformerModel,
@@ -60,6 +55,7 @@ pub const Engine = struct {
     buffers: *ModelBuffers,
     sampler: *Sampler,
     thread_pool: *ThreadPool,
+    backend: Backend,
     cuda_device: ?*CudaDevice = null,
     gpu_model: ?*CudaGpuModel = null,
     max_seq_len: usize,
@@ -91,33 +87,6 @@ pub const Engine = struct {
 
         const model = try TransformerModel.load(allocator, gguf_file);
         errdefer model.deinit();
-
-        // Auto-load companion multimodal projector if present
-        var mmproj_to_open: ?[]const u8 = options.mmproj_path;
-        var auto_mmproj_buf: [512]u8 = undefined;
-
-        if (mmproj_to_open == null) {
-            if (std.mem.lastIndexOfScalar(u8, model_path, '/')) |last_slash| {
-                const dir = model_path[0 .. last_slash + 1];
-                const cand1 = std.fmt.bufPrint(&auto_mmproj_buf, "{s}gemma-4-E2B-it-mmproj.gguf", .{dir}) catch null;
-                if (cand1) |cand| {
-                    if (std.posix.openat(std.posix.AT.FDCWD, cand, .{}, 0)) |fd| {
-                        _ = std.posix.system.close(fd);
-                        mmproj_to_open = cand;
-                    } else |_| {}
-                }
-            }
-        }
-
-        var mmproj_gguf_file: ?*GGUFFile = null;
-        if (mmproj_to_open) |mm_path| {
-            if (GGUFFile.open(allocator, mm_path)) |mm_gf| {
-                mmproj_gguf_file = mm_gf;
-                model.loadMMPROJ(allocator, mm_gf) catch |err| {
-                    std.debug.print("Warning: Failed to load mmproj weights: {any}\n", .{err});
-                };
-            } else |_| {}
-        }
 
         const max_seq = options.max_seq_len orelse @min(gguf_file.params.context_length, 4096);
         const max_head_size = @max(512, gguf_file.params.head_size);
@@ -158,12 +127,16 @@ pub const Engine = struct {
             }
         }
 
+        const backend = if (cuda_device) |cd|
+            Backend.initCuda(allocator, thread_pool, cd)
+        else
+            Backend.initCpu(allocator, thread_pool);
+
         const self = try allocator.create(Engine);
         self.* = .{
             .allocator = allocator,
             .format = .gguf,
             .gguf_file = gguf_file,
-            .mmproj_gguf_file = mmproj_gguf_file,
             .safetensors_file = null,
             .tokenizer = tokenizer,
             .model = model,
@@ -171,6 +144,7 @@ pub const Engine = struct {
             .buffers = buffers,
             .sampler = sampler,
             .thread_pool = thread_pool,
+            .backend = backend,
             .cuda_device = cuda_device,
             .gpu_model = gpu_model,
             .max_seq_len = max_seq,
@@ -269,12 +243,16 @@ pub const Engine = struct {
             }
         }
 
+        const backend = if (cuda_device) |cd|
+            Backend.initCuda(allocator, thread_pool, cd)
+        else
+            Backend.initCpu(allocator, thread_pool);
+
         const self = try allocator.create(Engine);
         self.* = .{
             .allocator = allocator,
             .format = .safetensors,
             .gguf_file = null,
-            .mmproj_gguf_file = null,
             .safetensors_file = st_file,
             .tokenizer = tokenizer,
             .model = model,
@@ -282,6 +260,7 @@ pub const Engine = struct {
             .buffers = buffers,
             .sampler = sampler,
             .thread_pool = thread_pool,
+            .backend = backend,
             .cuda_device = cuda_device,
             .gpu_model = gpu_model,
             .max_seq_len = max_seq,
@@ -301,7 +280,6 @@ pub const Engine = struct {
         self.model.deinit();
         self.tokenizer.deinit();
         if (self.gguf_file) |gf| gf.deinit();
-        if (self.mmproj_gguf_file) |mgf| mgf.deinit();
         if (self.safetensors_file) |sf| sf.deinit();
         self.allocator.destroy(self);
     }
@@ -334,7 +312,7 @@ pub const Engine = struct {
                 pos,
                 self.kv_cache,
                 self.buffers,
-                self.thread_pool,
+                &self.backend,
                 is_last_token,
             );
         }
@@ -350,7 +328,7 @@ pub const Engine = struct {
             while (cur_pos < tokens.len) {
                 const chunk_len = @min(tokens.len - cur_pos, 512);
                 const chunk = tokens[cur_pos .. cur_pos + chunk_len];
-                last_logits = try gm.forwardBatch(self.model, chunk, cur_pos, self.kv_cache, self.buffers);
+                last_logits = try gm.forwardBatch(self.model, chunk, null, cur_pos, self.kv_cache, self.buffers);
                 cur_pos += chunk_len;
             }
             return last_logits;
@@ -369,223 +347,36 @@ pub const Engine = struct {
         return try self.forwardTokenOrEmbedding(null, token, pos, true);
     }
 
-    pub fn encodeImage(self: *Engine, image_path: []const u8) ![]f32 {
-        var img = try Image.loadFromFile(self.allocator, image_path);
-        defer img.deinit();
-
-        if (self.model.vision_encoder) |*v_enc| {
-            return v_enc.encodeImage(self.allocator, &img, self.thread_pool);
-        } else {
-            const enc = vision.VisionEncoder.init(self.allocator, null, null, null, &[_]vision.VisionLayerWeights{});
-            return enc.encodeImage(self.allocator, &img, self.thread_pool);
+    pub fn decodeArgmax(self: *Engine, token: u32, pos: usize) !u32 {
+        if (pos >= self.max_seq_len) return error.ContextFull;
+        if (self.gpu_model) |gm| {
+            return try gm.forwardArgmax(self.model, token, pos, self.kv_cache, self.buffers, null);
         }
+        const logits = try self.decode(token, pos);
+        return self.sampler.sample(logits, &.{}, .{ .greedy = true });
     }
 
-    pub fn encodeAudio(self: *Engine, audio_path: []const u8) ![]f32 {
-        var audio_data = try audio.loadWav(self.allocator, audio_path);
-        defer audio_data.deinit(self.allocator);
-
-        var mel_gen = try audio.LogMelSpectrogram.init(self.allocator, 128, 512, 160, 16000);
-        defer mel_gen.deinit();
-
-        const spec = try mel_gen.compute(audio_data.samples);
-        defer self.allocator.free(spec);
-
-        const dim = self.model.params.embedding_length;
-        if (self.model.audio_encoder) |*ae| {
-            return try ae.encode(self.allocator, spec, self.thread_pool);
-        }
-
-        const n_frames = spec.len / 80;
-        const embeddings = try self.allocator.alloc(f32, n_frames * dim);
-        @memset(embeddings, 0.0);
-
-        for (0..n_frames) |f| {
-            const frame_spec = spec[f * 80 .. (f + 1) * 80];
-            const emb_frame = embeddings[f * dim .. (f + 1) * dim];
-            for (0..dim) |d| {
-                emb_frame[d] = frame_spec[d % 80] * 0.1;
-            }
-        }
-
-        return embeddings;
-    }
-
-    pub fn encodeVideo(self: *Engine, video_path: []const u8, max_frames: usize) !struct { embeddings: []f32, num_frames: usize } {
-        const vid = try video.Video.load(self.allocator, video_path, max_frames);
-        defer vid.deinit();
-
-        var total_embeddings: std.ArrayList(f32) = .empty;
-        errdefer total_embeddings.deinit(self.allocator);
-
-        for (vid.frames) |*frame| {
-            const frame_emb = if (self.model.vision_encoder) |*v_enc|
-                try v_enc.encodeImageWithTokens(self.allocator, &frame.image, self.thread_pool, 70)
-            else blk: {
-                const enc = vision.VisionEncoder.init(self.allocator, null, null, null, &[_]vision.VisionLayerWeights{});
-                break :blk try enc.encodeImageWithTokens(self.allocator, &frame.image, self.thread_pool, 70);
-            };
-            defer self.allocator.free(frame_emb);
-            try total_embeddings.appendSlice(self.allocator, frame_emb);
-        }
-
-        const embs = try total_embeddings.toOwnedSlice(self.allocator);
-        return .{
-            .embeddings = embs,
-            .num_frames = vid.frames.len,
-        };
-    }
-
-    pub const PrefillResult = struct {
-        logits: []const f32,
-        pos: usize,
-    };
-
-    pub fn generateWithMediaEmbeddings(
-        self: *Engine,
-        prompt: []const u8,
-        embeddings: ?[]const f32,
-        item_count: usize,
-        kind: types.MultimodalKind,
-        num_frames: usize,
-    ) !PrefillResult {
-        const tokens = try self.tokenizer.encode(self.allocator, prompt, true);
-        defer self.allocator.free(tokens);
-
+    pub fn prefillArgmax(self: *Engine, tokens: []const u32) !u32 {
         if (tokens.len == 0) return error.EmptyPrompt;
+        if (tokens.len > self.max_seq_len) return error.PromptExceedsContext;
 
-        var placeholder_pos: ?usize = null;
-        for (tokens, 0..) |tok, idx| {
-            const s = self.tokenizer.decode(tok);
-            switch (kind) {
-                .image => {
-                    if (tok == 258880 or tok == 255999 or std.mem.eql(u8, s, "<|image|>") or std.mem.eql(u8, s, "<|image>")) {
-                        placeholder_pos = idx;
-                        break;
-                    }
-                },
-                .audio => {
-                    if (tok == 258881 or tok == 256000 or std.mem.eql(u8, s, "<|audio|>") or std.mem.eql(u8, s, "<|audio>")) {
-                        placeholder_pos = idx;
-                        break;
-                    }
-                },
-                .video => {
-                    if (tok == 258884 or tok == 258880 or tok == 255999 or std.mem.eql(u8, s, "<|video|>") or std.mem.eql(u8, s, "<|image|>")) {
-                        placeholder_pos = idx;
-                        break;
-                    }
-                },
+        if (self.gpu_model) |gm| {
+            var cur_pos: usize = 0;
+            while (cur_pos < tokens.len) {
+                const chunk_len = @min(tokens.len - cur_pos, 512);
+                const chunk = tokens[cur_pos .. cur_pos + chunk_len];
+                const is_last_chunk = (cur_pos + chunk_len >= tokens.len);
+                if (is_last_chunk) {
+                    return try gm.forwardBatchArgmax(self.model, chunk, null, cur_pos, self.kv_cache, self.buffers);
+                } else {
+                    _ = try gm.forwardBatch(self.model, chunk, null, cur_pos, self.kv_cache, self.buffers);
+                }
+                cur_pos += chunk_len;
             }
         }
 
-        const dim = self.model.params.embedding_length;
-        var last_logits: []const f32 = undefined;
-        var pos: usize = 0;
-        var inserted = false;
-
-        const total_tokens_est = tokens.len + item_count + num_frames * 2 + 10;
-        if (total_tokens_est > self.max_seq_len) return error.PromptExceedsContext;
-
-        if (embeddings == null) {
-            const last_l = try self.prefill(tokens);
-            return PrefillResult{
-                .logits = last_l,
-                .pos = tokens.len,
-            };
-        }
-
-        for (tokens, 0..) |tok, idx| {
-            if (embeddings != null and !inserted and (placeholder_pos == null or idx == placeholder_pos.?)) {
-                const emb = embeddings.?;
-                switch (kind) {
-                    .image => {
-                        // 1. Beginning of Image: <|image> (255999)
-                        last_logits = try self.forwardTokenOrEmbedding(null, 255999, pos, false);
-                        pos += 1;
-
-                        // 2. Image patch embeddings (258880)
-                        for (0..item_count) |p| {
-                            const patch_emb = emb[p * dim .. (p + 1) * dim];
-                            last_logits = try self.forwardTokenOrEmbedding(patch_emb, 258880, pos, false);
-                            pos += 1;
-                        }
-
-                        // 3. End of Image: <image|> (258882)
-                        last_logits = try self.forwardTokenOrEmbedding(null, 258882, pos, false);
-                        pos += 1;
-                    },
-                    .audio => {
-                        // 1. Beginning of Audio: <|audio> (256000)
-                        last_logits = try self.forwardTokenOrEmbedding(null, 256000, pos, false);
-                        pos += 1;
-
-                        // 2. Audio frame embeddings (258881)
-                        for (0..item_count) |f| {
-                            const frame_emb = emb[f * dim .. (f + 1) * dim];
-                            last_logits = try self.forwardTokenOrEmbedding(frame_emb, 258881, pos, false);
-                            pos += 1;
-                        }
-
-                        // 3. End of Audio: <audio|> (258883)
-                        last_logits = try self.forwardTokenOrEmbedding(null, 258883, pos, false);
-                        pos += 1;
-                    },
-                    .video => {
-                        const patches_per_frame = if (num_frames > 0) item_count / num_frames else item_count;
-                        for (0..num_frames) |f_idx| {
-                            // Frame timestamp: e.g. "00:00 "
-                            const ts_min = (f_idx * 2) / 60;
-                            const ts_sec = (f_idx * 2) % 60;
-                            var ts_buf: [32]u8 = undefined;
-                            const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>2}:{d:0>2} ", .{ ts_min, ts_sec }) catch "00:00 ";
-                            const ts_toks = self.tokenizer.encode(self.allocator, ts_str, false) catch &[_]u32{};
-                            defer if (ts_toks.len > 0) self.allocator.free(ts_toks);
-                            for (ts_toks) |t_tok| {
-                                last_logits = try self.forwardTokenOrEmbedding(null, t_tok, pos, false);
-                                pos += 1;
-                            }
-
-                            // Frame start: <|image> (255999)
-                            last_logits = try self.forwardTokenOrEmbedding(null, 255999, pos, false);
-                            pos += 1;
-
-                            for (0..patches_per_frame) |p| {
-                                const p_idx = f_idx * patches_per_frame + p;
-                                if (p_idx < item_count) {
-                                    const patch_emb = emb[p_idx * dim .. (p_idx + 1) * dim];
-                                    last_logits = try self.forwardTokenOrEmbedding(patch_emb, 258884, pos, false);
-                                    pos += 1;
-                                }
-                            }
-
-                            // Frame end: <image|> (258882)
-                            last_logits = try self.forwardTokenOrEmbedding(null, 258882, pos, false);
-                            pos += 1;
-                        }
-                    },
-                }
-
-                inserted = true;
-                if (placeholder_pos != null) {
-                    continue; // Skip placeholder token
-                }
-            }
-
-            const is_last = (idx == tokens.len - 1);
-            last_logits = try self.forwardTokenOrEmbedding(
-                null,
-                tok,
-                pos,
-                is_last,
-            );
-            pos += 1;
-        }
-
-        return PrefillResult{
-            .logits = last_logits,
-            .pos = pos,
-        };
+        const logits = try self.prefill(tokens);
+        return self.sampler.sample(logits, &.{}, .{ .greedy = true });
     }
 
     pub fn generate(
@@ -595,34 +386,12 @@ pub const Engine = struct {
         callback_ctx: ?*anyopaque,
         callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
     ) !GenerationStats {
-        return self.generateWithImage(prompt, null, options, callback_ctx, callback);
-    }
-
-    pub fn generateWithImage(
-        self: *Engine,
-        prompt: []const u8,
-        image_path: ?[]const u8,
-        options: GenerationOptions,
-        callback_ctx: ?*anyopaque,
-        callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
-    ) !GenerationStats {
         var stats = GenerationStats{};
         const t_start = getTimestampNs();
 
-        var image_embeddings: ?[]f32 = null;
-        var image_patches: usize = 0;
-        if (image_path) |img_p| {
-            image_embeddings = try self.encodeImage(img_p);
-            image_patches = image_embeddings.?.len / self.model.params.embedding_length;
-        }
-        defer if (image_embeddings) |emb| self.allocator.free(emb);
-
         // 1. Tokenize prompt with turn wrapper if needed
         const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
-            (if (image_path != null)
-                try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|image|>{s}<turn|>\n<|turn>model\n", .{prompt})
-            else
-                try std.fmt.allocPrint(self.allocator, "<|turn>user\n{s}<turn|>\n<|turn>model\n", .{prompt}))
+            try std.fmt.allocPrint(self.allocator, "<|turn>user\n{s}<turn|>\n<|turn>model\n", .{prompt})
         else
             try self.allocator.dupe(u8, prompt);
         defer self.allocator.free(formatted_prompt);
@@ -630,7 +399,7 @@ pub const Engine = struct {
         const prompt_tokens = try self.tokenizer.encode(self.allocator, formatted_prompt, true);
         defer self.allocator.free(prompt_tokens);
 
-        stats.prompt_tokens = prompt_tokens.len + image_patches;
+        stats.prompt_tokens = prompt_tokens.len;
         if (stats.prompt_tokens == 0) return stats;
 
         var history: std.ArrayList(u32) = .empty;
@@ -639,10 +408,19 @@ pub const Engine = struct {
 
         self.reset();
 
+        const is_greedy = (options.sampler.greedy or options.sampler.temperature <= 0.0) and
+            (options.sampler.repetition_penalty == 1.0 and options.sampler.presence_penalty == 0.0 and options.sampler.frequency_penalty == 0.0) and
+            (self.gpu_model != null);
+
         // 2. Prefill phase
         const t_prefill_start = getTimestampNs();
-        const prefill_res = try self.generateWithMediaEmbeddings(formatted_prompt, image_embeddings, image_patches, .image, 1);
-        var logits = prefill_res.logits;
+        var prev_token: u32 = 0;
+        if (is_greedy) {
+            prev_token = try self.prefillArgmax(prompt_tokens);
+        } else {
+            const logits = try self.prefill(prompt_tokens);
+            prev_token = self.sampler.sample(logits, history.items, options.sampler);
+        }
         const t_prefill_end = getTimestampNs();
         stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
 
@@ -658,10 +436,9 @@ pub const Engine = struct {
 
         // 3. Autoregressive Generation phase
         const t_gen_start = getTimestampNs();
-        var cur_pos = prefill_res.pos;
+        var cur_pos = prompt_tokens.len;
         var completion_count: usize = 0;
 
-        var prev_token = self.sampler.sample(logits, history.items, options.sampler);
         if (self.tokenizer.isEosToken(prev_token)) {
             const t_now = getTimestampNs();
             stats.completion_tokens = 0;
@@ -685,239 +462,14 @@ pub const Engine = struct {
         }
 
         while (completion_count < options.max_tokens and cur_pos < self.max_seq_len) {
-            logits = try self.decode(prev_token, cur_pos);
+            const next_token = if (is_greedy)
+                try self.decodeArgmax(prev_token, cur_pos)
+            else blk: {
+                const logits = try self.decode(prev_token, cur_pos);
+                break :blk self.sampler.sample(logits, history.items, options.sampler);
+            };
             cur_pos += 1;
 
-            const next_token = self.sampler.sample(logits, history.items, options.sampler);
-            if (self.tokenizer.isEosToken(next_token)) break;
-
-            var is_stop = false;
-            for (options.stop_tokens) |stop_id| {
-                if (next_token == stop_id) {
-                    is_stop = true;
-                    break;
-                }
-            }
-            if (is_stop) break;
-
-            try history.append(self.allocator, next_token);
-            completion_count += 1;
-            prev_token = next_token;
-
-            if (callback) |cb| {
-                const token_str = self.tokenizer.decode(next_token);
-                if (!cb(callback_ctx, token_str, next_token)) break;
-            }
-        }
-
-        const t_gen_end = getTimestampNs();
-        stats.completion_tokens = completion_count;
-        stats.generation_time_ms = @as(f64, @floatFromInt(t_gen_end - t_gen_start)) / 1_000_000.0;
-        stats.total_time_ms = @as(f64, @floatFromInt(t_gen_end - t_start)) / 1_000_000.0;
-
-        return stats;
-    }
-
-    pub fn generateWithVideo(
-        self: *Engine,
-        prompt: []const u8,
-        video_path: ?[]const u8,
-        max_frames: usize,
-        options: GenerationOptions,
-        callback_ctx: ?*anyopaque,
-        callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
-    ) !GenerationStats {
-        if (video_path == null) return self.generate(prompt, options, callback_ctx, callback);
-
-        var stats = GenerationStats{};
-        const t_start = getTimestampNs();
-        const dim = self.model.params.embedding_length;
-
-        const vid_enc = try self.encodeVideo(video_path.?, if (max_frames > 0) max_frames else 2);
-        const video_embeddings = vid_enc.embeddings;
-        const video_patches = vid_enc.embeddings.len / dim;
-        defer self.allocator.free(video_embeddings);
-
-        const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
-            try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|video|>{s}<turn|>\n<|turn>model\n", .{prompt})
-        else
-            try self.allocator.dupe(u8, prompt);
-        defer self.allocator.free(formatted_prompt);
-
-        const prompt_tokens = try self.tokenizer.encode(self.allocator, formatted_prompt, true);
-        defer self.allocator.free(prompt_tokens);
-
-        stats.prompt_tokens = prompt_tokens.len + video_patches;
-        if (stats.prompt_tokens == 0) return stats;
-
-        var history: std.ArrayList(u32) = .empty;
-        defer history.deinit(self.allocator);
-        try history.appendSlice(self.allocator, prompt_tokens);
-
-        self.reset();
-
-        const t_prefill_start = getTimestampNs();
-        const prefill_res = try self.generateWithMediaEmbeddings(formatted_prompt, video_embeddings, video_patches, .video, vid_enc.num_frames);
-        var logits = prefill_res.logits;
-        const t_prefill_end = getTimestampNs();
-        stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
-
-        if (options.echo_prompt) {
-            if (callback) |cb| {
-                for (prompt_tokens) |tok| {
-                    const token_str = self.tokenizer.decode(tok);
-                    _ = cb(callback_ctx, token_str, tok);
-                }
-            }
-        }
-
-        const t_gen_start = getTimestampNs();
-        var cur_pos = prefill_res.pos;
-        var completion_count: usize = 0;
-
-        var prev_token = self.sampler.sample(logits, history.items, options.sampler);
-        if (self.tokenizer.isEosToken(prev_token)) {
-            const t_now = getTimestampNs();
-            stats.completion_tokens = 0;
-            stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
-            stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
-            return stats;
-        }
-
-        try history.append(self.allocator, prev_token);
-        completion_count += 1;
-
-        if (callback) |cb| {
-            const token_str = self.tokenizer.decode(prev_token);
-            if (!cb(callback_ctx, token_str, prev_token)) {
-                stats.completion_tokens = completion_count;
-                const t_now = getTimestampNs();
-                stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
-                stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
-                return stats;
-            }
-        }
-
-        while (completion_count < options.max_tokens and cur_pos < self.max_seq_len) {
-            logits = try self.decode(prev_token, cur_pos);
-            cur_pos += 1;
-
-            const next_token = self.sampler.sample(logits, history.items, options.sampler);
-            if (self.tokenizer.isEosToken(next_token)) break;
-
-            var is_stop = false;
-            for (options.stop_tokens) |stop_id| {
-                if (next_token == stop_id) {
-                    is_stop = true;
-                    break;
-                }
-            }
-            if (is_stop) break;
-
-            try history.append(self.allocator, next_token);
-            completion_count += 1;
-            prev_token = next_token;
-
-            if (callback) |cb| {
-                const token_str = self.tokenizer.decode(next_token);
-                if (!cb(callback_ctx, token_str, next_token)) break;
-            }
-        }
-
-        const t_gen_end = getTimestampNs();
-        stats.completion_tokens = completion_count;
-        stats.generation_time_ms = @as(f64, @floatFromInt(t_gen_end - t_gen_start)) / 1_000_000.0;
-        stats.total_time_ms = @as(f64, @floatFromInt(t_gen_end - t_start)) / 1_000_000.0;
-
-        return stats;
-    }
-
-    pub fn generateWithAudio(
-        self: *Engine,
-        prompt: []const u8,
-        audio_path: ?[]const u8,
-        options: GenerationOptions,
-        callback_ctx: ?*anyopaque,
-        callback: ?*const fn (ctx: ?*anyopaque, token_str: []const u8, token_id: u32) bool,
-    ) !GenerationStats {
-        if (audio_path == null) return self.generate(prompt, options, callback_ctx, callback);
-
-        var stats = GenerationStats{};
-        const t_start = getTimestampNs();
-        const dim = self.model.params.embedding_length;
-
-        const audio_embeddings = try self.encodeAudio(audio_path.?);
-        const audio_frames = audio_embeddings.len / dim;
-        defer self.allocator.free(audio_embeddings);
-
-        const formatted_prompt = if (std.mem.indexOf(u8, prompt, "<|turn>") == null and std.mem.indexOf(u8, prompt, "<start_of_turn>") == null)
-            try std.fmt.allocPrint(self.allocator, "<|turn>user\n<|audio|>{s}<turn|>\n<|turn>model\n", .{prompt})
-        else
-            try self.allocator.dupe(u8, prompt);
-        defer self.allocator.free(formatted_prompt);
-
-        const prompt_tokens = try self.tokenizer.encode(self.allocator, formatted_prompt, true);
-        defer self.allocator.free(prompt_tokens);
-
-        std.debug.print("formatted_prompt: {s}\n", .{formatted_prompt});
-        std.debug.print("prompt_tokens ({d}): {any}\n", .{ prompt_tokens.len, prompt_tokens });
-
-        stats.prompt_tokens = prompt_tokens.len + audio_frames;
-        if (stats.prompt_tokens == 0) return stats;
-
-        var history: std.ArrayList(u32) = .empty;
-        defer history.deinit(self.allocator);
-        try history.appendSlice(self.allocator, prompt_tokens);
-
-        self.reset();
-
-        const t_prefill_start = getTimestampNs();
-        const prefill_res = try self.generateWithMediaEmbeddings(formatted_prompt, audio_embeddings, audio_frames, .audio, 1);
-        var logits = prefill_res.logits;
-        const t_prefill_end = getTimestampNs();
-        stats.prefill_time_ms = @as(f64, @floatFromInt(t_prefill_end - t_prefill_start)) / 1_000_000.0;
-
-        if (options.echo_prompt) {
-            if (callback) |cb| {
-                for (prompt_tokens) |tok| {
-                    const token_str = self.tokenizer.decode(tok);
-                    _ = cb(callback_ctx, token_str, tok);
-                }
-            }
-        }
-
-        const t_gen_start = getTimestampNs();
-        var cur_pos = prefill_res.pos;
-        var completion_count: usize = 0;
-
-        var prev_token = self.sampler.sample(logits, history.items, options.sampler);
-        if (self.tokenizer.isEosToken(prev_token)) {
-            const t_now = getTimestampNs();
-            stats.completion_tokens = 0;
-            stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
-            stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
-            return stats;
-        }
-
-        try history.append(self.allocator, prev_token);
-        completion_count += 1;
-
-        if (callback) |cb| {
-            const token_str = self.tokenizer.decode(prev_token);
-            if (!cb(callback_ctx, token_str, prev_token)) {
-                stats.completion_tokens = completion_count;
-                const t_now = getTimestampNs();
-                stats.generation_time_ms = @as(f64, @floatFromInt(t_now - t_gen_start)) / 1_000_000.0;
-                stats.total_time_ms = @as(f64, @floatFromInt(t_now - t_start)) / 1_000_000.0;
-                return stats;
-            }
-        }
-
-        while (completion_count < options.max_tokens and cur_pos < self.max_seq_len) {
-            logits = try self.decode(prev_token, cur_pos);
-            cur_pos += 1;
-
-            const next_token = self.sampler.sample(logits, history.items, options.sampler);
             if (self.tokenizer.isEosToken(next_token)) break;
 
             var is_stop = false;

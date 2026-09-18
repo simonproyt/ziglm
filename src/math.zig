@@ -779,12 +779,28 @@ fn gemmRangeWorker(ctx_ptr: ?*anyopaque, start_row: usize, end_row: usize, _: us
     const rows = ctx.rows;
     const cols = ctx.cols;
 
-    for (start_row..end_row) |r| {
-        const row_start = r * row_bytes;
-        const row_data = weight_data[row_start .. row_start + row_bytes];
-        for (0..batch_size) |b| {
-            const x_slice = X[b * cols .. (b + 1) * cols];
-            Y[b * rows + r] = dotRow(qtype, row_data, x_slice, cols);
+    var temp_f32: [4096]f32 = undefined;
+    const b_chunk_size = 4;
+    var b_start: usize = 0;
+    while (b_start < batch_size) : (b_start += b_chunk_size) {
+        const b_end = @min(b_start + b_chunk_size, batch_size);
+        for (start_row..end_row) |r| {
+            const row_start = r * row_bytes;
+            const row_data = weight_data[row_start .. row_start + row_bytes];
+            
+            // Dequantize once for the chunk
+            if (qtype != .F32) {
+                quant.dequantizeRow(qtype, row_data, temp_f32[0..cols], cols);
+            }
+            
+            for (b_start..b_end) |b| {
+                const x_slice = X[b * cols .. (b + 1) * cols];
+                if (qtype == .F32) {
+                    Y[b * rows + r] = dotRow(.F32, row_data, x_slice, cols);
+                } else {
+                    Y[b * rows + r] = dotF32F32(temp_f32[0..cols], x_slice);
+                }
+            }
         }
     }
 }

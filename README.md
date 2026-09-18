@@ -3,7 +3,8 @@ curently cpu and cuda only also i only been able to test it on linux so it might
 
 #### Models tested
 - smollm2-360m
-- gemma 4 and its variants with curently only image multimodal working but sound and video might be added in the future
+- gemma 2 / gemma 4 and variants
+- llama 3 / mistral / qwen
 
 ## System requirements 
 
@@ -54,41 +55,19 @@ flowchart TD
         GGUF_LOAD --> TP_INIT["ThreadPool Initialization<br/>• N worker threads pinned to CPU cores<br/>• Lock-free work distribution"]
     end
 
-    %% Multimodal Input Processing (CPU)
-    subgraph Inputs ["3. Multimodal Preprocessing and Tower Encoders"]
+    %% Text Input & Tokenization
+    subgraph Inputs ["3. Text Input & Tokenization (tokenizer.zig)"]
         direction TB
-        TEXT_IN["Prompt Text"] --> TOKENIZER["BPE / SentencePiece Tokenizer<br/>Token ID Lookup (tokenizer.zig)"]
-        
-        IMAGE_IN["Image File (PNG/JPG/PPM)"] --> IMG_PROC["Image Rescaling [-1, 1]<br/>16x16 Patch Extraction (image.zig)"]
-        IMG_PROC --> VIT["16-Layer Vision Transformer<br/>• Patch Proj + 2D Pos Embedding<br/>• Self-Attention + GeGLU<br/>• RMSNorm + mm.input_projection<br/>• 280 Soft Tokens (vision.zig)"]
-
-        VIDEO_IN["Video File (MP4/MKV)"] --> VID_PROC["Frame Extraction and Sampling (video.zig)"]
-        VID_PROC --> VID_VIT["Per-Frame Vision Pooling<br/>• 70 Soft Tokens per Frame<br/>• Wrapped with &lt;|video|&gt; + Timestamps"]
-
-        AUDIO_IN["Audio WAV (16kHz Mono)"] --> AUDIO_STFT["Log-Mel Spectrogram (audio.zig)<br/>• 320-pt Hann Window (20ms)<br/>• 512-pt Real FFT + 128 Mel Bins<br/>• Natural Log ln(max(E, 0.001))"]
-        AUDIO_STFT --> AUDIO_USM["12-Layer Audio Conformer (audio.zig)<br/>• 2x Conv2D Subsampling (4x temporal reduction)<br/>• Macaron FFNs (0.5 residual weight)<br/>• Relative Attention + Sinusoidal Embeddings<br/>• Causal 1D Depthwise Separable Conv (k=5)<br/>• a.pre_encode.out + RMSNorm + mm.a.input_projection"]
+        TEXT_IN["Prompt Text"] --> TOKENIZER["BPE / SentencePiece Tokenizer<br/>Token ID Lookup"]
+        TOKENIZER --> EMBED_LOOKUP["GPU Batched Embedding Lookup<br/>(or CPU SIMD dequantization fallback)"]
     end
 
-    %% Prefill & Per-Layer Embeddings
-    subgraph Prefill ["4. Prefill Sequence Dispatcher (engine.zig / model.zig)"]
+    %% Transformer Layer Pipeline
+    subgraph Transformer ["4. Transformer Decoder Stack (model.zig / cuda_model.zig)"]
         direction TB
-        TOKENIZER --> DISPATCH["Prefill Sequence Dispatcher"]
-        VIT --> DISPATCH
-        VID_VIT --> DISPATCH
-        AUDIO_USM --> DISPATCH
+        EMBED_LOOKUP --> LAYER_LOOP["Iterate Layers 0..N-1"]
 
-        DISPATCH --> PLE_GATE{"Is Multimodal Token?<br/>custom_embedding != null"}
-        PLE_GATE -- "Yes (Vision/Audio/Video)" --> PLE_MM["Multimodal PLE Path<br/>• Context Projection ONLY<br/>• No Token ID Identity Lookup"]
-        PLE_GATE -- "No (Text Token)" --> PLE_TXT["Text PLE Path<br/>• (Token Identity + Context Proj) * 1/sqrt(2)"]
-    end
-
-    %% Transformer Layer CPU Pipeline
-    subgraph Transformer ["5. Transformer Decoder Stack (model.zig)"]
-        direction TB
-        PLE_MM --> LAYER_LOOP["Iterate Layers 0..N-1"]
-        PLE_TXT --> LAYER_LOOP
-
-        LAYER_LOOP --> ATTN_NORM["Input RMSNorm<br/>math.rmsNorm()"]
+        LAYER_LOOP --> ATTN_NORM["Input RMSNorm<br/>backend.rmsNorm()"]
         
         ATTN_NORM --> QKV_PROJ["Parallel Q / K / V GEMV Projections<br/>• Q = x @ W_q (wq.type: Q4_0 / Q8_0 / BF16)<br/>• K = x @ W_k<br/>• V = x @ W_v"]
         
@@ -149,9 +128,8 @@ flowchart TD
 the current cuda backend is kinda experimental so i havent done a lot of benchmarking stuff yet so its probably unoptimized and i need to work on it
 
 # Dependencies 
-- a zig complier (if you want to compile everything from source)
-- imagemagick/convert/ffmpeg for image converion for multimodal models
-- nvcc for compiling the cuda kernels
+- a zig compiler (if you want to compile everything from source)
+- nvcc / CUDA toolkit (for compiling CUDA GPU acceleration kernels)
 
 
 more coming soontm

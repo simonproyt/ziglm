@@ -11,13 +11,13 @@ const GGUFFile = @import("gguf.zig").GGUFFile;
 pub fn printUsage() void {
     std.debug.print(
         \\
-        \\  ⚡ ziglm - High-Performance LLM & Multimodal Inference Engine in Pure Zig ⚡
+        \\  ⚡ ziglm - High-Performance LLM Inference Engine in Pure Zig ⚡
         \\
         \\  USAGE:
         \\    ziglm <subcommand> [options]
         \\
         \\  SUBCOMMANDS:
-        \\    run          Run one-shot prompt inference (text, vision, video, audio)
+        \\    run          Run one-shot prompt text inference
         \\    chat         Start interactive multi-turn chat session
         \\    serve        Start OpenAI-compatible HTTP REST API server
         \\    bench        Run performance and throughput benchmark
@@ -41,13 +41,6 @@ pub fn printUsage() void {
         \\        --min-p <float>     Min-P sampling (default: 0.05)
         \\        --seed <int>        Random seed for reproducibility (default: 42)
         \\
-        \\  MULTIMODAL (A/V) OPTIONS:
-        \\        --image <path>      Path to input image (PNG, JPG, BMP, PPM) for vision
-        \\        --video <path>      Path to input video (MP4, MKV, frames) for video reasoning
-        \\        --audio <path>      Path to input audio (WAV 16kHz) for speech/audio transcription
-        \\        --max-frames <int>  Max video frames to sample (default: 32)
-        \\        --mmproj <path>     Path to external multimodal projector (mmproj.gguf)
-        \\
         \\  HARDWARE & ACCELERATION OPTIONS:
         \\        --gpu, --cuda       Enable NVIDIA CUDA GPU acceleration
         \\        --device <string>   Compute device: cpu, cuda, auto (default: auto)
@@ -60,15 +53,6 @@ pub fn printUsage() void {
         \\  EXAMPLES:
         \\    # Text generation
         \\    ziglm run -m model.gguf -p "Explain quantum computing in simple terms."
-        \\
-        \\    # Image understanding
-        \\    ziglm run -m model.gguf --image photo.jpg -p "Describe what is in this image."
-        \\
-        \\    # Video understanding
-        \\    ziglm run -m model.gguf --video clip.mp4 --max-frames 8 -p "Summarize the actions in this video."
-        \\
-        \\    # Audio speech transcription & reasoning
-        \\    ziglm run -m model.gguf --audio voice.wav -p "Transcribe the audio clip."
         \\
         \\    # Interactive chat session
         \\    ziglm chat -m model.gguf --system "You are a helpful coding assistant."
@@ -91,12 +75,7 @@ pub const CliArgs = struct {
     min_p: f32 = 0.05,
     max_tokens: usize = 256,
     max_seq_len: usize = 4096,
-    max_frames: usize = 32,
     threads: ?usize = null,
-    image_path: ?[]const u8 = null,
-    video_path: ?[]const u8 = null,
-    audio_path: ?[]const u8 = null,
-    mmproj_path: ?[]const u8 = null,
     use_gpu: bool = false,
     device: []const u8 = "auto",
     port: u16 = 8080,
@@ -140,8 +119,6 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
             if (arg_it.next()) |v| args.threads = std.fmt.parseInt(usize, v, 10) catch null;
         } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
             if (arg_it.next()) |v| args.max_seq_len = std.fmt.parseInt(usize, v, 10) catch 4096;
-        } else if (std.mem.eql(u8, arg, "--max-frames")) {
-            if (arg_it.next()) |v| args.max_frames = std.fmt.parseInt(usize, v, 10) catch 32;
         } else if (std.mem.eql(u8, arg, "--echo-prompt")) {
             args.echo_prompt = true;
         } else if (std.mem.eql(u8, arg, "--greedy")) {
@@ -155,14 +132,6 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
                     args.use_gpu = true;
                 }
             }
-        } else if (std.mem.eql(u8, arg, "--image")) {
-            args.image_path = arg_it.next();
-        } else if (std.mem.eql(u8, arg, "--video")) {
-            args.video_path = arg_it.next();
-        } else if (std.mem.eql(u8, arg, "--audio")) {
-            args.audio_path = arg_it.next();
-        } else if (std.mem.eql(u8, arg, "--mmproj")) {
-            args.mmproj_path = arg_it.next();
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (arg_it.next()) |v| args.port = std.fmt.parseInt(u16, v, 10) catch 8080;
         } else if (std.mem.eql(u8, arg, "--seed")) {
@@ -303,22 +272,14 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         std.debug.print("  RoPE Base Freq:      {d:.1}\n", .{gguf_file.params.rope_freq_base});
 
         std.debug.print("\n=== Tensors ({d} total) ===\n", .{gguf_file.tensors.len});
-        var a_count: usize = 0;
-        var v_count: usize = 0;
         var l_count: usize = 0;
         for (gguf_file.tensors) |t| {
             if (std.mem.indexOf(u8, t.name, "blk") == null) {
                 std.debug.print("  [GLOBAL] {s:<42} {s:<8} (id={d}) [{d}, {d}] ({d} bytes)\n", .{ t.name, t.type.name(), @intFromEnum(t.type), t.shape[0], t.shape[1], t.sizeBytes() });
             }
-            if (std.mem.startsWith(u8, t.name, "a.")) {
-                a_count += 1;
-            } else if (std.mem.startsWith(u8, t.name, "v.") or std.mem.startsWith(u8, t.name, "mm.") or std.mem.startsWith(u8, t.name, "patch_embd")) {
-                v_count += 1;
-            } else {
-                l_count += 1;
-            }
+            l_count += 1;
         }
-        std.debug.print("\nSummary: {d} Audio tensors, {d} Vision tensors, {d} Language tensors\n", .{ a_count, v_count, l_count });
+        std.debug.print("\nSummary: {d} Language tensors\n", .{l_count});
         if (gguf_file.tensors.len > 15) {
             std.debug.print("  ... and {d} more tensors\n", .{gguf_file.tensors.len - 15});
         }
@@ -331,7 +292,6 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
-            .mmproj_path = args.mmproj_path,
             .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
@@ -351,19 +311,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
 
         const clean_prompt = unescapePrompt(allocator, args.prompt);
 
-        var stats: types.GenerationStats = undefined;
-        if (args.video_path) |vid| {
-            std.debug.print("Processing multimodal video: {s} (max_frames: {d}) ...\n", .{ vid, args.max_frames });
-            stats = try engine.generateWithVideo(clean_prompt, vid, args.max_frames, options, null, printTokenStdout);
-        } else if (args.audio_path) |aud| {
-            std.debug.print("Processing multimodal audio: {s} ...\n", .{aud});
-            stats = try engine.generateWithAudio(clean_prompt, aud, options, null, printTokenStdout);
-        } else {
-            if (args.image_path) |img| {
-                std.debug.print("Processing multimodal image: {s} ...\n", .{img});
-            }
-            stats = try engine.generateWithImage(clean_prompt, args.image_path, options, null, printTokenStdout);
-        }
+        const stats = try engine.generate(clean_prompt, options, null, printTokenStdout);
 
         std.debug.print("\n\n────────────────────────────────────────\n", .{});
         std.debug.print("⚡ Prefill:    {d:.1} tok/s ({d} tokens in {d:.1} ms)\n", .{
@@ -386,7 +334,6 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
-            .mmproj_path = args.mmproj_path,
             .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
@@ -472,7 +419,6 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
-            .mmproj_path = args.mmproj_path,
             .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
@@ -490,14 +436,13 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         var engine = try Engine.load(allocator, model_path, .{
             .num_threads = args.threads,
             .seed = args.seed,
-            .mmproj_path = args.mmproj_path,
             .use_gpu = args.use_gpu,
         });
         defer engine.deinit();
 
         const bench_prompt = "The quick brown fox jumps over the lazy dog and explores the universe with fast mathematical computations";
         const options = GenerationOptions{
-            .max_tokens = 32,
+            .max_tokens = args.max_tokens,
             .sampler = .{ .greedy = true },
         };
 

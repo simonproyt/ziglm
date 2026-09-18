@@ -13,10 +13,6 @@ pub const engine = @import("engine.zig");
 pub const server = @import("server.zig");
 pub const synthetic = @import("synthetic.zig");
 pub const cli = @import("cli.zig");
-pub const image = @import("image.zig");
-pub const vision = @import("vision.zig");
-pub const audio = @import("audio.zig");
-pub const video = @import("video.zig");
 pub const backend = @import("backend.zig");
 pub const cuda = @import("cuda.zig");
 pub const cuda_model = @import("cuda_model.zig");
@@ -35,11 +31,6 @@ pub const Server = server.Server;
 pub const GGMLType = types.GGMLType;
 pub const GenerationOptions = types.GenerationOptions;
 pub const GenerationStats = types.GenerationStats;
-pub const Image = image.Image;
-pub const VisionEncoder = vision.VisionEncoder;
-pub const AudioData = audio.AudioData;
-pub const LogMelSpectrogram = audio.LogMelSpectrogram;
-pub const Video = video.Video;
 pub const Backend = backend.Backend;
 pub const CudaDevice = cuda.CudaDevice;
 
@@ -57,10 +48,7 @@ test {
     _ = server;
     _ = synthetic;
     _ = cli;
-    _ = image;
-    _ = vision;
-    _ = audio;
-    _ = video;
     _ = backend;
     _ = cuda;
 }
+

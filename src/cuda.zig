@@ -29,9 +29,11 @@ pub extern "c" fn cuda_gemm_q4_0(weights: ?*const anyopaque, x: [*]const f32, y:
 pub extern "c" fn cuda_gemm(qtype: c_int, weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, batch_size: c_int, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 
 pub extern "c" fn cuda_embed_lookup(emb_weights: ?*const anyopaque, qtype: c_int, token_id: c_int, out: [*]f32, dim: c_int, scale: f32, stream: CudaStream_t) void;
+pub extern "c" fn cuda_embed_lookup_batch(emb_weights: ?*const anyopaque, qtype: c_int, token_ids: [*]const c_int, out: [*]f32, n_tokens: c_int, dim: c_int, scale: f32, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rmsnorm(x: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rmsnorm_batched(x: [*]f32, weight: ?[*]const f32, out: [*]f32, head_dim: c_int, count: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_add_rmsnorm(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_add_rmsnorm_batched(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, batch_size: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rope(q: ?[*]f32, k: ?[*]f32, pos: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rope_batched(q: ?[*]f32, k: ?[*]f32, pos: c_int, batch_size: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
 
@@ -123,6 +125,13 @@ pub extern "c" fn cuda_ple_ctx_fuse(
     stream: CudaStream_t,
 ) void;
 
+pub extern "c" fn cuda_argmax(
+    logits: [*]const f32,
+    n: c_int,
+    out_idx: [*]c_uint,
+    stream: CudaStream_t,
+) void;
+
 // ============================================================================
 // High-Level Zig Wrappers
 // ============================================================================
@@ -138,11 +147,25 @@ pub const CudaBuffer = struct {
         if (err != 0) return error.CudaMemcpyFailed;
     }
 
+    pub fn copyFrom(self: *const CudaBuffer, other: CudaBuffer, copy_len: usize, stream: CudaStream_t) !void {
+        if (copy_len == 0) return;
+        const err = cuda_memcpy_d2d(self.ptr, other.ptr, copy_len, stream);
+        if (err != 0) return error.CudaMemcpyFailed;
+    }
+
     pub fn download(self: *const CudaBuffer, host_dst: []u8, stream: CudaStream_t) !void {
         const copy_len = @min(self.size_bytes, host_dst.len);
         if (copy_len == 0) return;
         const err = cuda_memcpy_d2h(host_dst.ptr, self.ptr, copy_len, stream);
         if (err != 0) return error.CudaMemcpyFailed;
+    }
+
+    pub inline fn asF32(self: *const CudaBuffer) [*]f32 {
+        return @ptrCast(@alignCast(self.ptr.?));
+    }
+
+    pub inline fn asConstF32(self: *const CudaBuffer) [*]const f32 {
+        return @ptrCast(@alignCast(self.ptr.?));
     }
 
     pub fn deinit(self: *CudaBuffer) void {
@@ -267,6 +290,19 @@ pub const CudaDevice = struct {
         cuda_embed_lookup(d_weights, @intCast(@intFromEnum(qtype)), @intCast(token_id), d_out, @intCast(dim), scale_factor, self.stream);
     }
 
+    pub fn embedLookupBatch(
+        self: *const CudaDevice,
+        d_weights: ?*const anyopaque,
+        qtype: GGMLType,
+        d_token_ids: [*]const c_int,
+        d_out: [*]f32,
+        n_tokens: usize,
+        dim: usize,
+        scale_factor: f32,
+    ) void {
+        cuda_embed_lookup_batch(d_weights, @intCast(@intFromEnum(qtype)), d_token_ids, d_out, @intCast(n_tokens), @intCast(dim), scale_factor, self.stream);
+    }
+
     pub fn rmsNorm(
         self: *const CudaDevice,
         d_x: [*]const f32,
@@ -304,6 +340,21 @@ pub const CudaDevice = struct {
     ) void {
         cuda_add_rmsnorm(d_x, d_residual, d_weight, d_out, @intCast(n), eps, if (use_unit_offset) 1 else 0, self.stream);
     }
+
+    pub fn addRmsNormBatched(
+        self: *const CudaDevice,
+        d_x: [*]f32,
+        d_residual: [*]const f32,
+        d_weight: ?[*]const f32,
+        d_out: [*]f32,
+        n: usize,
+        batch_size: usize,
+        eps: f32,
+        use_unit_offset: bool,
+    ) void {
+        cuda_add_rmsnorm_batched(d_x, d_residual, d_weight, d_out, @intCast(n), @intCast(batch_size), eps, if (use_unit_offset) 1 else 0, self.stream);
+    }
+
 
     pub fn rope(
         self: *const CudaDevice,
@@ -522,4 +573,14 @@ pub const CudaDevice = struct {
     ) void {
         cuda_tanh_softcap(d_x, cap, @intCast(n), self.stream);
     }
+
+    pub fn argmax(
+        self: *const CudaDevice,
+        d_logits: [*]const f32,
+        n: usize,
+        d_out_idx: [*]c_uint,
+    ) void {
+        cuda_argmax(d_logits, @intCast(n), d_out_idx, self.stream);
+    }
 };
+

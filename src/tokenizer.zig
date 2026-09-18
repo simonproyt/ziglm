@@ -352,15 +352,6 @@ pub const Tokenizer = struct {
             "<tool_call|>",
             "<|tool_response>",
             "<tool_response|>",
-            "<|image|>",
-            "<|image>",
-            "<image|>",
-            "<|audio|>",
-            "<|audio>",
-            "<audio|>",
-            "<|video|>",
-            "<|video>",
-            "<video|>",
         };
 
         var text_idx: usize = 0;

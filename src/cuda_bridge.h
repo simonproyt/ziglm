@@ -38,9 +38,11 @@ void cuda_gemm(int qtype, const void* weights, const float* x, float* y, int bat
 
 // Normalization & Embeddings
 void cuda_embed_lookup(const void* emb_weights, int qtype, int token_id, float* out, int dim, float scale, CudaStream_t stream);
+void cuda_embed_lookup_batch(const void* emb_weights, int qtype, const int* token_ids, float* out, int n_tokens, int dim, float scale, CudaStream_t stream);
 void cuda_rmsnorm(const float* x, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_rmsnorm_batched(float* x, const float* weight, float* out, int head_dim, int count, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_add_rmsnorm(float* x, const float* residual, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
+void cuda_add_rmsnorm_batched(float* x, const float* residual, const float* weight, float* out, int n, int batch_size, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
 void cuda_rope_batched(float* q, float* k, int pos, int batch_size, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
 
@@ -123,6 +125,10 @@ void cuda_attention_batched(
 void cuda_ple_gate_gelu(const float* ple_gate_in, const float* ple_slice, float* ple_buf_out, int ple_dim, CudaStream_t stream);
 void cuda_ple_ctx_fuse(float* ctx_ple_buf, const float* ctx_scratch, int n, int add_token_embd, CudaStream_t stream);
 
+// Argmax Reduction
+void cuda_argmax(const float* logits, int n, unsigned int* out_idx, CudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
+

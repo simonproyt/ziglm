@@ -5,6 +5,8 @@ const RoPEType = types.RoPEType;
 const math = @import("math.zig");
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const KVCache = @import("kv_cache.zig").KVCache;
+const cuda = @import("cuda.zig");
+const CudaDevice = cuda.CudaDevice;
 
 pub const DeviceType = enum {
     cpu,
@@ -15,12 +17,23 @@ pub const DeviceType = enum {
 pub const Backend = struct {
     device_type: DeviceType = .cpu,
     thread_pool: ?*ThreadPool = null,
+    cuda_device: ?*CudaDevice = null,
     allocator: std.mem.Allocator,
 
     pub fn initCpu(allocator: std.mem.Allocator, thread_pool: ?*ThreadPool) Backend {
         return .{
             .device_type = .cpu,
             .thread_pool = thread_pool,
+            .cuda_device = null,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn initCuda(allocator: std.mem.Allocator, thread_pool: ?*ThreadPool, cuda_device: ?*CudaDevice) Backend {
+        return .{
+            .device_type = if (cuda_device != null) .cuda else .cpu,
+            .thread_pool = thread_pool,
+            .cuda_device = cuda_device,
             .allocator = allocator,
         };
     }

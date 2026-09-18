@@ -10,10 +10,7 @@ const KVCache = @import("kv_cache.zig").KVCache;
 const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const math = @import("math.zig");
 const quant = @import("quant.zig");
-const vision = @import("vision.zig");
-const audio = @import("audio.zig");
-const VisionEncoder = vision.VisionEncoder;
-const VisionLayerWeights = vision.VisionLayerWeights;
+const Backend = @import("backend.zig").Backend;
 
 pub const LayerWeights = struct {
     // Layernorms
@@ -129,8 +126,6 @@ pub const TransformerModel = struct {
     output_norm: []const f32,
     output: ?Tensor = null,
     layers: []LayerWeights,
-    audio_encoder: ?audio.AudioEncoder = null,
-    vision_encoder: ?VisionEncoder = null,
 
     fn loadNorm(allocator: std.mem.Allocator, t_opt: ?Tensor, len: usize) !?[]const f32 {
         if (t_opt) |t| {
@@ -156,25 +151,6 @@ pub const TransformerModel = struct {
             }
         }
         return 1.0;
-    }
-
-    fn loadClipBounds(st: anytype, prefix: []const u8) ?audio.ClipBounds {
-        var buf: [256]u8 = undefined;
-        const in_min_name = std.fmt.bufPrint(&buf, "{s}.input_min", .{prefix}) catch return null;
-        const t_in_min = st.getTensor(in_min_name) orelse return null;
-        var bounds = audio.ClipBounds{};
-        bounds.in_min = loadScalar(t_in_min);
-
-        const in_max_name = std.fmt.bufPrint(&buf, "{s}.input_max", .{prefix}) catch return null;
-        if (st.getTensor(in_max_name)) |t| bounds.in_max = loadScalar(t);
-
-        const out_min_name = std.fmt.bufPrint(&buf, "{s}.output_min", .{prefix}) catch return null;
-        if (st.getTensor(out_min_name)) |t| bounds.out_min = loadScalar(t);
-
-        const out_max_name = std.fmt.bufPrint(&buf, "{s}.output_max", .{prefix}) catch return null;
-        if (st.getTensor(out_max_name)) |t| bounds.out_max = loadScalar(t);
-
-        return bounds;
     }
 
     pub fn load(allocator: std.mem.Allocator, gguf: *const GGUFFile) !*TransformerModel {
@@ -320,146 +296,7 @@ pub const TransformerModel = struct {
             self.layers[i] = layer;
         }
 
-        const patch_proj = gguf.getTensor("v.patch_embedder.input_proj.weight") orelse gguf.getTensor("vision.patch_embedder.input_proj.weight");
-        const pos_emb = gguf.getTensor("v.patch_embedder.position_embedding_table") orelse gguf.getTensor("vision.patch_embedder.position_embedding_table");
-        const emb_proj = gguf.getTensor("v.embedding_projection.weight") orelse gguf.getTensor("vision.embedding_projection.weight");
-
-        self.vision_encoder = if (patch_proj != null or emb_proj != null)
-            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj, &[_]vision.VisionLayerWeights{})
-        else
-            null;
-
         return self;
-    }
-
-    pub fn loadMMPROJ(self: *TransformerModel, allocator: std.mem.Allocator, gguf: *const GGUFFile) !void {
-        const patch_proj = gguf.getTensor("v.patch_embedder.input_proj.weight") orelse
-            gguf.getTensor("v.patch_embd.weight") orelse
-            gguf.getTensor("mm.patch_embd.weight");
-
-        const pos_emb = gguf.getTensor("v.position_embd.weight") orelse
-            gguf.getTensor("v.patch_embedder.position_embedding_table") orelse
-            gguf.getTensor("v.position_embedding_table");
-
-        const emb_proj = gguf.getTensor("mm.input_projection.weight") orelse
-            gguf.getTensor("v.embedding_projection.weight") orelse
-            gguf.getTensor("mm.0.weight");
-
-        var vision_layers: std.ArrayList(vision.VisionLayerWeights) = .empty;
-        errdefer vision_layers.deinit(allocator);
-
-        for (0..32) |l_idx| {
-            var buf: [128]u8 = undefined;
-            const q_name = std.fmt.bufPrint(&buf, "v.blk.{d}.attn_q.weight", .{l_idx}) catch break;
-            const q_proj = gguf.getTensor(q_name);
-            if (q_proj == null) break;
-
-            var layer = vision.VisionLayerWeights{};
-            layer.q_proj = q_proj;
-
-            var name_buf: [128]u8 = undefined;
-            layer.input_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ln1.weight", .{l_idx})), 768);
-            layer.post_attention_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ln2.weight", .{l_idx})), 768);
-            layer.q_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_q.weight", .{l_idx}));
-            layer.k_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_k.weight", .{l_idx}));
-            layer.v_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_v.weight", .{l_idx}));
-            layer.o_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_out.weight", .{l_idx}));
-            layer.gate_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_gate.weight", .{l_idx}));
-            layer.up_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_up.weight", .{l_idx}));
-            layer.down_proj = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_down.weight", .{l_idx}));
-            layer.q_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_q_norm.weight", .{l_idx})), 72);
-            layer.k_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.attn_k_norm.weight", .{l_idx})), 72);
-            layer.pre_feedforward_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_pre_norm.weight", .{l_idx})), 768);
-            layer.post_feedforward_layernorm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "v.blk.{d}.ffn_post_norm.weight", .{l_idx})), 768);
-
-            try vision_layers.append(allocator, layer);
-        }
-
-        const v_layers_slice = vision_layers.toOwnedSlice(allocator) catch |e| {
-            vision_layers.deinit(allocator);
-            return e;
-        };
-
-        if (patch_proj != null) {
-            self.vision_encoder = vision.VisionEncoder.init(
-                allocator,
-                patch_proj,
-                pos_emb,
-                emb_proj,
-                v_layers_slice,
-            );
-        }
-
-        const a_conv0_w = gguf.getTensor("a.conv1d.0.weight");
-        const a_conv0_n = try loadNorm(allocator, gguf.getTensor("a.conv1d.0.norm.weight"), 128);
-        const a_conv1_w = gguf.getTensor("a.conv1d.1.weight");
-        const a_conv1_n = try loadNorm(allocator, gguf.getTensor("a.conv1d.1.norm.weight"), 32);
-        const a_inp_proj = gguf.getTensor("a.input_projection.weight");
-        const a_pre_out = gguf.getTensor("a.pre_encode.out.weight");
-        const a_pre_bias = try loadNorm(allocator, gguf.getTensor("a.pre_encode.out.bias"), 1536);
-        const a_mm_proj = gguf.getTensor("mm.a.input_projection.weight");
-
-        var audio_layers: std.ArrayList(audio.AudioLayerWeights) = .empty;
-        errdefer audio_layers.deinit(allocator);
-
-        for (0..32) |l_idx| {
-            var buf: [128]u8 = undefined;
-            const q_name = std.fmt.bufPrint(&buf, "a.blk.{d}.attn_q.weight", .{l_idx}) catch break;
-            const q_proj = gguf.getTensor(q_name);
-            if (q_proj == null) break;
-
-            var layer = audio.AudioLayerWeights{};
-            layer.attn_q = q_proj;
-
-            var name_buf: [128]u8 = undefined;
-            layer.ffn_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_norm.weight", .{l_idx})), 1024);
-            layer.ffn_up = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_up.weight", .{l_idx}));
-            layer.ffn_down = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_down.weight", .{l_idx}));
-            layer.ffn_post_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_post_norm.weight", .{l_idx})), 1024);
-
-            layer.attn_pre_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_pre_norm.weight", .{l_idx})), 1024);
-            layer.attn_k = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_k.weight", .{l_idx}));
-            layer.attn_v = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_v.weight", .{l_idx}));
-            layer.attn_k_rel = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_k_rel.weight", .{l_idx}));
-            layer.per_dim_scale = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.per_dim_scale.weight", .{l_idx})), 128);
-            layer.attn_out = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_out.weight", .{l_idx}));
-            layer.attn_post_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.attn_post_norm.weight", .{l_idx})), 1024);
-
-            layer.norm_conv = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.norm_conv.weight", .{l_idx})), 1024);
-            layer.conv_pw1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_pw1.weight", .{l_idx}));
-            layer.conv_dw = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_dw.weight", .{l_idx}));
-            layer.conv_norm = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_norm.weight", .{l_idx})), 1024);
-            layer.conv_pw2 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.conv_pw2.weight", .{l_idx}));
-
-            layer.ffn_norm_1 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_norm_1.weight", .{l_idx})), 1024);
-            layer.ffn_up_1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_up_1.weight", .{l_idx}));
-            layer.ffn_down_1 = gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_down_1.weight", .{l_idx}));
-            layer.ffn_post_norm_1 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ffn_post_norm_1.weight", .{l_idx})), 1024);
-
-            layer.ln2 = try loadNorm(allocator, gguf.getTensor(try std.fmt.bufPrint(&name_buf, "a.blk.{d}.ln2.weight", .{l_idx})), 1024);
-
-            try audio_layers.append(allocator, layer);
-        }
-
-        const a_layers_slice = audio_layers.toOwnedSlice(allocator) catch |e| {
-            audio_layers.deinit(allocator);
-            return e;
-        };
-
-        if (a_conv0_w != null) {
-            self.audio_encoder = audio.AudioEncoder.init(
-                allocator,
-                a_conv0_w,
-                a_conv0_n,
-                a_conv1_w,
-                a_conv1_n,
-                a_inp_proj,
-                a_pre_out,
-                a_pre_bias,
-                a_mm_proj,
-                a_layers_slice,
-            );
-        }
     }
 
     pub fn loadFromSafeTensors(allocator: std.mem.Allocator, params: ModelParams, st: *const SafeTensorsFile) !*TransformerModel {
@@ -594,194 +431,10 @@ pub const TransformerModel = struct {
             self.layers[i] = layer;
         }
 
-        const patch_proj = st.getTensor("model.vision_tower.patch_embedder.input_proj.weight") orelse st.getTensor("vision_tower.patch_embedder.input_proj.weight");
-        const pos_emb = st.getTensor("model.vision_tower.patch_embedder.position_embedding_table") orelse st.getTensor("vision_tower.patch_embedder.position_embedding_table");
-        const emb_proj = st.getTensor("model.embed_vision.embedding_projection.weight") orelse st.getTensor("embed_vision.embedding_projection.weight");
-
-        // Load 16 Vision Transformer layers from SafeTensors
-        var vision_layers = std.ArrayList(vision.VisionLayerWeights).empty;
-        for (0..16) |l_idx| {
-            var v_name: [128]u8 = undefined;
-            const q_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.q_proj.linear.weight", .{l_idx}) catch break;
-            const q_proj = st.getTensor(q_proj_name) orelse break;
-
-            const in_ln_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.input_layernorm.weight", .{l_idx}) catch break;
-            const post_attn_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.post_attention_layernorm.weight", .{l_idx}) catch break;
-            const pre_ffn_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.pre_feedforward_layernorm.weight", .{l_idx}) catch break;
-            const post_ffn_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.post_feedforward_layernorm.weight", .{l_idx}) catch break;
-
-            const k_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.k_proj.linear.weight", .{l_idx}) catch break;
-            const v_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.v_proj.linear.weight", .{l_idx}) catch break;
-            const o_proj_name = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.o_proj.linear.weight", .{l_idx}) catch break;
-
-            const q_norm_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.q_norm.weight", .{l_idx}) catch break;
-            const k_norm_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.self_attn.k_norm.weight", .{l_idx}) catch break;
-
-            const gate_proj_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.mlp.gate_proj.linear.weight", .{l_idx}) catch break;
-            const up_proj_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.mlp.up_proj.linear.weight", .{l_idx}) catch break;
-            const down_proj_n = std.fmt.bufPrint(&v_name, "model.vision_tower.encoder.layers.{d}.mlp.down_proj.linear.weight", .{l_idx}) catch break;
-
-            try vision_layers.append(allocator, .{
-                .input_layernorm = try loadNorm(allocator, st.getTensor(in_ln_name), 768),
-                .post_attention_layernorm = try loadNorm(allocator, st.getTensor(post_attn_name), 768),
-                .pre_feedforward_layernorm = try loadNorm(allocator, st.getTensor(pre_ffn_name), 768),
-                .post_feedforward_layernorm = try loadNorm(allocator, st.getTensor(post_ffn_name), 768),
-                .q_proj = q_proj,
-                .k_proj = st.getTensor(k_proj_name),
-                .v_proj = st.getTensor(v_proj_name),
-                .o_proj = st.getTensor(o_proj_name),
-                .q_norm = try loadNorm(allocator, st.getTensor(q_norm_n), 64),
-                .k_norm = try loadNorm(allocator, st.getTensor(k_norm_n), 64),
-                .gate_proj = st.getTensor(gate_proj_n),
-                .up_proj = st.getTensor(up_proj_n),
-                .down_proj = st.getTensor(down_proj_n),
-            });
-        }
-        const v_layers_slice = try vision_layers.toOwnedSlice(allocator);
-        if (v_layers_slice.len > 0) {
-            std.debug.print("  Loaded {d} Vision Transformer layers from SafeTensors\n", .{v_layers_slice.len});
-        }
-
-        self.vision_encoder = if (patch_proj != null or emb_proj != null or v_layers_slice.len > 0)
-            VisionEncoder.init(allocator, patch_proj, pos_emb, emb_proj, v_layers_slice)
-        else
-            null;
-
-        // Load Audio Encoder from SafeTensors (Gemma 4 Conformer audio tower)
-        const a_conv0_w = st.getTensor("model.audio_tower.subsample_conv_projection.layer0.conv.weight");
-        const a_conv0_n = try loadNorm(allocator, st.getTensor("model.audio_tower.subsample_conv_projection.layer0.norm.weight"), 128);
-        const a_conv1_w = st.getTensor("model.audio_tower.subsample_conv_projection.layer1.conv.weight");
-        const a_conv1_n = try loadNorm(allocator, st.getTensor("model.audio_tower.subsample_conv_projection.layer1.norm.weight"), 32);
-        const a_inp_proj = st.getTensor("model.audio_tower.subsample_conv_projection.input_proj_linear.weight");
-        const a_pre_out = st.getTensor("model.audio_tower.output_proj.weight");
-        const a_pre_bias = try loadNorm(allocator, st.getTensor("model.audio_tower.output_proj.bias"), 1536);
-        const a_mm_proj = st.getTensor("model.embed_audio.embedding_projection.weight");
-
-        var audio_layers = std.ArrayList(audio.AudioLayerWeights).empty;
-        errdefer audio_layers.deinit(allocator);
-
-        for (0..12) |l_idx| {
-            var a_buf: [128]u8 = undefined;
-            var q_name_buf: [160]u8 = undefined;
-
-            const q_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.q_proj", .{l_idx}) catch break;
-            const q_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{q_prefix}) catch break;
-            const a_q_proj = st.getTensor(q_name);
-            if (a_q_proj == null) break;
-
-            var layer = audio.AudioLayerWeights{};
-            layer.attn_q = a_q_proj;
-            layer.attn_q_clip = loadClipBounds(st, q_prefix);
-
-            // FFN 1 (feed_forward1)
-            const ffn1_up_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.ffw_layer_1", .{l_idx}) catch break;
-            layer.ffn_up_clip = loadClipBounds(st, ffn1_up_prefix);
-            const ffn1_up_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn1_up_prefix}) catch break;
-            layer.ffn_up = st.getTensor(ffn1_up_name);
-
-            const ffn1_down_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.ffw_layer_2", .{l_idx}) catch break;
-            layer.ffn_down_clip = loadClipBounds(st, ffn1_down_prefix);
-            const ffn1_down_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn1_down_prefix}) catch break;
-            layer.ffn_down = st.getTensor(ffn1_down_name);
-
-            const ffn1_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.pre_layer_norm.weight", .{l_idx}) catch break;
-            layer.ffn_norm = try loadNorm(allocator, st.getTensor(ffn1_pre_name), 1024);
-            const ffn1_post_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward1.post_layer_norm.weight", .{l_idx}) catch break;
-            layer.ffn_post_norm = try loadNorm(allocator, st.getTensor(ffn1_post_name), 1024);
-
-            // Attention
-            const attn_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.norm_pre_attn.weight", .{l_idx}) catch break;
-            layer.attn_pre_norm = try loadNorm(allocator, st.getTensor(attn_pre_name), 1024);
-
-            const k_proj_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.k_proj", .{l_idx}) catch break;
-            layer.attn_k_clip = loadClipBounds(st, k_proj_prefix);
-            const k_proj_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{k_proj_prefix}) catch break;
-            layer.attn_k = st.getTensor(k_proj_name);
-
-            const v_proj_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.v_proj", .{l_idx}) catch break;
-            layer.attn_v_clip = loadClipBounds(st, v_proj_prefix);
-            const v_proj_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{v_proj_prefix}) catch break;
-            layer.attn_v = st.getTensor(v_proj_name);
-
-            const k_rel_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.relative_k_proj.weight", .{l_idx}) catch break;
-            layer.attn_k_rel = st.getTensor(k_rel_name);
-            const pds_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.per_dim_scale", .{l_idx}) catch break;
-            layer.per_dim_scale = try loadNorm(allocator, st.getTensor(pds_name), 128);
-
-            const attn_out_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.self_attn.post", .{l_idx}) catch break;
-            layer.attn_out_clip = loadClipBounds(st, attn_out_prefix);
-            const attn_out_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{attn_out_prefix}) catch break;
-            layer.attn_out = st.getTensor(attn_out_name);
-
-            const attn_post_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.norm_post_attn.weight", .{l_idx}) catch break;
-            layer.attn_post_norm = try loadNorm(allocator, st.getTensor(attn_post_name), 1024);
-
-            // Conv Module (lconv1d)
-            const conv_norm_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.pre_layer_norm.weight", .{l_idx}) catch break;
-            layer.norm_conv = try loadNorm(allocator, st.getTensor(conv_norm_pre_name), 1024);
-
-            const conv_pw1_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.linear_start", .{l_idx}) catch break;
-            layer.conv_pw1_clip = loadClipBounds(st, conv_pw1_prefix);
-            const conv_pw1_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{conv_pw1_prefix}) catch break;
-            layer.conv_pw1 = st.getTensor(conv_pw1_name);
-
-            const conv_dw_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.depthwise_conv1d.weight", .{l_idx}) catch break;
-            layer.conv_dw = st.getTensor(conv_dw_name);
-            const conv_norm_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.conv_norm.weight", .{l_idx}) catch break;
-            layer.conv_norm = try loadNorm(allocator, st.getTensor(conv_norm_name), 1024);
-
-            const conv_pw2_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.lconv1d.linear_end", .{l_idx}) catch break;
-            layer.conv_pw2_clip = loadClipBounds(st, conv_pw2_prefix);
-            const conv_pw2_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{conv_pw2_prefix}) catch break;
-            layer.conv_pw2 = st.getTensor(conv_pw2_name);
-
-            // FFN 2 (feed_forward2)
-            const ffn2_pre_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.pre_layer_norm.weight", .{l_idx}) catch break;
-            layer.ffn_norm_1 = try loadNorm(allocator, st.getTensor(ffn2_pre_name), 1024);
-
-            const ffn2_up_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.ffw_layer_1", .{l_idx}) catch break;
-            layer.ffn_up_1_clip = loadClipBounds(st, ffn2_up_prefix);
-            const ffn2_up_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn2_up_prefix}) catch break;
-            layer.ffn_up_1 = st.getTensor(ffn2_up_name);
-
-            const ffn2_down_prefix = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.ffw_layer_2", .{l_idx}) catch break;
-            layer.ffn_down_1_clip = loadClipBounds(st, ffn2_down_prefix);
-            const ffn2_down_name = std.fmt.bufPrint(&q_name_buf, "{s}.linear.weight", .{ffn2_down_prefix}) catch break;
-            layer.ffn_down_1 = st.getTensor(ffn2_down_name);
-
-            const ffn2_post_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.feed_forward2.post_layer_norm.weight", .{l_idx}) catch break;
-            layer.ffn_post_norm_1 = try loadNorm(allocator, st.getTensor(ffn2_post_name), 1024);
-
-            // Final LN
-            const ln2_name = std.fmt.bufPrint(&a_buf, "model.audio_tower.layers.{d}.norm_out.weight", .{l_idx}) catch break;
-            layer.ln2 = try loadNorm(allocator, st.getTensor(ln2_name), 1024);
-
-            try audio_layers.append(allocator, layer);
-        }
-
-        const a_layers_slice = try audio_layers.toOwnedSlice(allocator);
-        if (a_conv0_w != null and a_layers_slice.len > 0) {
-            self.audio_encoder = audio.AudioEncoder.init(
-                allocator,
-                a_conv0_w,
-                a_conv0_n,
-                a_conv1_w,
-                a_conv1_n,
-                a_inp_proj,
-                a_pre_out,
-                a_pre_bias,
-                a_mm_proj,
-                a_layers_slice,
-            );
-            std.debug.print("  Loaded {d} Audio Conformer layers from SafeTensors\n", .{a_layers_slice.len});
-        }
-
         return self;
     }
 
     pub fn deinit(self: *TransformerModel) void {
-        if (self.vision_encoder) |*ve| ve.deinit();
-        if (self.audio_encoder) |*ae| ae.deinit();
         for (self.layers) |layer| {
             if (layer.input_layernorm) |n| self.allocator.free(n);
             if (layer.post_attention_layernorm) |n| self.allocator.free(n);
@@ -803,10 +456,10 @@ pub const TransformerModel = struct {
         pos: usize,
         kv_cache: *KVCache,
         bufs: *ModelBuffers,
-        pool: ?*ThreadPool,
+        backend_or_pool: anytype,
         compute_logits: bool,
     ) ![]const f32 {
-        return self.forwardWithEmbedding(null, token_id, pos, kv_cache, bufs, pool, compute_logits);
+        return self.forwardWithEmbedding(null, token_id, pos, kv_cache, bufs, backend_or_pool, compute_logits);
     }
 
     pub fn forwardWithEmbedding(
@@ -816,9 +469,19 @@ pub const TransformerModel = struct {
         pos: usize,
         kv_cache: *KVCache,
         bufs: *ModelBuffers,
-        pool: ?*ThreadPool,
+        backend_or_pool: anytype,
         compute_logits: bool,
     ) ![]const f32 {
+        const T = @TypeOf(backend_or_pool);
+        const backend: Backend = if (T == *const Backend or T == *Backend)
+            backend_or_pool.*
+        else if (T == Backend)
+            backend_or_pool
+        else if (T == ?*ThreadPool or T == *ThreadPool or T == @TypeOf(null))
+            Backend.initCpu(undefined, if (T == @TypeOf(null)) null else backend_or_pool)
+        else
+            Backend.initCpu(undefined, null);
+
         const p = &self.params;
         const dim = p.embedding_length;
 
@@ -856,12 +519,12 @@ pub const TransformerModel = struct {
             if (self.per_layer_model_projection) |ctx_proj_t| {
                 const inv_sqrt_dim = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
                 for (0..dim) |d| bufs.xb[d] = bufs.x[d] * inv_sqrt_dim;
-                math.gemv(pool, ctx_proj_t.type, ctx_proj_t.data, bufs.xb, bufs.ctx_scratch[0..total_ple_dim], total_ple_dim, dim);
+                backend.gemv(ctx_proj_t.type, ctx_proj_t.data, bufs.xb, bufs.ctx_scratch[0..total_ple_dim], total_ple_dim, dim);
                 if (self.per_layer_projection_norm) |norm_slice| {
                     const inv_sqrt_2: f32 = 1.0 / @sqrt(2.0);
                     for (0..self.layers.len) |l_idx| {
                         const slice = bufs.ctx_scratch[l_idx * ple_dim .. (l_idx + 1) * ple_dim];
-                        math.rmsNorm(slice, norm_slice, slice, p.layer_norm_rms_epsilon, false);
+                        backend.rmsNorm(slice, norm_slice, slice, p.layer_norm_rms_epsilon, false);
                         if (custom_embedding == null) {
                             for (0..ple_dim) |d| {
                                 bufs.ctx_ple_buf[l_idx * ple_dim + d] = (bufs.ctx_ple_buf[l_idx * ple_dim + d] + slice[d]) * inv_sqrt_2;
@@ -880,7 +543,7 @@ pub const TransformerModel = struct {
         for (self.layers, 0..) |layer, layer_idx| {
             // A. Pre-Attention Norm
             if (layer.input_layernorm) |norm_slice| {
-                math.rmsNorm(bufs.x, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                backend.rmsNorm(bufs.x, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             } else {
                 @memcpy(bufs.xb, bufs.x);
             }
@@ -892,14 +555,14 @@ pub const TransformerModel = struct {
 
             // Q Projection
             if (layer.attn_q) |t_q| {
-                math.gemv(pool, t_q.type, t_q.data, bufs.xb, bufs.q, n_heads * head_size, dim);
+                backend.gemv(t_q.type, t_q.data, bufs.xb, bufs.q, n_heads * head_size, dim);
             }
 
             // Optional Q RMSNorm
             if (layer.attn_q_norm) |q_norm_slice| {
                 for (0..n_heads) |h| {
                     const q_head = bufs.q[h * head_size .. (h + 1) * head_size];
-                    math.rmsNorm(q_head, q_norm_slice, q_head, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                    backend.rmsNorm(q_head, q_norm_slice, q_head, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
                 }
             }
 
@@ -956,23 +619,23 @@ pub const TransformerModel = struct {
 
             if (!is_kv_shared) {
                 if (layer.attn_k) |t_k| {
-                    math.gemv(pool, t_k.type, t_k.data, bufs.xb, bufs.k, n_kv_heads * head_size, dim);
+                    backend.gemv(t_k.type, t_k.data, bufs.xb, bufs.k, n_kv_heads * head_size, dim);
                 }
                 if (layer.attn_v) |t_v| {
-                    math.gemv(pool, t_v.type, t_v.data, bufs.xb, bufs.v, n_kv_heads * head_size, dim);
+                    backend.gemv(t_v.type, t_v.data, bufs.xb, bufs.v, n_kv_heads * head_size, dim);
                 }
 
                 if (layer.attn_k_norm) |k_norm_slice| {
                     for (0..n_kv_heads) |h| {
                         const k_head = bufs.k[h * head_size .. (h + 1) * head_size];
-                        math.rmsNorm(k_head, k_norm_slice, k_head, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                        backend.rmsNorm(k_head, k_norm_slice, k_head, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
                     }
                 }
 
                 if (p.arch == .gemma4) {
                     for (0..n_kv_heads) |h| {
                         const v_head = bufs.v[h * head_size .. (h + 1) * head_size];
-                        math.rmsNormNoScale(v_head, v_head, p.layer_norm_rms_epsilon);
+                        backend.rmsNormNoScale(v_head, v_head, p.layer_norm_rms_epsilon);
                     }
                 }
 
@@ -1039,12 +702,12 @@ pub const TransformerModel = struct {
 
             // Attention Output Projection
             if (layer.attn_output) |t_out| {
-                math.gemv(pool, t_out.type, t_out.data, bufs.attn_out[0 .. n_heads * head_size], bufs.xb, dim, n_heads * head_size);
+                backend.gemv(t_out.type, t_out.data, bufs.attn_out[0 .. n_heads * head_size], bufs.xb, dim, n_heads * head_size);
             }
 
             // Post-attention norm
             if (layer.post_attention_layernorm) |norm_slice| {
-                math.rmsNorm(bufs.xb, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                backend.rmsNorm(bufs.xb, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             }
 
             // Residual Add
@@ -1054,7 +717,7 @@ pub const TransformerModel = struct {
 
             // B. Pre-FFN Norm
             if (layer.pre_feedforward_layernorm) |norm_slice| {
-                math.rmsNorm(bufs.x, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                backend.rmsNorm(bufs.x, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             } else {
                 @memcpy(bufs.xb, bufs.x);
             }
@@ -1063,27 +726,27 @@ pub const TransformerModel = struct {
 
             // FFN Projections
             if (layer.ffn_gate) |t_gate| {
-                math.gemv(pool, t_gate.type, t_gate.data, bufs.xb, bufs.gate, ffn_len, dim);
+                backend.gemv(t_gate.type, t_gate.data, bufs.xb, bufs.gate, ffn_len, dim);
             }
             if (layer.ffn_up) |t_up| {
-                math.gemv(pool, t_up.type, t_up.data, bufs.xb, bufs.up, ffn_len, dim);
+                backend.gemv(t_up.type, t_up.data, bufs.xb, bufs.up, ffn_len, dim);
             }
 
             // Activation: SwiGLU or GeGLU
             if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4) {
-                math.geglu(bufs.gate[0..ffn_len], bufs.up[0..ffn_len], bufs.gate[0..ffn_len]);
+                backend.geglu(bufs.gate[0..ffn_len], bufs.up[0..ffn_len], bufs.gate[0..ffn_len]);
             } else {
-                math.swiglu(bufs.gate[0..ffn_len], bufs.up[0..ffn_len], bufs.gate[0..ffn_len]);
+                backend.swiglu(bufs.gate[0..ffn_len], bufs.up[0..ffn_len], bufs.gate[0..ffn_len]);
             }
 
             // Down Projection
             if (layer.ffn_down) |t_down| {
-                math.gemv(pool, t_down.type, t_down.data, bufs.gate[0..ffn_len], bufs.ffn_out, dim, ffn_len);
+                backend.gemv(t_down.type, t_down.data, bufs.gate[0..ffn_len], bufs.ffn_out, dim, ffn_len);
             }
 
             // Post-FFN norm
             if (layer.post_feedforward_layernorm) |norm_slice| {
-                math.rmsNorm(bufs.ffn_out, norm_slice, bufs.ffn_out, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                backend.rmsNorm(bufs.ffn_out, norm_slice, bufs.ffn_out, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             }
 
             // Residual Add
@@ -1098,7 +761,7 @@ pub const TransformerModel = struct {
 
                 // gate = gelu(W_gate * x)
                 const t_gate = layer.per_layer_input_gate.?;
-                math.gemv(pool, t_gate.type, t_gate.data, bufs.x, bufs.ple_gate[0..ple_dim], ple_dim, dim);
+                backend.gemv(t_gate.type, t_gate.data, bufs.x, bufs.ple_gate[0..ple_dim], ple_dim, dim);
                 for (bufs.ple_gate[0..ple_dim]) |*g| g.* = math.gelu(g.*);
 
                 // ple = ple_slice * gate
@@ -1106,11 +769,11 @@ pub const TransformerModel = struct {
 
                 // delta_x = W_proj * ple
                 const t_proj = layer.per_layer_projection.?;
-                math.gemv(pool, t_proj.type, t_proj.data, bufs.ple_buf[0..ple_dim], bufs.xb, dim, ple_dim);
+                backend.gemv(t_proj.type, t_proj.data, bufs.ple_buf[0..ple_dim], bufs.xb, dim, ple_dim);
 
                 // norm(delta_x)
                 if (layer.post_per_layer_input_norm) |norm_slice| {
-                    math.rmsNorm(bufs.xb, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, false);
+                    backend.rmsNorm(bufs.xb, norm_slice, bufs.xb, p.layer_norm_rms_epsilon, false);
                 }
 
                 // x = x + delta_x
@@ -1128,14 +791,14 @@ pub const TransformerModel = struct {
         if (!compute_logits) return bufs.logits;
 
         // 3. Final Norm
-        math.rmsNorm(bufs.x, self.output_norm, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+        backend.rmsNorm(bufs.x, self.output_norm, bufs.xb, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
 
         // 4. LM Head Output Projection
         if (self.output) |head| {
-            math.gemv(pool, head.type, head.data, bufs.xb, bufs.logits, p.vocab_size, dim);
+            backend.gemv(head.type, head.data, bufs.xb, bufs.logits, p.vocab_size, dim);
         } else {
             // Weight tying: token_embd is reused as LM head
-            math.gemv(pool, self.token_embd.type, self.token_embd.data, bufs.xb, bufs.logits, p.vocab_size, dim);
+            backend.gemv(self.token_embd.type, self.token_embd.data, bufs.xb, bufs.logits, p.vocab_size, dim);
         }
 
         // Final logit softcapping (Gemma 2 / Gemma 4)

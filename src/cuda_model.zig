@@ -56,6 +56,10 @@ pub const CudaGpuNorm = struct {
         };
     }
 
+    pub inline fn asConstF32(self: *const CudaGpuNorm) [*]const f32 {
+        return self.buf.asConstF32();
+    }
+
     pub fn deinit(self: *CudaGpuNorm) void {
         self.buf.deinit();
     }
@@ -111,7 +115,6 @@ pub const CudaGpuLayer = struct {
         if (self.ffn_down) |*t| t.deinit();
 
         if (self.per_layer_input_gate) |*t| t.deinit();
-        if (self.per_layer_projection) |*t| t.deinit();
     }
 };
 
@@ -128,6 +131,7 @@ pub const CudaGpuModel = struct {
     // Per-Layer Embedding Context Projection weights on GPU
     per_layer_model_projection: ?CudaGpuTensor = null,
     per_layer_projection_norm: ?CudaGpuNorm = null,
+    embed_tokens_per_layer: ?CudaGpuTensor = null,
 
     // Device temporary buffers
     d_x: CudaBuffer,
@@ -145,6 +149,8 @@ pub const CudaGpuModel = struct {
     d_ctx_ple_buf: CudaBuffer,
     d_ctx_scratch: CudaBuffer,
     d_logits: CudaBuffer,
+    d_argmax: CudaBuffer,
+    d_tokens: CudaBuffer,
 
     // GPU-Resident KV Cache
     d_k_cache: CudaBuffer,
@@ -193,6 +199,8 @@ pub const CudaGpuModel = struct {
         const d_ctx_ple_buf = try device.alloc(max_batch * total_ple_dim * @sizeOf(f32));
         const d_ctx_scratch = try device.alloc(max_batch * total_ple_dim * @sizeOf(f32));
         const d_logits = try device.alloc(p.vocab_size * @sizeOf(f32));
+        const d_argmax = try device.alloc(@sizeOf(c_uint));
+        const d_tokens = try device.alloc(max_batch * @sizeOf(c_int));
 
         // GPU KV Cache: [num_layers, max_seq, max_kv_heads * max_head_dim]
         const max_kv_dim = max_kv_heads * max_head_dim;
@@ -263,7 +271,7 @@ pub const CudaGpuModel = struct {
 
         // Upload Output Projection and Token Embeddings
         const can_gpu_embed = switch (cpu_model.token_embd.type) {
-            .F32, .F16, .BF16, .Q4_0, .Q8_0 => true,
+            .F32, .F16, .BF16, .Q4_0, .Q8_0, .Q4_K, .Q6_K => true,
             else => false,
         };
 
@@ -294,6 +302,20 @@ pub const CudaGpuModel = struct {
             gpu_ctx_norm = try CudaGpuNorm.upload(device, norm);
         }
 
+        var gpu_embed_tokens_per_layer: ?CudaGpuTensor = null;
+        if (cpu_model.embed_tokens_per_layer) |t| {
+            const can_gpu_ple = switch (t.type) {
+                .F32, .F16, .BF16, .Q4_0, .Q8_0, .Q4_K, .Q6_K => true,
+                else => false,
+            };
+            if (can_gpu_ple) {
+                gpu_embed_tokens_per_layer = CudaGpuTensor.upload(device, t, p.vocab_size, cpu_model.layers.len * 256) catch null;
+                if (gpu_embed_tokens_per_layer != null) {
+                    std.debug.print("⚡ Gemma-4 Per-Layer Embedding table offloaded to GPU VRAM!\n", .{});
+                }
+            }
+        }
+
         device.sync();
 
         const self = try allocator.create(CudaGpuModel);
@@ -308,6 +330,7 @@ pub const CudaGpuModel = struct {
             .owns_token_embd = owns_token_embd,
             .per_layer_model_projection = gpu_ctx_proj,
             .per_layer_projection_norm = gpu_ctx_norm,
+            .embed_tokens_per_layer = gpu_embed_tokens_per_layer,
             .d_x = d_x,
             .d_xb = d_xb,
             .d_q = d_q,
@@ -323,6 +346,8 @@ pub const CudaGpuModel = struct {
             .d_ctx_ple_buf = d_ctx_ple_buf,
             .d_ctx_scratch = d_ctx_scratch,
             .d_logits = d_logits,
+            .d_argmax = d_argmax,
+            .d_tokens = d_tokens,
             .d_k_cache = d_k_cache,
             .d_v_cache = d_v_cache,
             .max_seq_len = max_seq,
@@ -348,6 +373,7 @@ pub const CudaGpuModel = struct {
         if (self.output_norm) |*n| n.deinit();
         if (self.per_layer_model_projection) |*t| t.deinit();
         if (self.per_layer_projection_norm) |*n| n.deinit();
+        if (self.embed_tokens_per_layer) |*t| t.deinit();
 
         self.d_x.deinit();
         self.d_xb.deinit();
@@ -364,6 +390,8 @@ pub const CudaGpuModel = struct {
         self.d_ctx_ple_buf.deinit();
         self.d_ctx_scratch.deinit();
         self.d_logits.deinit();
+        self.d_argmax.deinit();
+        self.d_tokens.deinit();
         self.d_k_cache.deinit();
         self.d_v_cache.deinit();
 
@@ -420,7 +448,46 @@ pub const CudaGpuModel = struct {
         }
 
         // PLE precomputation on GPU
-        if (cpu_model.embed_tokens_per_layer) |ple_tab| {
+        if (self.embed_tokens_per_layer) |ple_tensor| {
+            const ple_dim: usize = 256;
+            const total_ple_dim = self.layers.len * ple_dim;
+            const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
+
+            if (custom_embedding == null and token_id < p.vocab_size) {
+                const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+                self.device.embedLookup(
+                    ple_tensor.buf.ptr,
+                    ple_tensor.qtype,
+                    token_id,
+                    d_ctx_ple_ptr,
+                    total_ple_dim,
+                    token_scale,
+                );
+            } else {
+                self.device.scale(d_ctx_ple_ptr, 0.0, total_ple_dim);
+            }
+
+            if (self.per_layer_model_projection) |ctx_proj| {
+                const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+                const d_ctx_scratch_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_scratch.ptr));
+
+                // Scale d_x into d_xb: d_xb = d_x * inv_sqrt_dim on GPU
+                _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
+                self.device.scale(d_xb_ptr, inv_sqrt_dim, dim);
+
+                // GPU GEMV: ctx_scratch = ctx_proj * d_xb (8960 rows x 1536 cols in parallel on GPU)
+                self.device.gemv(ctx_proj.qtype, ctx_proj.buf.ptr, d_xb_ptr, d_ctx_scratch_ptr, total_ple_dim, dim);
+
+                // Normalization on GPU (batched across all 35 layers in ONE kernel launch!)
+                if (self.per_layer_projection_norm) |norm| {
+                    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                    self.device.rmsNormBatched(d_ctx_scratch_ptr, norm_ptr, d_ctx_scratch_ptr, ple_dim, self.layers.len, p.layer_norm_rms_epsilon, false);
+                }
+
+                // Fusion on GPU
+                self.device.pleCtxFuse(d_ctx_ple_ptr, d_ctx_scratch_ptr, total_ple_dim, custom_embedding == null and token_id < p.vocab_size);
+            }
+        } else if (cpu_model.embed_tokens_per_layer) |ple_tab| {
             const ple_dim: usize = 256;
             const total_ple_dim = self.layers.len * ple_dim;
             const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
@@ -632,17 +699,49 @@ pub const CudaGpuModel = struct {
         return self.host_logits;
     }
 
+    pub fn forwardArgmax(
+        self: *CudaGpuModel,
+        cpu_model: *const TransformerModel,
+        token_id: u32,
+        pos: usize,
+        kv_cache: ?*KVCache,
+        bufs: *ModelBuffers,
+        custom_embedding: ?[]const f32,
+    ) !u32 {
+        const p = self.params;
+        const dim = p.embedding_length;
+        _ = try self.forward(cpu_model, token_id, pos, kv_cache.?, bufs, custom_embedding, false);
+
+        const d_xb_ptr: [*]f32 = @ptrCast(@alignCast(self.d_xb.ptr));
+        const d_logits_ptr: [*]f32 = @ptrCast(@alignCast(self.d_logits.ptr));
+        if (self.output) |t_out| {
+            self.device.gemv(t_out.qtype, t_out.buf.ptr, d_xb_ptr, d_logits_ptr, p.vocab_size, dim);
+        }
+        if (p.final_logit_softcapping > 0.0) {
+            self.device.tanhSoftcap(d_logits_ptr, p.final_logit_softcapping, p.vocab_size);
+        }
+
+        const d_argmax_ptr: [*]c_uint = @ptrCast(@alignCast(self.d_argmax.ptr));
+        self.device.argmax(d_logits_ptr, p.vocab_size, d_argmax_ptr);
+        var out_tok: c_uint = 0;
+        try self.d_argmax.download(std.mem.asBytes(&out_tok), self.device.stream);
+        self.device.sync();
+        return @intCast(out_tok);
+    }
+
     pub fn forwardBatch(
         self: *CudaGpuModel,
         cpu_model: *const TransformerModel,
         tokens: []const u32,
+        embs: ?[]const f32,
         pos: usize,
         kv_cache: ?*KVCache,
         bufs: *ModelBuffers,
     ) ![]const f32 {
         if (tokens.len == 0) return self.host_logits[0..0];
         if (tokens.len == 1) {
-            return self.forward(cpu_model, tokens[0], pos, kv_cache.?, bufs, null, true);
+            const emb_single = if (embs != null) embs.?[0..self.params.embedding_length] else null;
+            return self.forward(cpu_model, tokens[0], pos, kv_cache.?, bufs, emb_single, true);
         }
 
         const B = tokens.len;
@@ -657,13 +756,37 @@ pub const CudaGpuModel = struct {
         else
             1.0;
 
-        for (tokens, 0..) |tok, b| {
-            const dst = self.host_x[b * dim .. (b + 1) * dim];
-            const row_bytes = cpu_model.token_embd.getRow(tok);
-            quant.dequantizeRow(cpu_model.token_embd.type, row_bytes, dst, dim);
-            for (dst) |*v| v.* *= embd_scale;
+        if (embs) |precomputed_embs| {
+            // Use provided dense embeddings directly (caller must apply scaling if needed)
+            @memcpy(self.host_x[0 .. B * dim], precomputed_embs[0 .. B * dim]);
+            try self.d_x.upload(std.mem.sliceAsBytes(self.host_x[0 .. B * dim]), self.device.stream);
+        } else if (self.token_embd) |emb_tensor| {
+            // Fast 100% GPU Batched Embedding Lookup!
+            var token_ids_buf: [512]c_int = undefined;
+            for (tokens, 0..) |tok, b| {
+                token_ids_buf[b] = @intCast(tok);
+            }
+            try self.d_tokens.upload(std.mem.sliceAsBytes(token_ids_buf[0..B]), self.device.stream);
+            const d_tokens_ptr: [*]const c_int = @ptrCast(@alignCast(self.d_tokens.ptr));
+            self.device.embedLookupBatch(
+                emb_tensor.buf.ptr,
+                emb_tensor.qtype,
+                d_tokens_ptr,
+                d_x_ptr,
+                B,
+                dim,
+                embd_scale,
+            );
+        } else {
+            // Lookup from token embedding table (CPU fallback)
+            for (tokens, 0..) |tok, b| {
+                const dst = self.host_x[b * dim .. (b + 1) * dim];
+                const row_bytes = cpu_model.token_embd.getRow(tok);
+                quant.dequantizeRow(cpu_model.token_embd.type, row_bytes, dst, dim);
+                for (dst) |*v| v.* *= embd_scale;
+            }
+            try self.d_x.upload(std.mem.sliceAsBytes(self.host_x[0 .. B * dim]), self.device.stream);
         }
-        try self.d_x.upload(std.mem.sliceAsBytes(self.host_x[0 .. B * dim]), self.device.stream);
 
         // PLE precomputation for Gemma 4
         const ple_dim: usize = 256;
@@ -671,7 +794,42 @@ pub const CudaGpuModel = struct {
         const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
         const d_ctx_scratch_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_scratch.ptr));
 
-        if (cpu_model.embed_tokens_per_layer) |ple_tab| {
+        if (self.embed_tokens_per_layer) |ple_tensor| {
+            const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+            var token_ids_buf: [512]c_int = undefined;
+            for (tokens, 0..) |tok, b| {
+                token_ids_buf[b] = @intCast(tok);
+            }
+            try self.d_tokens.upload(std.mem.sliceAsBytes(token_ids_buf[0..B]), self.device.stream);
+            const d_tokens_ptr: [*]const c_int = @ptrCast(@alignCast(self.d_tokens.ptr));
+            self.device.embedLookupBatch(
+                ple_tensor.buf.ptr,
+                ple_tensor.qtype,
+                d_tokens_ptr,
+                d_ctx_ple_ptr,
+                B,
+                total_ple_dim,
+                token_scale,
+            );
+
+            if (self.per_layer_model_projection) |ctx_proj| {
+                const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+                _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, B * dim * @sizeOf(f32), self.device.stream);
+                self.device.scale(d_xb_ptr, inv_sqrt_dim, B * dim);
+
+                // GPU Batched GEMM: ctx_scratch = ctx_proj * d_xb (B vectors in parallel on GPU)
+                self.device.gemm(ctx_proj.qtype, ctx_proj.buf.ptr, d_xb_ptr, d_ctx_scratch_ptr, B, total_ple_dim, dim);
+
+                // Batched RMSNorm across all B * layers.len
+                if (self.per_layer_projection_norm) |norm| {
+                    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                    self.device.rmsNormBatched(d_ctx_scratch_ptr, norm_ptr, d_ctx_scratch_ptr, ple_dim, B * self.layers.len, p.layer_norm_rms_epsilon, false);
+                }
+
+                // Fusion on GPU across B * total_ple_dim
+                self.device.pleCtxFuse(d_ctx_ple_ptr, d_ctx_scratch_ptr, B * total_ple_dim, true);
+            }
+        } else if (cpu_model.embed_tokens_per_layer) |ple_tab| {
             const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
             for (tokens, 0..) |tok, b| {
                 const dst = self.host_ple[b * total_ple_dim .. (b + 1) * total_ple_dim];
@@ -828,14 +986,12 @@ pub const CudaGpuModel = struct {
                 self.device.rmsNormBatched(d_xb_ptr, norm_ptr, d_xb_ptr, dim, B, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             }
 
-            // Residual Add: X = X + Attn_Out
-            self.device.add(d_x_ptr, d_xb_ptr, B * dim);
-
             // E. Feed-Forward Network
             if (layer.pre_feedforward_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
-                self.device.rmsNormBatched(d_x_ptr, norm_ptr, d_xb_ptr, dim, B, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                self.device.addRmsNormBatched(d_x_ptr, d_xb_ptr, norm_ptr, d_xb_ptr, dim, B, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
             } else {
+                self.device.add(d_x_ptr, d_xb_ptr, B * dim);
                 _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, B * dim * @sizeOf(f32), self.device.stream);
             }
 
@@ -915,6 +1071,33 @@ pub const CudaGpuModel = struct {
 
         return self.host_logits;
     }
+
+    pub fn forwardBatchArgmax(
+        self: *CudaGpuModel,
+        cpu_model: *const TransformerModel,
+        tokens: []const u32,
+        embs: ?[]const f32,
+        pos: usize,
+        kv_cache: ?*KVCache,
+        bufs: *ModelBuffers,
+    ) !u32 {
+        if (tokens.len == 0) return 0;
+        if (tokens.len == 1) {
+            const emb_single = if (embs != null) embs.?[0..self.params.embedding_length] else null;
+            return self.forwardArgmax(cpu_model, tokens[0], pos, kv_cache, bufs, emb_single);
+        }
+
+        _ = try self.forwardBatch(cpu_model, tokens, embs, pos, kv_cache, bufs);
+
+        const p = self.params;
+        const d_logits_ptr: [*]f32 = @ptrCast(@alignCast(self.d_logits.ptr));
+        const d_argmax_ptr: [*]c_uint = @ptrCast(@alignCast(self.d_argmax.ptr));
+        self.device.argmax(d_logits_ptr, p.vocab_size, d_argmax_ptr);
+        var out_tok: c_uint = 0;
+        try self.d_argmax.download(std.mem.asBytes(&out_tok), self.device.stream);
+        self.device.sync();
+        return @intCast(out_tok);
+    }
 };
 
 test "CudaGpuModel C ABI vs CPU TransformerModel forward numerical parity" {
@@ -972,7 +1155,8 @@ test "CudaGpuModel C ABI vs CPU TransformerModel forward numerical parity" {
     // Test forwardBatch vs sequential forward
     const test_batch = [_]u32{ 100, 200, 300, 400 };
     gpu_eng.reset();
-    var seq_final: [256000]f32 = undefined;
+    const seq_final = try allocator.alloc(f32, cpu_eng.params.vocab_size);
+    defer allocator.free(seq_final);
     for (test_batch, 0..) |tok, p_idx| {
         const l = try gpu_eng.gpu_model.?.forward(gpu_eng.model, tok, p_idx, gpu_eng.kv_cache, gpu_eng.buffers, null, p_idx == test_batch.len - 1);
         if (p_idx == test_batch.len - 1) {
@@ -981,7 +1165,7 @@ test "CudaGpuModel C ABI vs CPU TransformerModel forward numerical parity" {
     }
 
     gpu_eng.reset();
-    const bat_logits = try gpu_eng.gpu_model.?.forwardBatch(gpu_eng.model, &test_batch, 0, gpu_eng.kv_cache, gpu_eng.buffers);
+    const bat_logits = try gpu_eng.gpu_model.?.forwardBatch(gpu_eng.model, &test_batch, null, 0, gpu_eng.kv_cache, gpu_eng.buffers);
 
     var batch_diff: f32 = 0.0;
     var b_max_idx: usize = 0;
@@ -994,4 +1178,23 @@ test "CudaGpuModel C ABI vs CPU TransformerModel forward numerical parity" {
     }
     std.debug.print("[CUDA C ABI Batch Parity] Max diff: {d:.6} at index {d} (Seq: {d:.4}, Bat: {d:.4})\n", .{ batch_diff, b_max_idx, seq_final[b_max_idx], bat_logits[b_max_idx] });
     try std.testing.expect(batch_diff < 0.001);
+
+    // Test forwardArgmax and forwardBatchArgmax
+    gpu_eng.reset();
+    const gpu_argmax_kernel = try gpu_eng.gpu_model.?.forwardArgmax(gpu_eng.model, test_tok, pos, gpu_eng.kv_cache, gpu_eng.buffers, null);
+    std.debug.print("GPU direct argmax: {d} ('{s}')\n", .{ gpu_argmax_kernel, gpu_eng.tokenizer.decode(gpu_argmax_kernel) });
+    try std.testing.expectEqual(cpu_argmax, gpu_argmax_kernel);
+
+    gpu_eng.reset();
+    const batch_argmax_kernel = try gpu_eng.gpu_model.?.forwardBatchArgmax(gpu_eng.model, &test_batch, null, 0, gpu_eng.kv_cache, gpu_eng.buffers);
+    var bat_max_val: f32 = -1e9;
+    var bat_argmax: u32 = 0;
+    for (0..bat_logits.len) |i| {
+        if (bat_logits[i] > bat_max_val) {
+            bat_max_val = bat_logits[i];
+            bat_argmax = @intCast(i);
+        }
+    }
+    std.debug.print("GPU batch argmax: {d}, kernel batch argmax: {d}\n", .{ bat_argmax, batch_argmax_kernel });
+    try std.testing.expectEqual(bat_argmax, batch_argmax_kernel);
 }
