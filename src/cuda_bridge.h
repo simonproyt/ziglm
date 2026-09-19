@@ -27,8 +27,9 @@ void cuda_gemv_q4_k(const void* weights, const float* x, float* y, int rows, int
 void cuda_gemv_q6_k(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
 void cuda_gemv_f16(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
 void cuda_gemv_bf16(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
-void cuda_gemv_f32(const float* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
 void cuda_gemv(int qtype, const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
+void cuda_gemv_geglu_q4_0(const void* gate_w, const void* up_w, const float* x, float* act_out, int rows, int cols, CudaStream_t stream);
+void cuda_gemv_qkv_q4_0(const void* q_w, const void* k_w, const void* v_w, const float* x, float* q_out, float* k_out, float* v_out, int q_rows, int k_rows, int v_rows, int cols, CudaStream_t stream);
 
 // Batched Quantized GEMM Operations (Matrix * Matrix)
 void cuda_gemm_q4_0(const void* weights, const float* x, float* y, int batch_size, int rows, int cols, CudaStream_t stream);

@@ -201,9 +201,9 @@ exec_ziglm() {
     raw_out="$(LC_ALL=C "$ZIGLM_BIN" run -m "$MODEL_PATH" -p "$PROMPT" -n "$MAX_TOKENS" --greedy $gpu_flag 2>&1)"
 
     local prefill gen total_ms
-    prefill="$(echo "$raw_out" | grep -oE "Prefill:[[:space:]]+[0-9.]+[[:space:]]+tok/s" | awk '{print $2}' | tail -n 1)"
-    gen="$(echo "$raw_out" | grep -oE "Generation:[[:space:]]+[0-9.]+[[:space:]]+tok/s" | awk '{print $2}' | tail -n 1)"
-    total_ms="$(echo "$raw_out" | grep -oE "Total time:[[:space:]]+[0-9.]+[[:space:]]+ms" | awk '{print $3}' | tail -n 1)"
+    prefill="$(echo "$raw_out" | grep -oE "Prefill:[[:space:]]+[0-9.,]+[[:space:]]+tok/s" | awk '{print $2}' | tr ',' '.' | tail -n 1)"
+    gen="$(echo "$raw_out" | grep -oE "Generation:[[:space:]]+[0-9.,]+[[:space:]]+tok/s" | awk '{print $2}' | tr ',' '.' | tail -n 1)"
+    total_ms="$(echo "$raw_out" | grep -oE "Total time:[[:space:]]+[0-9.,]+[[:space:]]+ms" | awk '{print $3}' | tr ',' '.' | tail -n 1)"
 
     local response
     response="$(echo "$raw_out" | sed -n '/Prompt:/,/─\{10,\}/p' | grep -v 'Prompt:' | grep -v '─\{10,\}' | sed '/^[[:space:]]*$/d')"
@@ -221,8 +221,8 @@ exec_llama() {
     raw_out="$(LC_ALL=C "$LLAMA_BIN" -m "$MODEL_PATH" -p "$PROMPT" -n "$MAX_TOKENS" --temp 0 -ngl "$ngl" -st --no-warmup --simple-io --reasoning off 2>&1)"
 
     local prefill gen
-    prefill="$(echo "$raw_out" | grep -oE "Prompt:[[:space:]]+[0-9.]+[[:space:]]+t/s" | awk '{print $2}' | tail -n 1)"
-    gen="$(echo "$raw_out" | grep -oE "Generation:[[:space:]]+[0-9.]+[[:space:]]+t/s" | awk '{print $2}' | tail -n 1)"
+    prefill="$(echo "$raw_out" | grep -oE "Prompt:[[:space:]]+[0-9.,]+[[:space:]]+t/s" | awk '{print $2}' | tr ',' '.' | tail -n 1)"
+    gen="$(echo "$raw_out" | grep -oE "Generation:[[:space:]]+[0-9.,]+[[:space:]]+t/s" | awk '{print $2}' | tr ',' '.' | tail -n 1)"
 
     local response
     response="$(echo "$raw_out" | sed -n '/> '"$PROMPT"'/!b;n;:a;/\[ Prompt:/!{p;n;ba}' | sed '/^[[:space:]]*$/d')"

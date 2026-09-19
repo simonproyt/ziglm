@@ -25,6 +25,8 @@ pub extern "c" fn cuda_gemv_q6_k(weights: ?*const anyopaque, x: [*]const f32, y:
 pub extern "c" fn cuda_gemv_f16(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_gemv_bf16(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_gemv_f32(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_gemv_geglu_q4_0(gate_w: ?*const anyopaque, up_w: ?*const anyopaque, x: [*]const f32, act_out: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_gemv_qkv_q4_0(q_w: ?*const anyopaque, k_w: ?*const anyopaque, v_w: ?*const anyopaque, x: [*]const f32, q_out: [*]f32, k_out: [*]f32, v_out: [*]f32, q_rows: c_int, k_rows: c_int, v_rows: c_int, cols: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_gemm_q4_0(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, batch_size: c_int, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_gemm(qtype: c_int, weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, batch_size: c_int, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 
@@ -251,6 +253,35 @@ pub const CudaDevice = struct {
             .F32 => cuda_gemv_f32(d_weights, d_x, d_y, r, c, self.stream),
             else => cuda_gemv_f32(d_weights, d_x, d_y, r, c, self.stream),
         }
+    }
+
+    pub inline fn gemvGegluQ4_0(
+        self: *const CudaDevice,
+        d_gate_w: ?*const anyopaque,
+        d_up_w: ?*const anyopaque,
+        d_x: [*]const f32,
+        d_act_out: [*]f32,
+        rows: usize,
+        cols: usize,
+    ) void {
+        cuda_gemv_geglu_q4_0(d_gate_w, d_up_w, d_x, d_act_out, @intCast(rows), @intCast(cols), self.stream);
+    }
+
+    pub inline fn gemvQkvQ4_0(
+        self: *const CudaDevice,
+        d_q_w: ?*const anyopaque,
+        d_k_w: ?*const anyopaque,
+        d_v_w: ?*const anyopaque,
+        d_x: [*]const f32,
+        d_q_out: [*]f32,
+        d_k_out: [*]f32,
+        d_v_out: [*]f32,
+        q_rows: usize,
+        k_rows: usize,
+        v_rows: usize,
+        cols: usize,
+    ) void {
+        cuda_gemv_qkv_q4_0(d_q_w, d_k_w, d_v_w, d_x, d_q_out, d_k_out, d_v_out, @intCast(q_rows), @intCast(k_rows), @intCast(v_rows), @intCast(cols), self.stream);
     }
 
     pub fn gemmQ4_0(

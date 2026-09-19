@@ -277,7 +277,7 @@ __global__ void k_gemv_q4_0(
     }
 }
 
-// Fused GEMV Gate + Up + GEGLU (Q4_0, eliminates 2 kernel launches and 2 intermediate DRAM roundtrips)
+// Fused GEMV Gate + Up + GEGLU (Q4_0, 2 rows per block, eliminates 2 kernel launches and intermediate DRAM roundtrips)
 __global__ void k_gemv_geglu_q4_0(
     const unsigned char* __restrict__ gate_w,
     const unsigned char* __restrict__ up_w,
@@ -286,17 +286,20 @@ __global__ void k_gemv_geglu_q4_0(
     int rows,
     int cols
 ) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
+    int row0 = blockIdx.x * 2;
+    int row1 = row0 + 1;
+    if (row0 >= rows) return;
 
     int tid = threadIdx.y * 32 + threadIdx.x; // 0..127
     int num_blocks = cols / 32;
     size_t row_stride = (size_t)num_blocks * 18;
-    const unsigned char* r_gate = gate_w + (size_t)row * row_stride;
-    const unsigned char* r_up = up_w + (size_t)row * row_stride;
+    const unsigned char* rg0 = gate_w + (size_t)row0 * row_stride;
+    const unsigned char* ru0 = up_w + (size_t)row0 * row_stride;
+    const unsigned char* rg1 = (row1 < rows) ? (gate_w + (size_t)row1 * row_stride) : NULL;
+    const unsigned char* ru1 = (row1 < rows) ? (up_w + (size_t)row1 * row_stride) : NULL;
 
-    float sum_gate = 0.0f;
-    float sum_up = 0.0f;
+    float sum_g0 = 0.0f, sum_u0 = 0.0f;
+    float sum_g1 = 0.0f, sum_u1 = 0.0f;
 
     int kbx_base = tid >> 1;     // 0..63
     int half_block = tid & 1;    // 0 or 1
@@ -311,55 +314,216 @@ __global__ void k_gemv_geglu_q4_0(
         int u2 = get_int_b4(bq8->qs, kqs + 1);
         int u3 = get_int_b4(bq8->qs, kqs + 1 + 4);
 
-        // Gate
-        const unsigned char* bg = r_gate + (size_t)kbx * 18;
-        float dg = f16_to_f32(*(const unsigned short*)bg);
-        int vg0 = get_int_b2(bg + 2, kqs + 0);
-        int vg1 = get_int_b2(bg + 2, kqs + 1);
+        // Row 0 Gate & Up
+        const unsigned char* bg0 = rg0 + (size_t)kbx * 18;
+        float dg0 = f16_to_f32(*(const unsigned short*)bg0);
+        int vg0_0 = get_int_b2(bg0 + 2, kqs + 0);
+        int vg0_1 = get_int_b2(bg0 + 2, kqs + 1);
 
-        int sumig = 0;
-        sumig = ziglm_dp4a((vg0 >> 0) & 0x0F0F0F0F, u0, sumig);
-        sumig = ziglm_dp4a((vg0 >> 4) & 0x0F0F0F0F, u1, sumig);
-        sumig = ziglm_dp4a((vg1 >> 0) & 0x0F0F0F0F, u2, sumig);
-        sumig = ziglm_dp4a((vg1 >> 4) & 0x0F0F0F0F, u3, sumig);
-        sum_gate += dg * ((float)sumig * ds8.x - 4.0f * ds8.y);
+        int sig0 = 0;
+        sig0 = ziglm_dp4a((vg0_0 >> 0) & 0x0F0F0F0F, u0, sig0);
+        sig0 = ziglm_dp4a((vg0_0 >> 4) & 0x0F0F0F0F, u1, sig0);
+        sig0 = ziglm_dp4a((vg0_1 >> 0) & 0x0F0F0F0F, u2, sig0);
+        sig0 = ziglm_dp4a((vg0_1 >> 4) & 0x0F0F0F0F, u3, sig0);
+        sum_g0 += dg0 * ((float)sig0 * ds8.x - 4.0f * ds8.y);
 
-        // Up
-        const unsigned char* bu = r_up + (size_t)kbx * 18;
-        float du = f16_to_f32(*(const unsigned short*)bu);
-        int vu0 = get_int_b2(bu + 2, kqs + 0);
-        int vu1 = get_int_b2(bu + 2, kqs + 1);
+        const unsigned char* bu0 = ru0 + (size_t)kbx * 18;
+        float du0 = f16_to_f32(*(const unsigned short*)bu0);
+        int vu0_0 = get_int_b2(bu0 + 2, kqs + 0);
+        int vu0_1 = get_int_b2(bu0 + 2, kqs + 1);
 
-        int sumiu = 0;
-        sumiu = ziglm_dp4a((vu0 >> 0) & 0x0F0F0F0F, u0, sumiu);
-        sumiu = ziglm_dp4a((vu0 >> 4) & 0x0F0F0F0F, u1, sumiu);
-        sumiu = ziglm_dp4a((vu1 >> 0) & 0x0F0F0F0F, u2, sumiu);
-        sumiu = ziglm_dp4a((vu1 >> 4) & 0x0F0F0F0F, u3, sumiu);
-        sum_up += du * ((float)sumiu * ds8.x - 4.0f * ds8.y);
+        int siu0 = 0;
+        siu0 = ziglm_dp4a((vu0_0 >> 0) & 0x0F0F0F0F, u0, siu0);
+        siu0 = ziglm_dp4a((vu0_0 >> 4) & 0x0F0F0F0F, u1, siu0);
+        siu0 = ziglm_dp4a((vu0_1 >> 0) & 0x0F0F0F0F, u2, siu0);
+        siu0 = ziglm_dp4a((vu0_1 >> 4) & 0x0F0F0F0F, u3, siu0);
+        sum_u0 += du0 * ((float)siu0 * ds8.x - 4.0f * ds8.y);
+
+        // Row 1 Gate & Up
+        if (rg1) {
+            const unsigned char* bg1 = rg1 + (size_t)kbx * 18;
+            float dg1 = f16_to_f32(*(const unsigned short*)bg1);
+            int vg1_0 = get_int_b2(bg1 + 2, kqs + 0);
+            int vg1_1 = get_int_b2(bg1 + 2, kqs + 1);
+
+            int sig1 = 0;
+            sig1 = ziglm_dp4a((vg1_0 >> 0) & 0x0F0F0F0F, u0, sig1);
+            sig1 = ziglm_dp4a((vg1_0 >> 4) & 0x0F0F0F0F, u1, sig1);
+            sig1 = ziglm_dp4a((vg1_1 >> 0) & 0x0F0F0F0F, u2, sig1);
+            sig1 = ziglm_dp4a((vg1_1 >> 4) & 0x0F0F0F0F, u3, sig1);
+            sum_g1 += dg1 * ((float)sig1 * ds8.x - 4.0f * ds8.y);
+
+            const unsigned char* bu1 = ru1 + (size_t)kbx * 18;
+            float du1 = f16_to_f32(*(const unsigned short*)bu1);
+            int vu1_0 = get_int_b2(bu1 + 2, kqs + 0);
+            int vu1_1 = get_int_b2(bu1 + 2, kqs + 1);
+
+            int siu1 = 0;
+            siu1 = ziglm_dp4a((vu1_0 >> 0) & 0x0F0F0F0F, u0, siu1);
+            siu1 = ziglm_dp4a((vu1_0 >> 4) & 0x0F0F0F0F, u1, siu1);
+            siu1 = ziglm_dp4a((vu1_1 >> 0) & 0x0F0F0F0F, u2, siu1);
+            siu1 = ziglm_dp4a((vu1_1 >> 4) & 0x0F0F0F0F, u3, siu1);
+            sum_u1 += du1 * ((float)siu1 * ds8.x - 4.0f * ds8.y);
+        }
     }
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
-        sum_gate += __shfl_down_sync(0xffffffff, sum_gate, offset);
-        sum_up += __shfl_down_sync(0xffffffff, sum_up, offset);
+        sum_g0 += __shfl_down_sync(0xffffffff, sum_g0, offset);
+        sum_u0 += __shfl_down_sync(0xffffffff, sum_u0, offset);
+        sum_g1 += __shfl_down_sync(0xffffffff, sum_g1, offset);
+        sum_u1 += __shfl_down_sync(0xffffffff, sum_u1, offset);
     }
 
-    __shared__ float s_gate[4];
-    __shared__ float s_up[4];
+    __shared__ float s_g0[4], s_u0[4], s_g1[4], s_u1[4];
     int warp_id = threadIdx.y;
     int lane = threadIdx.x;
 
     if (lane == 0) {
-        s_gate[warp_id] = sum_gate;
-        s_up[warp_id] = sum_up;
+        s_g0[warp_id] = sum_g0;
+        s_u0[warp_id] = sum_u0;
+        s_g1[warp_id] = sum_g1;
+        s_u1[warp_id] = sum_u1;
     }
     __syncthreads();
 
     if (warp_id == 0 && lane == 0) {
-        float g = s_gate[0] + s_gate[1] + s_gate[2] + s_gate[3];
-        float u = s_up[0] + s_up[1] + s_up[2] + s_up[3];
-        float gelu = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
-        act_out[row] = gelu * u;
+        float g0 = s_g0[0] + s_g0[1] + s_g0[2] + s_g0[3];
+        float u0 = s_u0[0] + s_u0[1] + s_u0[2] + s_u0[3];
+        float gelu0 = 0.5f * g0 * (1.0f + tanhf(0.7978845608f * (g0 + 0.044715f * g0 * g0 * g0)));
+        act_out[row0] = gelu0 * u0;
+
+        if (row1 < rows) {
+            float g1 = s_g1[0] + s_g1[1] + s_g1[2] + s_g1[3];
+            float u1 = s_u1[0] + s_u1[1] + s_u1[2] + s_u1[3];
+            float gelu1 = 0.5f * g1 * (1.0f + tanhf(0.7978845608f * (g1 + 0.044715f * g1 * g1 * g1)));
+            act_out[row1] = gelu1 * u1;
+        }
+    }
+}
+
+// Fused GEMV QKV (Q4_0, computes Q, K, V projections in 1 kernel launch with 2 rows per block)
+__global__ void k_gemv_qkv_q4_0(
+    const unsigned char* __restrict__ q_w,
+    const unsigned char* __restrict__ k_w,
+    const unsigned char* __restrict__ v_w,
+    const block_q8_1* __restrict__ y_q8_1,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    int q_rows,
+    int k_rows,
+    int v_rows,
+    int cols
+) {
+    int total_rows = q_rows + k_rows + v_rows;
+    int row0 = blockIdx.x * 2;
+    int row1 = row0 + 1;
+    if (row0 >= total_rows) return;
+
+    int tid = threadIdx.y * 32 + threadIdx.x; // 0..127
+    int num_blocks = cols / 32;
+    size_t row_stride = (size_t)num_blocks * 18;
+
+    const unsigned char* r_w0 = NULL;
+    float* out_ptr0 = NULL;
+    if (row0 < q_rows) {
+        r_w0 = q_w + (size_t)row0 * row_stride;
+        out_ptr0 = q_out + row0;
+    } else if (row0 < q_rows + k_rows) {
+        int r = row0 - q_rows;
+        r_w0 = k_w + (size_t)r * row_stride;
+        out_ptr0 = k_out + r;
+    } else {
+        int r = row0 - q_rows - k_rows;
+        r_w0 = v_w + (size_t)r * row_stride;
+        out_ptr0 = v_out + r;
+    }
+
+    const unsigned char* r_w1 = NULL;
+    float* out_ptr1 = NULL;
+    if (row1 < total_rows) {
+        if (row1 < q_rows) {
+            r_w1 = q_w + (size_t)row1 * row_stride;
+            out_ptr1 = q_out + row1;
+        } else if (row1 < q_rows + k_rows) {
+            int r = row1 - q_rows;
+            r_w1 = k_w + (size_t)r * row_stride;
+            out_ptr1 = k_out + r;
+        } else {
+            int r = row1 - q_rows - k_rows;
+            r_w1 = v_w + (size_t)r * row_stride;
+            out_ptr1 = v_out + r;
+        }
+    }
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    int kbx_base = tid >> 1;     // 0..63
+    int half_block = tid & 1;    // 0 or 1
+    int kqs = half_block << 1;   // 0 or 2
+
+    for (int kbx = kbx_base; kbx < num_blocks; kbx += 64) {
+        const block_q8_1* bq8 = y_q8_1 + kbx;
+        float2 ds8 = __half22float2(bq8->ds);
+
+        int u0 = get_int_b4(bq8->qs, kqs + 0);
+        int u1 = get_int_b4(bq8->qs, kqs + 0 + 4);
+        int u2 = get_int_b4(bq8->qs, kqs + 1);
+        int u3 = get_int_b4(bq8->qs, kqs + 1 + 4);
+
+        // Row 0
+        const unsigned char* b0 = r_w0 + (size_t)kbx * 18;
+        float d4_0 = f16_to_f32(*(const unsigned short*)b0);
+        int v0_0 = get_int_b2(b0 + 2, kqs + 0);
+        int v1_0 = get_int_b2(b0 + 2, kqs + 1);
+
+        int sumi0 = 0;
+        sumi0 = ziglm_dp4a((v0_0 >> 0) & 0x0F0F0F0F, u0, sumi0);
+        sumi0 = ziglm_dp4a((v0_0 >> 4) & 0x0F0F0F0F, u1, sumi0);
+        sumi0 = ziglm_dp4a((v1_0 >> 0) & 0x0F0F0F0F, u2, sumi0);
+        sumi0 = ziglm_dp4a((v1_0 >> 4) & 0x0F0F0F0F, u3, sumi0);
+        sum0 += d4_0 * ((float)sumi0 * ds8.x - 4.0f * ds8.y);
+
+        // Row 1
+        if (r_w1) {
+            const unsigned char* b1 = r_w1 + (size_t)kbx * 18;
+            float d4_1 = f16_to_f32(*(const unsigned short*)b1);
+            int v0_1 = get_int_b2(b1 + 2, kqs + 0);
+            int v1_1 = get_int_b2(b1 + 2, kqs + 1);
+
+            int sumi1 = 0;
+            sumi1 = ziglm_dp4a((v0_1 >> 0) & 0x0F0F0F0F, u0, sumi1);
+            sumi1 = ziglm_dp4a((v0_1 >> 4) & 0x0F0F0F0F, u1, sumi1);
+            sumi1 = ziglm_dp4a((v1_1 >> 0) & 0x0F0F0F0F, u2, sumi1);
+            sumi1 = ziglm_dp4a((v1_1 >> 4) & 0x0F0F0F0F, u3, sumi1);
+            sum1 += d4_1 * ((float)sumi1 * ds8.x - 4.0f * ds8.y);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum0 += __shfl_down_sync(0xffffffff, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
+    }
+
+    __shared__ float s_warp_sums0[4];
+    __shared__ float s_warp_sums1[4];
+    int warp_id = threadIdx.y;
+    int lane = threadIdx.x;
+
+    if (lane == 0) {
+        s_warp_sums0[warp_id] = sum0;
+        s_warp_sums1[warp_id] = sum1;
+    }
+    __syncthreads();
+
+    if (warp_id == 0 && lane == 0) {
+        *out_ptr0 = s_warp_sums0[0] + s_warp_sums0[1] + s_warp_sums0[2] + s_warp_sums0[3];
+        if (out_ptr1) {
+            *out_ptr1 = s_warp_sums1[0] + s_warp_sums1[1] + s_warp_sums1[2] + s_warp_sums1[3];
+        }
     }
 }
 
@@ -500,7 +664,7 @@ __global__ void k_gemv_q4_k(
     }
 }
 
-// Q6_K MMVQ: 64 threads (2 warps) per row, DP4A SIMD inner loop
+// Q6_K MMVQ: 64 threads (2 warps) per block, 2 rows per block (shared activation loads)
 __global__ void k_gemv_q6_k(
     const unsigned char* __restrict__ weights,
     const block_q8_1* __restrict__ y_q8_1,
@@ -508,33 +672,28 @@ __global__ void k_gemv_q6_k(
     int rows,
     int cols
 ) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
+    int row0 = blockIdx.x * 2;
+    int row1 = row0 + 1;
+    if (row0 >= rows) return;
 
     int tid = threadIdx.y * 32 + threadIdx.x; // 0..63
     int num_superblocks = cols / 256;
-    const unsigned char* row_w = weights + (size_t)row * num_superblocks * 210;
+    size_t row_stride = (size_t)num_superblocks * 210;
+    const unsigned char* row_w0 = weights + (size_t)row0 * row_stride;
+    const unsigned char* row_w1 = (row1 < rows) ? (weights + (size_t)row1 * row_stride) : NULL;
 
-    float sum = 0.0f;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
 
     int kbx_base = tid >> 5;     // 0 for warp 0, 1 for warp 1
     int iqs = tid & 31;          // 0..31
 
     for (int kbx = kbx_base; kbx < num_superblocks; kbx += 2) {
-        const unsigned char* sb_ptr = row_w + (size_t)kbx * 210;
         const block_q8_1* bq8_1_base = y_q8_1 + (size_t)kbx * 8; // 256 weights = 8 Q8_1 blocks
 
         const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
         const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
         const int vh_shift = 2 * ((iqs % 16) / 8);
-
-        const unsigned char* ql = sb_ptr;
-        const unsigned char* qh = sb_ptr + 128;
-        const signed char* scales = (const signed char*)(sb_ptr + 192) + scale_offset;
-        float d = f16_to_f32(*(const unsigned short*)(sb_ptr + 208));
-
-        int vl = get_int_b2(ql, iqs);
-        int vh = get_int_b2(qh, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
 
         int u[2];
         float d8[2];
@@ -544,35 +703,73 @@ __global__ void k_gemv_q6_k(
             d8[i] = __low2float(bq8_1_base[bq8_offset + 2 * i].ds);
         }
 
-        float sumf = 0.0f;
+        // Row 0
+        const unsigned char* sb_ptr0 = row_w0 + (size_t)kbx * 210;
+        const unsigned char* ql0 = sb_ptr0;
+        const unsigned char* qh0 = sb_ptr0 + 128;
+        const signed char* scales0 = (const signed char*)(sb_ptr0 + 192) + scale_offset;
+        float d0 = f16_to_f32(*(const unsigned short*)(sb_ptr0 + 208));
+
+        int vl0 = get_int_b2(ql0, iqs);
+        int vh0 = get_int_b2(qh0, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
+
+        float sumf0 = 0.0f;
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            int sc = (int)scales[4 * i];
-            int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
-            int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+            int sc = (int)scales0[4 * i];
+            int vil = (vl0 >> (4 * i)) & 0x0F0F0F0F;
+            int vih = ((vh0 >> (4 * i)) << 4) & 0x30303030;
             int vi = ziglm_vsubss4(vil | vih, 0x20202020);
-            sumf += d8[i] * ((float)ziglm_dp4a(vi, u[i], 0) * (float)sc);
+            sumf0 += d8[i] * ((float)ziglm_dp4a(vi, u[i], 0) * (float)sc);
         }
+        sum0 += d0 * sumf0;
 
-        sum += d * sumf;
+        // Row 1
+        if (row_w1) {
+            const unsigned char* sb_ptr1 = row_w1 + (size_t)kbx * 210;
+            const unsigned char* ql1 = sb_ptr1;
+            const unsigned char* qh1 = sb_ptr1 + 128;
+            const signed char* scales1 = (const signed char*)(sb_ptr1 + 192) + scale_offset;
+            float d1 = f16_to_f32(*(const unsigned short*)(sb_ptr1 + 208));
+
+            int vl1 = get_int_b2(ql1, iqs);
+            int vh1 = get_int_b2(qh1, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
+
+            float sumf1 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                int sc = (int)scales1[4 * i];
+                int vil = (vl1 >> (4 * i)) & 0x0F0F0F0F;
+                int vih = ((vh1 >> (4 * i)) << 4) & 0x30303030;
+                int vi = ziglm_vsubss4(vil | vih, 0x20202020);
+                sumf1 += d8[i] * ((float)ziglm_dp4a(vi, u[i], 0) * (float)sc);
+            }
+            sum1 += d1 * sumf1;
+        }
     }
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
+        sum0 += __shfl_down_sync(0xffffffff, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
     }
 
-    __shared__ float s_warp_sums[2];
+    __shared__ float s_warp_sums0[2];
+    __shared__ float s_warp_sums1[2];
     int warp_id = threadIdx.y;
     int lane = threadIdx.x;
 
     if (lane == 0) {
-        s_warp_sums[warp_id] = sum;
+        s_warp_sums0[warp_id] = sum0;
+        s_warp_sums1[warp_id] = sum1;
     }
     __syncthreads();
 
     if (warp_id == 0 && lane == 0) {
-        y[row] = s_warp_sums[0] + s_warp_sums[1];
+        y[row0] = s_warp_sums0[0] + s_warp_sums0[1];
+        if (row1 < rows) {
+            y[row1] = s_warp_sums1[0] + s_warp_sums1[1];
+        }
     }
 }
 
@@ -693,7 +890,7 @@ extern "C" void cuda_gemv_q4_0(const void* weights, const float* x, float* y, in
     k_quantize_q8_1<<<q_grid, q_dim, 0, (cudaStream_t)stream>>>(x, g_q8_1_buf, cols);
 
     dim3 block(32, 4);
-    dim3 grid(rows);
+    dim3 grid((rows + 1) / 2);
     k_gemv_q4_0<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned char*)weights, g_q8_1_buf, y, rows, cols);
 }
 
@@ -727,8 +924,78 @@ extern "C" void cuda_gemv_q6_k(const void* weights, const float* x, float* y, in
     k_quantize_q8_1<<<q_grid, q_dim, 0, (cudaStream_t)stream>>>(x, g_q8_1_buf, cols);
 
     dim3 block(32, 2);
-    dim3 grid(rows);
+    dim3 grid((rows + 1) / 2);
     k_gemv_q6_k<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned char*)weights, g_q8_1_buf, y, rows, cols);
+}
+
+extern "C" void cuda_gemv_geglu_q4_0(
+    const void* gate_w,
+    const void* up_w,
+    const float* x,
+    float* act_out,
+    int rows,
+    int cols,
+    CudaStream_t stream
+) {
+    if (rows <= 0 || cols <= 0) return;
+    int num_q8_blocks = (cols + 31) / 32;
+    int q_threads = 256;
+    int q_blocks = (num_q8_blocks + (q_threads / 32) - 1) / (q_threads / 32);
+    dim3 q_grid(q_blocks);
+    dim3 q_dim(32, q_threads / 32);
+    k_quantize_q8_1<<<q_grid, q_dim, 0, (cudaStream_t)stream>>>(x, g_q8_1_buf, cols);
+
+    dim3 block(32, 4);
+    dim3 grid((rows + 1) / 2);
+    k_gemv_geglu_q4_0<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const unsigned char*)gate_w,
+        (const unsigned char*)up_w,
+        g_q8_1_buf,
+        act_out,
+        rows,
+        cols
+    );
+}
+
+extern "C" void cuda_gemv_qkv_q4_0(
+    const void* q_w,
+    const void* k_w,
+    const void* v_w,
+    const float* x,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    int q_rows,
+    int k_rows,
+    int v_rows,
+    int cols,
+    CudaStream_t stream
+) {
+    int total_rows = q_rows + k_rows + v_rows;
+    if (total_rows <= 0 || cols <= 0) return;
+
+    int num_q8_blocks = (cols + 31) / 32;
+    int q_threads = 256;
+    int q_blocks = (num_q8_blocks + (q_threads / 32) - 1) / (q_threads / 32);
+    dim3 q_grid(q_blocks);
+    dim3 q_dim(32, q_threads / 32);
+    k_quantize_q8_1<<<q_grid, q_dim, 0, (cudaStream_t)stream>>>(x, g_q8_1_buf, cols);
+
+    dim3 block(32, 4);
+    dim3 grid((total_rows + 1) / 2);
+    k_gemv_qkv_q4_0<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const unsigned char*)q_w,
+        (const unsigned char*)k_w,
+        (const unsigned char*)v_w,
+        g_q8_1_buf,
+        q_out,
+        k_out,
+        v_out,
+        q_rows,
+        k_rows,
+        v_rows,
+        cols
+    );
 }
 
 extern "C" void cuda_gemv_f16(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream) {
