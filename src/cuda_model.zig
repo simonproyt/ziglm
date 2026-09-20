@@ -151,6 +151,7 @@ pub const CudaGpuModel = struct {
     d_logits: CudaBuffer,
     d_argmax: CudaBuffer,
     d_tokens: CudaBuffer,
+    d_params: CudaBuffer,
 
     // GPU-Resident KV Cache
     d_k_cache: CudaBuffer,
@@ -162,6 +163,12 @@ pub const CudaGpuModel = struct {
     host_x: []f32,
     host_ple: []f32,
     host_logits: []f32,
+    host_params: [*]c_int,
+    host_out_tok: *c_uint,
+
+    // CUDA Graph state for near-zero dispatch overhead decode
+    graph_exec: ?cuda.CudaGraphExec_t = null,
+    graph: ?cuda.CudaGraph_t = null,
 
     pub fn init(allocator: std.mem.Allocator, device: *CudaDevice, cpu_model: *const TransformerModel) !*CudaGpuModel {
         const p = cpu_model.params;
@@ -201,6 +208,7 @@ pub const CudaGpuModel = struct {
         const d_logits = try device.alloc(p.vocab_size * @sizeOf(f32));
         const d_argmax = try device.alloc(@sizeOf(c_uint));
         const d_tokens = try device.alloc(max_batch * @sizeOf(c_int));
+        const d_params = try device.alloc(2 * @sizeOf(c_int));
 
         // GPU KV Cache: [num_layers, max_seq, max_kv_heads * max_head_dim]
         const max_kv_dim = max_kv_heads * max_head_dim;
@@ -212,6 +220,18 @@ pub const CudaGpuModel = struct {
         const host_x = try allocator.alloc(f32, max_batch * dim);
         const host_ple = try allocator.alloc(f32, max_batch * total_ple_dim);
         const host_logits = try allocator.alloc(f32, p.vocab_size);
+
+        var h_params_raw: ?*anyopaque = null;
+        if (cuda.cuda_malloc_host(&h_params_raw, 2 * @sizeOf(c_int)) != 0 or h_params_raw == null) {
+            return error.CudaHostAllocFailed;
+        }
+        const host_params: [*]c_int = @ptrCast(@alignCast(h_params_raw.?));
+
+        var h_out_raw: ?*anyopaque = null;
+        if (cuda.cuda_malloc_host(&h_out_raw, @sizeOf(c_uint)) != 0 or h_out_raw == null) {
+            return error.CudaHostAllocFailed;
+        }
+        const host_out_tok: *c_uint = @ptrCast(@alignCast(h_out_raw.?));
 
         // Upload transformer layers
         const gpu_layers = try allocator.alloc(CudaGpuLayer, cpu_model.layers.len);
@@ -348,6 +368,7 @@ pub const CudaGpuModel = struct {
             .d_logits = d_logits,
             .d_argmax = d_argmax,
             .d_tokens = d_tokens,
+            .d_params = d_params,
             .d_k_cache = d_k_cache,
             .d_v_cache = d_v_cache,
             .max_seq_len = max_seq,
@@ -355,6 +376,8 @@ pub const CudaGpuModel = struct {
             .host_x = host_x,
             .host_ple = host_ple,
             .host_logits = host_logits,
+            .host_params = host_params,
+            .host_out_tok = host_out_tok,
         };
 
         std.debug.print("⚡ Successfully initialized pure CUDA C GPU acceleration ({d} layers in VRAM)!\n", .{gpu_layers.len});
@@ -363,6 +386,17 @@ pub const CudaGpuModel = struct {
 
     pub fn deinit(self: *CudaGpuModel) void {
         self.device.sync();
+        if (self.graph_exec) |exec| {
+            _ = cuda.cuda_graph_exec_destroy(exec);
+            self.graph_exec = null;
+        }
+        if (self.graph) |g| {
+            _ = cuda.cuda_graph_destroy(g);
+            self.graph = null;
+        }
+        _ = cuda.cuda_free_host(self.host_params);
+        _ = cuda.cuda_free_host(self.host_out_tok);
+
         for (self.layers) |*l| l.deinit();
         self.allocator.free(self.layers);
 
@@ -392,6 +426,7 @@ pub const CudaGpuModel = struct {
         self.d_logits.deinit();
         self.d_argmax.deinit();
         self.d_tokens.deinit();
+        self.d_params.deinit();
         self.d_k_cache.deinit();
         self.d_v_cache.deinit();
 
@@ -722,6 +757,256 @@ pub const CudaGpuModel = struct {
         return self.host_logits;
     }
 
+    /// Pure GPU decode step: dispatches all kernels for 1 token into the stream.
+    /// Reads token_id and pos from self.d_params (device memory).
+    /// Writes argmax index to self.d_argmax.
+    /// Zero CPU synchronization, zero host allocations - 100% graphable!
+    pub fn forwardGpuDecodeStep(self: *CudaGpuModel) void {
+        const p = self.params;
+        const dim = p.embedding_length;
+        const d_x_ptr: [*]f32 = @ptrCast(@alignCast(self.d_x.ptr));
+        const d_xb_ptr: [*]f32 = @ptrCast(@alignCast(self.d_xb.ptr));
+        const d_tokens_ptr: [*]const c_int = @ptrCast(@alignCast(self.d_params.ptr));
+        const d_pos_ptr: [*]const c_int = @ptrCast(@alignCast(@as([*]u8, @ptrCast(self.d_params.ptr.?)) + @sizeOf(c_int)));
+
+        // 1. Embedding lookup from device token ID
+        if (self.token_embd) |emb_tensor| {
+            const embd_scale: f32 = if (p.arch == .gemma or p.arch == .gemma2 or p.arch == .gemma4)
+                @sqrt(@as(f32, @floatFromInt(dim)))
+            else
+                1.0;
+            self.device.embedLookupBatch(
+                emb_tensor.buf.ptr,
+                emb_tensor.qtype,
+                d_tokens_ptr,
+                d_x_ptr,
+                1,
+                dim,
+                embd_scale,
+            );
+        }
+
+        // Gemma 4 PLE precomputation on GPU
+        const ple_dim: usize = 256;
+        const total_ple_dim = self.layers.len * ple_dim;
+        const d_ctx_ple_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_ple_buf.ptr));
+
+        if (self.embed_tokens_per_layer) |ple_tensor| {
+            const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+            self.device.embedLookupBatch(
+                ple_tensor.buf.ptr,
+                ple_tensor.qtype,
+                d_tokens_ptr,
+                d_ctx_ple_ptr,
+                1,
+                total_ple_dim,
+                token_scale,
+            );
+        }
+
+        if (self.per_layer_model_projection) |ctx_proj| {
+            const inv_sqrt_dim: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+            const d_ctx_scratch_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ctx_scratch.ptr));
+
+            _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
+            self.device.scale(d_xb_ptr, inv_sqrt_dim, dim);
+
+            self.device.gemv(ctx_proj.qtype, ctx_proj.buf.ptr, d_xb_ptr, d_ctx_scratch_ptr, total_ple_dim, dim);
+
+            if (self.per_layer_projection_norm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNormBatched(d_ctx_scratch_ptr, norm_ptr, d_ctx_scratch_ptr, ple_dim, self.layers.len, p.layer_norm_rms_epsilon, false);
+            }
+
+            self.device.pleCtxFuse(d_ctx_ple_ptr, d_ctx_scratch_ptr, total_ple_dim, true);
+        }
+
+        const d_q_ptr: [*]f32 = @ptrCast(@alignCast(self.d_q.ptr));
+        const d_k_ptr: [*]f32 = @ptrCast(@alignCast(self.d_k.ptr));
+        const d_v_ptr: [*]f32 = @ptrCast(@alignCast(self.d_v.ptr));
+        const d_attn_out_ptr: [*]f32 = @ptrCast(@alignCast(self.d_attn_out.ptr));
+        const d_gate_ptr: [*]f32 = @ptrCast(@alignCast(self.d_gate.ptr));
+        const d_up_ptr: [*]f32 = @ptrCast(@alignCast(self.d_up.ptr));
+        const d_act_ptr: [*]f32 = @ptrCast(@alignCast(self.d_act.ptr));
+        const d_ffn_out_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ffn_out.ptr));
+        const d_ple_gate_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ple_gate.ptr));
+        const d_ple_buf_ptr: [*]f32 = @ptrCast(@alignCast(self.d_ple_buf.ptr));
+        const d_k_cache_ptr: [*]f32 = @ptrCast(@alignCast(self.d_k_cache.ptr));
+        const d_v_cache_ptr: [*]f32 = @ptrCast(@alignCast(self.d_v_cache.ptr));
+
+        // 2. Transformer layers forward
+        for (self.layers, 0..) |layer, layer_idx| {
+            if (layer.input_layernorm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNorm(d_x_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            } else {
+                _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
+            }
+
+            const head_size = layer.head_dim;
+            const n_heads = layer.n_heads;
+            const n_kv_heads = layer.n_kv_heads;
+
+            const unshared_count: usize = if (p.num_kv_shared_layers > 0)
+                (p.block_count - p.num_kv_shared_layers)
+            else if (p.arch == .gemma4)
+                (if (p.block_count == 42) 24 else 15)
+            else
+                p.block_count;
+
+            const is_kv_shared = (p.arch == .gemma4 and (layer.attn_k == null or layer_idx >= unshared_count));
+            var donor_layer: usize = layer_idx;
+            if (is_kv_shared) {
+                var l = unshared_count;
+                while (l > 0) {
+                    l -= 1;
+                    if (self.layers[l].head_dim == layer.head_dim) {
+                        donor_layer = l;
+                        break;
+                    }
+                }
+            }
+
+            if (!is_kv_shared and layer.attn_q != null and layer.attn_k != null and layer.attn_v != null and
+                layer.attn_q.?.qtype == .Q4_0 and layer.attn_k.?.qtype == .Q4_0 and layer.attn_v.?.qtype == .Q4_0)
+            {
+                self.device.gemvQkvQ4_0(
+                    layer.attn_q.?.buf.ptr,
+                    layer.attn_k.?.buf.ptr,
+                    layer.attn_v.?.buf.ptr,
+                    d_xb_ptr,
+                    d_q_ptr,
+                    d_k_ptr,
+                    d_v_ptr,
+                    n_heads * head_size,
+                    n_kv_heads * head_size,
+                    n_kv_heads * head_size,
+                    dim,
+                );
+            } else {
+                if (layer.attn_q) |t_q| {
+                    self.device.gemv(t_q.qtype, t_q.buf.ptr, d_xb_ptr, d_q_ptr, n_heads * head_size, dim);
+                }
+                if (!is_kv_shared) {
+                    if (layer.attn_k) |t_k| {
+                        self.device.gemv(t_k.qtype, t_k.buf.ptr, d_xb_ptr, d_k_ptr, n_kv_heads * head_size, dim);
+                    }
+                    if (layer.attn_v) |t_v| {
+                        self.device.gemv(t_v.qtype, t_v.buf.ptr, d_xb_ptr, d_v_ptr, n_kv_heads * head_size, dim);
+                    }
+                }
+            }
+
+            if (layer.attn_q_norm) |q_norm| {
+                const q_norm_ptr: [*]const f32 = @ptrCast(@alignCast(q_norm.buf.ptr));
+                self.device.rmsNormBatched(d_q_ptr, q_norm_ptr, d_q_ptr, head_size, n_heads, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            }
+
+            if (!is_kv_shared) {
+                if (layer.attn_k_norm) |k_norm| {
+                    const k_norm_ptr: [*]const f32 = @ptrCast(@alignCast(k_norm.buf.ptr));
+                    self.device.rmsNormBatched(d_k_ptr, k_norm_ptr, d_k_ptr, head_size, n_kv_heads, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                }
+
+                if (p.arch == .gemma4) {
+                    self.device.rmsNormBatched(d_v_ptr, null, d_v_ptr, head_size, n_kv_heads, p.layer_norm_rms_epsilon, false);
+                }
+
+                self.device.ropeInd(null, d_k_ptr, d_pos_ptr, 0, n_kv_heads, head_size, layer.rotary_dim, layer.rope_theta);
+                self.device.kvCachePutInd(d_k_cache_ptr, d_v_cache_ptr, d_k_ptr, d_v_ptr, layer_idx, d_pos_ptr, self.max_seq_len, n_kv_heads, head_size, self.max_kv_dim);
+            }
+
+            self.device.ropeInd(d_q_ptr, null, d_pos_ptr, n_heads, 0, head_size, layer.rotary_dim, layer.rope_theta);
+
+            const donor_kv_heads = self.layers[donor_layer].n_kv_heads;
+            const attn_scale: f32 = if (p.arch == .gemma4) 1.0 else 1.0 / @sqrt(@as(f32, @floatFromInt(head_size)));
+            self.device.attentionForwardInd(d_q_ptr, d_k_cache_ptr, d_v_cache_ptr, d_attn_out_ptr, donor_layer, d_pos_ptr, self.max_seq_len, n_heads, donor_kv_heads, head_size, self.max_kv_dim, attn_scale, p.attn_logit_softcapping, layer.sliding_window);
+
+            if (layer.attn_output) |t_out| {
+                self.device.gemv(t_out.qtype, t_out.buf.ptr, d_attn_out_ptr, d_xb_ptr, dim, n_heads * head_size);
+            }
+
+            if (layer.post_attention_layernorm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNorm(d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            }
+
+            const d_ffn_in_ptr = if (layer.pre_feedforward_layernorm) |norm| blk: {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.addRmsNorm(d_x_ptr, d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                break :blk d_xb_ptr;
+            } else blk: {
+                self.device.add(d_x_ptr, d_xb_ptr, dim);
+                break :blk d_x_ptr;
+            };
+
+            const inter_dim = if (layer.ffn_gate) |g| g.rows else dim * 4;
+
+            if (layer.ffn_gate) |t_gate| {
+                if (layer.ffn_up) |t_up| {
+                    if (t_gate.qtype == .Q4_0 and t_up.qtype == .Q4_0) {
+                        self.device.gemvGegluQ4_0(t_gate.buf.ptr, t_up.buf.ptr, d_ffn_in_ptr, d_act_ptr, inter_dim, dim);
+                    } else {
+                        self.device.gemv(t_gate.qtype, t_gate.buf.ptr, d_ffn_in_ptr, d_gate_ptr, inter_dim, dim);
+                        self.device.gemv(t_up.qtype, t_up.buf.ptr, d_ffn_in_ptr, d_up_ptr, inter_dim, dim);
+                        self.device.geglu(d_gate_ptr, d_up_ptr, d_act_ptr, inter_dim);
+                    }
+                }
+            }
+
+            if (layer.ffn_down) |t_down| {
+                self.device.gemv(t_down.qtype, t_down.buf.ptr, d_act_ptr, d_ffn_out_ptr, dim, inter_dim);
+            }
+
+            if (layer.post_feedforward_layernorm) |norm| {
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                self.device.rmsNorm(d_ffn_out_ptr, norm_ptr, d_ffn_out_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            }
+
+            self.device.add(d_x_ptr, d_ffn_out_ptr, dim);
+
+            if (layer.per_layer_input_gate != null and layer.per_layer_projection != null) {
+                const ple_slice_ptr = d_ctx_ple_ptr + layer_idx * ple_dim;
+                const t_gate = layer.per_layer_input_gate.?;
+                self.device.gemv(t_gate.qtype, t_gate.buf.ptr, d_x_ptr, d_ple_gate_ptr, ple_dim, dim);
+                self.device.pleGateGelu(d_ple_gate_ptr, ple_slice_ptr, d_ple_buf_ptr, ple_dim);
+                const t_proj = layer.per_layer_projection.?;
+                self.device.gemv(t_proj.qtype, t_proj.buf.ptr, d_ple_buf_ptr, d_xb_ptr, dim, ple_dim);
+                if (layer.post_per_layer_input_norm) |norm| {
+                    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+                    self.device.rmsNorm(d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, false);
+                }
+                self.device.add(d_x_ptr, d_xb_ptr, dim);
+            }
+
+            if (layer.scale != 1.0) {
+                self.device.scale(d_x_ptr, layer.scale, dim);
+            }
+        }
+
+        // 3. Final Output Norm
+        if (self.output_norm) |norm| {
+            const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
+            self.device.rmsNorm(d_x_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+        } else {
+            _ = cuda.cuda_memcpy_d2d(self.d_xb.ptr, self.d_x.ptr, dim * @sizeOf(f32), self.device.stream);
+        }
+
+        // 4. Output Logits Projection (LM Head)
+        const d_logits_ptr: [*]f32 = @ptrCast(@alignCast(self.d_logits.ptr));
+        if (self.output) |t_out| {
+            self.device.gemv(t_out.qtype, t_out.buf.ptr, d_xb_ptr, d_logits_ptr, p.vocab_size, dim);
+        }
+
+        if (p.final_logit_softcapping > 0.0) {
+            self.device.tanhSoftcap(d_logits_ptr, p.final_logit_softcapping, p.vocab_size);
+        }
+
+        // 5. Argmax on GPU
+        const d_argmax_ptr: [*]c_uint = @ptrCast(@alignCast(self.d_argmax.ptr));
+        self.device.argmax(d_logits_ptr, p.vocab_size, d_argmax_ptr);
+    }
+
     pub fn forwardArgmax(
         self: *CudaGpuModel,
         cpu_model: *const TransformerModel,
@@ -731,6 +1016,72 @@ pub const CudaGpuModel = struct {
         bufs: *ModelBuffers,
         custom_embedding: ?[]const f32,
     ) !u32 {
+        // Fast-path: CUDA Graph Execution for standard autoregressive decoding
+        const can_use_graph = (custom_embedding == null and self.token_embd != null);
+        if (can_use_graph) {
+            // Upload dynamic decode parameters (token_id and pos)
+            self.host_params[0] = @intCast(token_id);
+            self.host_params[1] = @intCast(pos);
+            _ = cuda.cuda_memcpy_h2d(self.d_params.ptr, self.host_params, 2 * @sizeOf(c_int), self.device.stream);
+
+            // Gemma 4: If PLE table is stored in host memory, dequantize and upload the token's PLE row
+            if (self.embed_tokens_per_layer == null) {
+                if (cpu_model.embed_tokens_per_layer) |ple_tab| {
+                    const ple_dim: usize = 256;
+                    const total_ple_dim = self.layers.len * ple_dim;
+                    if (token_id < self.params.vocab_size) {
+                        const ple_row = ple_tab.getRow(token_id);
+                        quant.dequantizeRow(ple_tab.type, ple_row, bufs.ctx_ple_buf[0..total_ple_dim], total_ple_dim);
+                        const token_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+                        for (bufs.ctx_ple_buf[0..total_ple_dim]) |*v| v.* *= token_scale;
+                    } else {
+                        @memset(bufs.ctx_ple_buf[0..total_ple_dim], 0.0);
+                    }
+                    const ple_bytes = std.mem.sliceAsBytes(bufs.ctx_ple_buf[0..total_ple_dim]);
+                    _ = cuda.cuda_memcpy_h2d(self.d_ctx_ple_buf.ptr, ple_bytes.ptr, ple_bytes.len, self.device.stream);
+                }
+            }
+
+            // If already captured, launch graph directly!
+            if (self.graph_exec) |exec| {
+                _ = cuda.cuda_graph_launch(exec, self.device.stream);
+                _ = cuda.cuda_memcpy_d2h(self.host_out_tok, self.d_argmax.ptr, @sizeOf(c_uint), self.device.stream);
+                self.device.sync();
+                return @intCast(self.host_out_tok.*);
+            }
+
+            // If not yet captured, capture graph on stream
+
+            const capture_res = cuda.cuda_graph_begin_capture(self.device.stream);
+            if (capture_res == 0) {
+                self.forwardGpuDecodeStep();
+                var g: cuda.CudaGraph_t = null;
+                const end_res = cuda.cuda_graph_end_capture(self.device.stream, &g);
+                if (end_res == 0 and g != null) {
+                    var exec: cuda.CudaGraphExec_t = null;
+                    const inst_res = cuda.cuda_graph_instantiate(&exec, g);
+                    if (inst_res == 0 and exec != null) {
+                        self.graph = g;
+                        self.graph_exec = exec;
+
+                        // First launch using the newly instantiated graph!
+                        _ = cuda.cuda_graph_launch(exec, self.device.stream);
+                        _ = cuda.cuda_memcpy_d2h(self.host_out_tok, self.d_argmax.ptr, @sizeOf(c_uint), self.device.stream);
+                        self.device.sync();
+                        return @intCast(self.host_out_tok.*);
+                    } else {
+                        std.debug.print("⚠️ CUDA Graph instantiate failed: res={d}\n", .{inst_res});
+                        if (g != null) _ = cuda.cuda_graph_destroy(g);
+                    }
+                } else {
+                    std.debug.print("⚠️ CUDA Graph end_capture failed: res={d}\n", .{end_res});
+                }
+            } else {
+                std.debug.print("⚠️ CUDA Graph begin_capture failed: res={d}\n", .{capture_res});
+            }
+        }
+
+        // Fallback: regular non-graphed forward
         const p = self.params;
         const dim = p.embedding_length;
         _ = try self.forward(cpu_model, token_id, pos, kv_cache.?, bufs, custom_embedding, false);

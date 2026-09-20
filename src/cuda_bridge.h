@@ -8,17 +8,29 @@ extern "C" {
 #endif
 
 typedef void* CudaStream_t;
+typedef void* CudaGraph_t;
+typedef void* CudaGraphExec_t;
 
 // Device & Memory Management
 int cuda_device_get_info(int device_id, char* name, size_t name_len, size_t* total_vram_bytes);
 int cuda_malloc(void** ptr, size_t bytes);
 int cuda_free(void* ptr);
+int cuda_malloc_host(void** ptr, size_t bytes);
+int cuda_free_host(void* ptr);
 int cuda_memcpy_h2d(void* dst, const void* src, size_t bytes, CudaStream_t stream);
 int cuda_memcpy_d2h(void* dst, const void* src, size_t bytes, CudaStream_t stream);
 int cuda_memcpy_d2d(void* dst, const void* src, size_t bytes, CudaStream_t stream);
 int cuda_stream_create(CudaStream_t* stream);
 int cuda_stream_destroy(CudaStream_t stream);
 int cuda_stream_sync(CudaStream_t stream);
+
+// CUDA Graph Management
+int cuda_graph_begin_capture(CudaStream_t stream);
+int cuda_graph_end_capture(CudaStream_t stream, CudaGraph_t* graph_out);
+int cuda_graph_instantiate(CudaGraphExec_t* exec_out, CudaGraph_t graph);
+int cuda_graph_launch(CudaGraphExec_t exec, CudaStream_t stream);
+int cuda_graph_destroy(CudaGraph_t graph);
+int cuda_graph_exec_destroy(CudaGraphExec_t exec);
 
 // Quantized & Float GEMV Operations (Matrix * Vector)
 void cuda_gemv_q4_0(const void* weights, const float* x, float* y, int rows, int cols, CudaStream_t stream);
@@ -45,6 +57,7 @@ void cuda_rmsnorm_batched(float* x, const float* weight, float* out, int head_di
 void cuda_add_rmsnorm(float* x, const float* residual, const float* weight, float* out, int n, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_add_rmsnorm_batched(float* x, const float* residual, const float* weight, float* out, int n, int batch_size, float eps, int use_unit_offset, CudaStream_t stream);
 void cuda_rope(float* q, float* k, int pos, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
+void cuda_rope_ind(float* q, float* k, const int* d_pos, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
 void cuda_rope_batched(float* q, float* k, int pos, int batch_size, int num_heads, int num_kv_heads, int head_dim, int rotary_dim, float freq_base, CudaStream_t stream);
 
 // Activations & Elementwise Math
@@ -62,6 +75,20 @@ void cuda_kv_cache_put(
     const float* v,
     int layer_idx,
     int pos,
+    int max_seq,
+    int n_kv_heads,
+    int head_dim,
+    int max_kv_dim,
+    CudaStream_t stream
+);
+
+void cuda_kv_cache_put_ind(
+    float* k_cache,
+    float* v_cache,
+    const float* k,
+    const float* v,
+    int layer_idx,
+    const int* d_pos,
     int max_seq,
     int n_kv_heads,
     int head_dim,
@@ -92,6 +119,24 @@ void cuda_attention_forward(
     float* out,
     int donor_layer,
     int pos,
+    int max_seq,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_kv_dim,
+    float attn_scale,
+    float softcap,
+    int sliding_window,
+    CudaStream_t stream
+);
+
+void cuda_attention_forward_ind(
+    const float* q,
+    const float* k_cache,
+    const float* v_cache,
+    float* out,
+    int donor_layer,
+    const int* d_pos,
     int max_seq,
     int n_heads,
     int n_kv_heads,

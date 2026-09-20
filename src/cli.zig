@@ -77,6 +77,7 @@ pub const CliArgs = struct {
     max_seq_len: usize = 4096,
     threads: ?usize = null,
     use_gpu: bool = false,
+    greedy: bool = false,
     device: []const u8 = "auto",
     port: u16 = 8080,
     seed: u64 = 42,
@@ -122,6 +123,7 @@ pub fn parseArgsFromIterator(arg_it: *std.process.Args.Iterator) CliArgs {
         } else if (std.mem.eql(u8, arg, "--echo-prompt")) {
             args.echo_prompt = true;
         } else if (std.mem.eql(u8, arg, "--greedy")) {
+            args.greedy = true;
             args.temperature = 0.0;
         } else if (std.mem.eql(u8, arg, "--gpu") or std.mem.eql(u8, arg, "--cuda")) {
             args.use_gpu = true;
@@ -274,8 +276,8 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         std.debug.print("\n=== Tensors ({d} total) ===\n", .{gguf_file.tensors.len});
         var l_count: usize = 0;
         for (gguf_file.tensors) |t| {
-            if (std.mem.indexOf(u8, t.name, "blk") == null) {
-                std.debug.print("  [GLOBAL] {s:<42} {s:<8} (id={d}) [{d}, {d}] ({d} bytes)\n", .{ t.name, t.type.name(), @intFromEnum(t.type), t.shape[0], t.shape[1], t.sizeBytes() });
+            if (std.mem.indexOf(u8, t.name, "blk") == null or std.mem.indexOf(u8, t.name, "blk.0.") != null) {
+                std.debug.print("  {s:<46} {s:<8} (id={d}) [{d}, {d}] ({d} bytes)\n", .{ t.name, t.type.name(), @intFromEnum(t.type), t.shape[0], t.shape[1], t.sizeBytes() });
             }
             l_count += 1;
         }
@@ -298,6 +300,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
 
         std.debug.print("\nPrompt: {s}\n\n", .{args.prompt});
 
+        const is_greedy = args.greedy or args.temperature <= 0.0;
         const options = GenerationOptions{
             .max_tokens = args.max_tokens,
             .sampler = .{
@@ -306,6 +309,8 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
                 .top_k = args.top_k,
                 .min_p = args.min_p,
                 .seed = args.seed,
+                .greedy = is_greedy,
+                .repetition_penalty = if (is_greedy) 1.0 else 1.1,
             },
         };
 
@@ -443,7 +448,11 @@ pub fn runCli(allocator: std.mem.Allocator, args: CliArgs) !void {
         const bench_prompt = "The quick brown fox jumps over the lazy dog and explores the universe with fast mathematical computations";
         const options = GenerationOptions{
             .max_tokens = args.max_tokens,
-            .sampler = .{ .greedy = true },
+            .sampler = .{
+                .greedy = true,
+                .temperature = 0.0,
+                .repetition_penalty = 1.0,
+            },
         };
 
         std.debug.print("Running 3 warmup & benchmark iterations ...\n", .{});

@@ -409,7 +409,7 @@ pub const Engine = struct {
         self.reset();
 
         const is_greedy = (options.sampler.greedy or options.sampler.temperature <= 0.0) and
-            (options.sampler.repetition_penalty == 1.0 and options.sampler.presence_penalty == 0.0 and options.sampler.frequency_penalty == 0.0) and
+            (options.sampler.greedy or (options.sampler.repetition_penalty == 1.0 and options.sampler.presence_penalty == 0.0 and options.sampler.frequency_penalty == 0.0)) and
             (self.gpu_model != null);
 
         // 2. Prefill phase

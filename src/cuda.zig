@@ -3,6 +3,8 @@ const types = @import("types.zig");
 const GGMLType = types.GGMLType;
 
 pub const CudaStream_t = ?*anyopaque;
+pub const CudaGraph_t = ?*anyopaque;
+pub const CudaGraphExec_t = ?*anyopaque;
 
 // ============================================================================
 // Direct CUDA C ABI Declarations
@@ -11,12 +13,22 @@ pub const CudaStream_t = ?*anyopaque;
 pub extern "c" fn cuda_device_get_info(device_id: c_int, name: [*c]u8, name_len: usize, total_vram_bytes: *usize) c_int;
 pub extern "c" fn cuda_malloc(ptr: *?*anyopaque, bytes: usize) c_int;
 pub extern "c" fn cuda_free(ptr: ?*anyopaque) c_int;
+pub extern "c" fn cuda_malloc_host(ptr: *?*anyopaque, bytes: usize) c_int;
+pub extern "c" fn cuda_free_host(ptr: ?*anyopaque) c_int;
 pub extern "c" fn cuda_memcpy_h2d(dst: ?*anyopaque, src: ?*const anyopaque, bytes: usize, stream: CudaStream_t) c_int;
 pub extern "c" fn cuda_memcpy_d2h(dst: ?*anyopaque, src: ?*const anyopaque, bytes: usize, stream: CudaStream_t) c_int;
 pub extern "c" fn cuda_memcpy_d2d(dst: ?*anyopaque, src: ?*const anyopaque, bytes: usize, stream: CudaStream_t) c_int;
 pub extern "c" fn cuda_stream_create(stream: *CudaStream_t) c_int;
 pub extern "c" fn cuda_stream_destroy(stream: CudaStream_t) c_int;
 pub extern "c" fn cuda_stream_sync(stream: CudaStream_t) c_int;
+
+// CUDA Graph Management
+pub extern "c" fn cuda_graph_begin_capture(stream: CudaStream_t) c_int;
+pub extern "c" fn cuda_graph_end_capture(stream: CudaStream_t, graph_out: *CudaGraph_t) c_int;
+pub extern "c" fn cuda_graph_instantiate(exec_out: *CudaGraphExec_t, graph: CudaGraph_t) c_int;
+pub extern "c" fn cuda_graph_launch(exec: CudaGraphExec_t, stream: CudaStream_t) c_int;
+pub extern "c" fn cuda_graph_destroy(graph: CudaGraph_t) c_int;
+pub extern "c" fn cuda_graph_exec_destroy(exec: CudaGraphExec_t) c_int;
 
 pub extern "c" fn cuda_gemv_q4_0(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_gemv_q8_0(weights: ?*const anyopaque, x: [*]const f32, y: [*]f32, rows: c_int, cols: c_int, stream: CudaStream_t) void;
@@ -37,6 +49,7 @@ pub extern "c" fn cuda_rmsnorm_batched(x: [*]f32, weight: ?[*]const f32, out: [*
 pub extern "c" fn cuda_add_rmsnorm(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_add_rmsnorm_batched(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, batch_size: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rope(q: ?[*]f32, k: ?[*]f32, pos: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
+pub extern "c" fn cuda_rope_ind(q: ?[*]f32, k: ?[*]f32, d_pos: [*]const c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rope_batched(q: ?[*]f32, k: ?[*]f32, pos: c_int, batch_size: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
 
 pub extern "c" fn cuda_geglu(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int, stream: CudaStream_t) void;
@@ -52,6 +65,20 @@ pub extern "c" fn cuda_kv_cache_put(
     v: [*]const f32,
     layer_idx: c_int,
     pos: c_int,
+    max_seq: c_int,
+    n_kv_heads: c_int,
+    head_dim: c_int,
+    max_kv_dim: c_int,
+    stream: CudaStream_t,
+) void;
+
+pub extern "c" fn cuda_kv_cache_put_ind(
+    k_cache: [*]f32,
+    v_cache: [*]f32,
+    k: [*]const f32,
+    v: [*]const f32,
+    layer_idx: c_int,
+    d_pos: [*]const c_int,
     max_seq: c_int,
     n_kv_heads: c_int,
     head_dim: c_int,
@@ -81,6 +108,24 @@ pub extern "c" fn cuda_attention_forward(
     out: [*]f32,
     donor_layer: c_int,
     pos: c_int,
+    max_seq: c_int,
+    n_heads: c_int,
+    n_kv_heads: c_int,
+    head_dim: c_int,
+    max_kv_dim: c_int,
+    attn_scale: f32,
+    softcap: f32,
+    sliding_window: c_int,
+    stream: CudaStream_t,
+) void;
+
+pub extern "c" fn cuda_attention_forward_ind(
+    q: [*]const f32,
+    k_cache: [*]const f32,
+    v_cache: [*]const f32,
+    out: [*]f32,
+    donor_layer: c_int,
+    d_pos: [*]const c_int,
     max_seq: c_int,
     n_heads: c_int,
     n_kv_heads: c_int,
@@ -401,6 +446,20 @@ pub const CudaDevice = struct {
         cuda_rope(d_q, d_k, @intCast(pos), @intCast(num_heads), @intCast(num_kv_heads), @intCast(head_dim), @intCast(rotary_dim), freq_base, self.stream);
     }
 
+    pub fn ropeInd(
+        self: *const CudaDevice,
+        d_q: ?[*]f32,
+        d_k: ?[*]f32,
+        d_pos: [*]const c_int,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        freq_base: f32,
+    ) void {
+        cuda_rope_ind(d_q, d_k, d_pos, @intCast(num_heads), @intCast(num_kv_heads), @intCast(head_dim), @intCast(rotary_dim), freq_base, self.stream);
+    }
+
     pub fn ropeBatched(
         self: *const CudaDevice,
         d_q: ?[*]f32,
@@ -436,6 +495,34 @@ pub const CudaDevice = struct {
             d_v,
             @intCast(layer_idx),
             @intCast(pos),
+            @intCast(max_seq),
+            @intCast(n_kv_heads),
+            @intCast(head_dim),
+            @intCast(max_kv_dim),
+            self.stream,
+        );
+    }
+
+    pub fn kvCachePutInd(
+        self: *const CudaDevice,
+        d_k_cache: [*]f32,
+        d_v_cache: [*]f32,
+        d_k: [*]const f32,
+        d_v: [*]const f32,
+        layer_idx: usize,
+        d_pos: [*]const c_int,
+        max_seq: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_kv_dim: usize,
+    ) void {
+        cuda_kv_cache_put_ind(
+            d_k_cache,
+            d_v_cache,
+            d_k,
+            d_v,
+            @intCast(layer_idx),
+            d_pos,
             @intCast(max_seq),
             @intCast(n_kv_heads),
             @intCast(head_dim),
@@ -498,6 +585,42 @@ pub const CudaDevice = struct {
             d_out,
             @intCast(donor_layer),
             @intCast(pos),
+            @intCast(max_seq),
+            @intCast(n_heads),
+            @intCast(n_kv_heads),
+            @intCast(head_dim),
+            @intCast(max_kv_dim),
+            attn_scale,
+            softcap,
+            @intCast(sliding_window),
+            self.stream,
+        );
+    }
+
+    pub fn attentionForwardInd(
+        self: *const CudaDevice,
+        d_q: [*]const f32,
+        d_k_cache: [*]const f32,
+        d_v_cache: [*]const f32,
+        d_out: [*]f32,
+        donor_layer: usize,
+        d_pos: [*]const c_int,
+        max_seq: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_kv_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
+        sliding_window: usize,
+    ) void {
+        cuda_attention_forward_ind(
+            d_q,
+            d_k_cache,
+            d_v_cache,
+            d_out,
+            @intCast(donor_layer),
+            d_pos,
             @intCast(max_seq),
             @intCast(n_heads),
             @intCast(n_kv_heads),
