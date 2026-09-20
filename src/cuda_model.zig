@@ -703,10 +703,10 @@ pub const CudaGpuModel = struct {
 
             if (layer.post_feedforward_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
-                self.device.rmsNorm(d_ffn_out_ptr, norm_ptr, d_ffn_out_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                self.device.rmsnormAdd(d_x_ptr, d_ffn_out_ptr, norm_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            } else {
+                self.device.add(d_x_ptr, d_ffn_out_ptr, dim);
             }
-
-            self.device.add(d_x_ptr, d_ffn_out_ptr, dim);
 
             if (layer.per_layer_input_gate != null and layer.per_layer_projection != null) {
                 const ple_dim: usize = 256;
@@ -718,9 +718,10 @@ pub const CudaGpuModel = struct {
                 self.device.gemv(t_proj.qtype, t_proj.buf.ptr, d_ple_buf_ptr, d_xb_ptr, dim, ple_dim);
                 if (layer.post_per_layer_input_norm) |norm| {
                     const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
-                    self.device.rmsNorm(d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, false);
+                    self.device.rmsnormAdd(d_x_ptr, d_xb_ptr, norm_ptr, dim, p.layer_norm_rms_epsilon, false);
+                } else {
+                    self.device.add(d_x_ptr, d_xb_ptr, dim);
                 }
-                self.device.add(d_x_ptr, d_xb_ptr, dim);
             }
 
             if (layer.scale != 1.0) {
@@ -960,10 +961,10 @@ pub const CudaGpuModel = struct {
 
             if (layer.post_feedforward_layernorm) |norm| {
                 const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
-                self.device.rmsNorm(d_ffn_out_ptr, norm_ptr, d_ffn_out_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+                self.device.rmsnormAdd(d_x_ptr, d_ffn_out_ptr, norm_ptr, dim, p.layer_norm_rms_epsilon, p.use_gemma_rms_unit_offset);
+            } else {
+                self.device.add(d_x_ptr, d_ffn_out_ptr, dim);
             }
-
-            self.device.add(d_x_ptr, d_ffn_out_ptr, dim);
 
             if (layer.per_layer_input_gate != null and layer.per_layer_projection != null) {
                 const ple_slice_ptr = d_ctx_ple_ptr + layer_idx * ple_dim;
@@ -974,9 +975,10 @@ pub const CudaGpuModel = struct {
                 self.device.gemv(t_proj.qtype, t_proj.buf.ptr, d_ple_buf_ptr, d_xb_ptr, dim, ple_dim);
                 if (layer.post_per_layer_input_norm) |norm| {
                     const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm.buf.ptr));
-                    self.device.rmsNorm(d_xb_ptr, norm_ptr, d_xb_ptr, dim, p.layer_norm_rms_epsilon, false);
+                    self.device.rmsnormAdd(d_x_ptr, d_xb_ptr, norm_ptr, dim, p.layer_norm_rms_epsilon, false);
+                } else {
+                    self.device.add(d_x_ptr, d_xb_ptr, dim);
                 }
-                self.device.add(d_x_ptr, d_xb_ptr, dim);
             }
 
             if (layer.scale != 1.0) {
@@ -996,10 +998,6 @@ pub const CudaGpuModel = struct {
         const d_logits_ptr: [*]f32 = @ptrCast(@alignCast(self.d_logits.ptr));
         if (self.output) |t_out| {
             self.device.gemv(t_out.qtype, t_out.buf.ptr, d_xb_ptr, d_logits_ptr, p.vocab_size, dim);
-        }
-
-        if (p.final_logit_softcapping > 0.0) {
-            self.device.tanhSoftcap(d_logits_ptr, p.final_logit_softcapping, p.vocab_size);
         }
 
         // 5. Argmax on GPU

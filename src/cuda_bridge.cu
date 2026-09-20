@@ -742,6 +742,7 @@ __global__ void k_gemv_q4_k(
 }
 
 // Q6_K MMVQ: 64 threads (2 warps) per block, 2 rows per block (shared activation loads)
+// Q6_K MMVQ: 64 threads (2 warps) per block, 4 rows per block (shared activation loads)
 __global__ void k_gemv_q6_k(
     const unsigned char* __restrict__ weights,
     const block_q8_1* __restrict__ y_q8_1,
@@ -749,8 +750,10 @@ __global__ void k_gemv_q6_k(
     int rows,
     int cols
 ) {
-    int row0 = blockIdx.x * 2;
+    int row0 = blockIdx.x * 4;
     int row1 = row0 + 1;
+    int row2 = row0 + 2;
+    int row3 = row0 + 3;
     if (row0 >= rows) return;
 
     int tid = threadIdx.y * 32 + threadIdx.x; // 0..63
@@ -758,9 +761,13 @@ __global__ void k_gemv_q6_k(
     size_t row_stride = (size_t)num_superblocks * 210;
     const unsigned char* row_w0 = weights + (size_t)row0 * row_stride;
     const unsigned char* row_w1 = (row1 < rows) ? (weights + (size_t)row1 * row_stride) : NULL;
+    const unsigned char* row_w2 = (row2 < rows) ? (weights + (size_t)row2 * row_stride) : NULL;
+    const unsigned char* row_w3 = (row3 < rows) ? (weights + (size_t)row3 * row_stride) : NULL;
 
     float sum0 = 0.0f;
     float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
 
     int kbx_base = tid >> 5;     // 0 for warp 0, 1 for warp 1
     int iqs = tid & 31;          // 0..31
@@ -781,25 +788,27 @@ __global__ void k_gemv_q6_k(
         }
 
         // Row 0
-        const unsigned char* sb_ptr0 = row_w0 + (size_t)kbx * 210;
-        const unsigned char* ql0 = sb_ptr0;
-        const unsigned char* qh0 = sb_ptr0 + 128;
-        const signed char* scales0 = (const signed char*)(sb_ptr0 + 192) + scale_offset;
-        float d0 = f16_to_f32(*(const unsigned short*)(sb_ptr0 + 208));
+        {
+            const unsigned char* sb_ptr0 = row_w0 + (size_t)kbx * 210;
+            const unsigned char* ql0 = sb_ptr0;
+            const unsigned char* qh0 = sb_ptr0 + 128;
+            const signed char* scales0 = (const signed char*)(sb_ptr0 + 192) + scale_offset;
+            float d0 = f16_to_f32(*(const unsigned short*)(sb_ptr0 + 208));
 
-        int vl0 = get_int_b2(ql0, iqs);
-        int vh0 = get_int_b2(qh0, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
+            int vl0 = get_int_b2(ql0, iqs);
+            int vh0 = get_int_b2(qh0, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
 
-        float sumf0 = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            int sc = (int)scales0[4 * i];
-            int vil = (vl0 >> (4 * i)) & 0x0F0F0F0F;
-            int vih = ((vh0 >> (4 * i)) << 4) & 0x30303030;
-            int vi = ziglm_vsubss4(vil | vih, 0x20202020);
-            sumf0 += d8[i] * ((float)ziglm_dp4a(vi, u[i], 0) * (float)sc);
+            float sumf0 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                int sc = (int)scales0[4 * i];
+                int vil = (vl0 >> (4 * i)) & 0x0F0F0F0F;
+                int vih = ((vh0 >> (4 * i)) << 4) & 0x30303030;
+                int vi = ziglm_vsubss4(vil | vih, 0x20202020);
+                sumf0 += d8[i] * ((float)ziglm_dp4a(vi, u[i], 0) * (float)sc);
+            }
+            sum0 += d0 * sumf0;
         }
-        sum0 += d0 * sumf0;
 
         // Row 1
         if (row_w1) {
@@ -823,30 +832,82 @@ __global__ void k_gemv_q6_k(
             }
             sum1 += d1 * sumf1;
         }
+
+        // Row 2
+        if (row_w2) {
+            const unsigned char* sb_ptr2 = row_w2 + (size_t)kbx * 210;
+            const unsigned char* ql2 = sb_ptr2;
+            const unsigned char* qh2 = sb_ptr2 + 128;
+            const signed char* scales2 = (const signed char*)(sb_ptr2 + 192) + scale_offset;
+            float d2 = f16_to_f32(*(const unsigned short*)(sb_ptr2 + 208));
+
+            int vl2 = get_int_b2(ql2, iqs);
+            int vh2 = get_int_b2(qh2, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
+
+            float sumf2 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                int sc = (int)scales2[4 * i];
+                int vil = (vl2 >> (4 * i)) & 0x0F0F0F0F;
+                int vih = ((vh2 >> (4 * i)) << 4) & 0x30303030;
+                int vi = ziglm_vsubss4(vil | vih, 0x20202020);
+                sumf2 += d8[i] * ((float)ziglm_dp4a(vi, u[i], 0) * (float)sc);
+            }
+            sum2 += d2 * sumf2;
+        }
+
+        // Row 3
+        if (row_w3) {
+            const unsigned char* sb_ptr3 = row_w3 + (size_t)kbx * 210;
+            const unsigned char* ql3 = sb_ptr3;
+            const unsigned char* qh3 = sb_ptr3 + 128;
+            const signed char* scales3 = (const signed char*)(sb_ptr3 + 192) + scale_offset;
+            float d3 = f16_to_f32(*(const unsigned short*)(sb_ptr3 + 208));
+
+            int vl3 = get_int_b2(ql3, iqs);
+            int vh3 = get_int_b2(qh3, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;
+
+            float sumf3 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                int sc = (int)scales3[4 * i];
+                int vil = (vl3 >> (4 * i)) & 0x0F0F0F0F;
+                int vih = ((vh3 >> (4 * i)) << 4) & 0x30303030;
+                int vi = ziglm_vsubss4(vil | vih, 0x20202020);
+                sumf3 += d8[i] * ((float)ziglm_dp4a(vi, u[i], 0) * (float)sc);
+            }
+            sum3 += d3 * sumf3;
+        }
     }
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         sum0 += __shfl_down_sync(0xffffffff, sum0, offset);
         sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+        sum3 += __shfl_down_sync(0xffffffff, sum3, offset);
     }
 
     __shared__ float s_warp_sums0[2];
     __shared__ float s_warp_sums1[2];
+    __shared__ float s_warp_sums2[2];
+    __shared__ float s_warp_sums3[2];
     int warp_id = threadIdx.y;
     int lane = threadIdx.x;
 
     if (lane == 0) {
         s_warp_sums0[warp_id] = sum0;
         s_warp_sums1[warp_id] = sum1;
+        s_warp_sums2[warp_id] = sum2;
+        s_warp_sums3[warp_id] = sum3;
     }
     __syncthreads();
 
     if (warp_id == 0 && lane == 0) {
         y[row0] = s_warp_sums0[0] + s_warp_sums0[1];
-        if (row1 < rows) {
-            y[row1] = s_warp_sums1[0] + s_warp_sums1[1];
-        }
+        if (row1 < rows) y[row1] = s_warp_sums1[0] + s_warp_sums1[1];
+        if (row2 < rows) y[row2] = s_warp_sums2[0] + s_warp_sums2[1];
+        if (row3 < rows) y[row3] = s_warp_sums3[0] + s_warp_sums3[1];
     }
 }
 
@@ -1001,7 +1062,7 @@ extern "C" void cuda_gemv_q6_k(const void* weights, const float* x, float* y, in
     k_quantize_q8_1<<<q_grid, q_dim, 0, (cudaStream_t)stream>>>(x, g_q8_1_buf, cols);
 
     dim3 block(32, 2);
-    dim3 grid((rows + 1) / 2);
+    dim3 grid((rows + 3) / 4);
     k_gemv_q6_k<<<grid, block, 0, (cudaStream_t)stream>>>((const unsigned char*)weights, g_q8_1_buf, y, rows, cols);
 }
 
@@ -1387,6 +1448,30 @@ extern "C" void cuda_gemm(
 // Normalization & Elementwise Kernels
 // ============================================================================
 
+__device__ __forceinline__ float block_reduce_sum_256(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    __shared__ float s_warp_sums[8];
+    int warp_id = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (lane == 0) {
+        s_warp_sums[warp_id] = val;
+    }
+    __syncthreads();
+    float sum = (lane < 8) ? s_warp_sums[lane] : 0.0f;
+    #pragma unroll
+    for (int offset = 4; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    if (threadIdx.x == 0) {
+        s_warp_sums[0] = sum;
+    }
+    __syncthreads();
+    return s_warp_sums[0];
+}
+
 __global__ void k_rmsnorm(
     const float* __restrict__ x,
     const float* __restrict__ weight,
@@ -1395,25 +1480,15 @@ __global__ void k_rmsnorm(
     float eps,
     int use_unit_offset
 ) {
-    __shared__ float s_sum[256];
     int tid = threadIdx.x;
-
     float local_sum = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
         float val = x[i];
         local_sum += val * val;
     }
-    s_sum[tid] = local_sum;
-    __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid] += s_sum[tid + s];
-        }
-        __syncthreads();
-    }
-
-    float mean = s_sum[0] / (float)n;
+    float total_sum = block_reduce_sum_256(local_sum);
+    float mean = total_sum / (float)n;
     float inv_std = rsqrtf(mean + eps);
 
     for (int i = tid; i < n; i += blockDim.x) {
@@ -1442,23 +1517,14 @@ __global__ void k_rmsnorm_batched(
     float* x_head = x + (size_t)h * head_dim;
     float* out_head = out + (size_t)h * head_dim;
 
-    __shared__ float s_sum[256];
     float local_sum = 0.0f;
     for (int i = tid; i < head_dim; i += blockDim.x) {
         float val = x_head[i];
         local_sum += val * val;
     }
-    s_sum[tid] = local_sum;
-    __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid] += s_sum[tid + s];
-        }
-        __syncthreads();
-    }
-
-    float mean = s_sum[0] / (float)head_dim;
+    float total_sum = block_reduce_sum_256(local_sum);
+    float mean = total_sum / (float)head_dim;
     float inv_std = rsqrtf(mean + eps);
 
     for (int i = tid; i < head_dim; i += blockDim.x) {
@@ -1678,25 +1744,24 @@ __global__ void k_embed_lookup_batch_q4_0(
     int dim,
     float scale
 ) {
+    int global_i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_i >= n_tokens * dim) return;
+
+    int t = global_i / dim;
+    int col = global_i % dim;
+    int b = col / 32;
+    int lane = col % 32;
     int num_blocks = dim / 32;
-    int global_b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (global_b < n_tokens * num_blocks) {
-        int t = global_b / num_blocks;
-        int b = global_b % num_blocks;
-        int token_id = token_ids[t];
-        size_t row_offset = (size_t)token_id * (size_t)num_blocks * 18;
-        const unsigned char* block_ptr = weights + row_offset + (size_t)b * 18;
-        float d = f16_to_f32(*(const unsigned short*)block_ptr) * scale;
-        float* out_ptr = out + (size_t)t * dim + (size_t)b * 32;
-        #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            unsigned char byte = block_ptr[2 + i];
-            int q0 = (int)(byte & 0x0F) - 8;
-            int q1 = (int)(byte >> 4) - 8;
-            out_ptr[i] = (float)q0 * d;
-            out_ptr[i + 16] = (float)q1 * d;
-        }
-    }
+
+    int token_id = token_ids[t];
+    size_t row_offset = (size_t)token_id * (size_t)num_blocks * 18;
+    const unsigned char* block_ptr = weights + row_offset + (size_t)b * 18;
+    float d = f16_to_f32(*(const unsigned short*)block_ptr) * scale;
+
+    int byte_idx = lane % 16;
+    unsigned char byte = block_ptr[2 + byte_idx];
+    int q = (lane < 16) ? ((int)(byte & 0x0F) - 8) : ((int)(byte >> 4) - 8);
+    out[global_i] = (float)q * d;
 }
 
 __global__ void k_embed_lookup_batch_q8_0(
@@ -1707,22 +1772,21 @@ __global__ void k_embed_lookup_batch_q8_0(
     int dim,
     float scale
 ) {
+    int global_i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_i >= n_tokens * dim) return;
+
+    int t = global_i / dim;
+    int col = global_i % dim;
+    int b = col / 32;
+    int lane = col % 32;
     int num_blocks = dim / 32;
-    int global_b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (global_b < n_tokens * num_blocks) {
-        int t = global_b / num_blocks;
-        int b = global_b % num_blocks;
-        int token_id = token_ids[t];
-        size_t row_offset = (size_t)token_id * (size_t)num_blocks * 34;
-        const unsigned char* block_ptr = weights + row_offset + (size_t)b * 34;
-        float d = f16_to_f32(*(const unsigned short*)block_ptr) * scale;
-        const signed char* qs = (const signed char*)(block_ptr + 2);
-        float* out_ptr = out + (size_t)t * dim + (size_t)b * 32;
-        #pragma unroll
-        for (int i = 0; i < 32; i++) {
-            out_ptr[i] = (float)qs[i] * d;
-        }
-    }
+
+    int token_id = token_ids[t];
+    size_t row_offset = (size_t)token_id * (size_t)num_blocks * 34;
+    const unsigned char* block_ptr = weights + row_offset + (size_t)b * 34;
+    float d = f16_to_f32(*(const unsigned short*)block_ptr) * scale;
+    const signed char* qs = (const signed char*)(block_ptr + 2);
+    out[global_i] = (float)qs[lane] * d;
 }
 
 __global__ void k_embed_lookup_batch_bf16(
@@ -1833,16 +1897,14 @@ extern "C" void cuda_embed_lookup_batch(
 ) {
     if (!emb_weights || !token_ids || n_tokens <= 0 || dim <= 0) return;
     if (qtype == 2) { // Q4_0
-        int num_blocks = dim / 32;
-        int total = n_tokens * num_blocks;
+        int total = n_tokens * dim;
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
         k_embed_lookup_batch_q4_0<<<blocks, threads, 0, (cudaStream_t)stream>>>(
             (const unsigned char*)emb_weights, token_ids, out, n_tokens, dim, scale
         );
     } else if (qtype == 8) { // Q8_0
-        int num_blocks = dim / 32;
-        int total = n_tokens * num_blocks;
+        int total = n_tokens * dim;
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
         k_embed_lookup_batch_q8_0<<<blocks, threads, 0, (cudaStream_t)stream>>>(
@@ -1886,26 +1948,16 @@ __global__ void k_add_rmsnorm(
     float eps,
     int use_unit_offset
 ) {
-    __shared__ float s_sum[256];
     int tid = threadIdx.x;
-
     float local_sum = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
         float val = x[i] + residual[i];
         x[i] = val; // in-place update of residual
         local_sum += val * val;
     }
-    s_sum[tid] = local_sum;
-    __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid] += s_sum[tid + s];
-        }
-        __syncthreads();
-    }
-
-    float mean = s_sum[0] / (float)n;
+    float total_sum = block_reduce_sum_256(local_sum);
+    float mean = total_sum / (float)n;
     float inv_std = rsqrtf(mean + eps);
 
     for (int i = tid; i < n; i += blockDim.x) {
@@ -1928,26 +1980,16 @@ __global__ void k_add_rmsnorm_batched(
     const float* res_row = residual_add + (size_t)row * n;
     float* out_row = out + (size_t)row * n;
 
-    __shared__ float s_sum[256];
     int tid = threadIdx.x;
-
     float local_sum = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
         float val = x_row[i] + res_row[i];
         x_row[i] = val; // in-place update of residual
         local_sum += val * val;
     }
-    s_sum[tid] = local_sum;
-    __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid] += s_sum[tid + s];
-        }
-        __syncthreads();
-    }
-
-    float mean = s_sum[0] / (float)n;
+    float total_sum = block_reduce_sum_256(local_sum);
+    float mean = total_sum / (float)n;
     float inv_std = rsqrtf(mean + eps);
 
     for (int i = tid; i < n; i += blockDim.x) {
@@ -1986,6 +2028,43 @@ extern "C" void cuda_add_rmsnorm_batched(
         return;
     }
     k_add_rmsnorm_batched<<<batch_size, 256, 0, (cudaStream_t)stream>>>(x, residual, weight, out, n, eps, use_unit_offset);
+}
+
+__global__ void k_rmsnorm_add(
+    float* __restrict__ x,
+    const float* __restrict__ in,
+    const float* __restrict__ weight,
+    int n,
+    float eps,
+    int use_unit_offset
+) {
+    int tid = threadIdx.x;
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float val = in[i];
+        local_sum += val * val;
+    }
+
+    float total_sum = block_reduce_sum_256(local_sum);
+    float mean = total_sum / (float)n;
+    float inv_std = rsqrtf(mean + eps);
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        float w = (weight != NULL) ? (weight[i] + (use_unit_offset ? 1.0f : 0.0f)) : 1.0f;
+        x[i] += in[i] * inv_std * w;
+    }
+}
+
+extern "C" void cuda_rmsnorm_add(
+    float* x,
+    const float* in,
+    const float* weight,
+    int n,
+    float eps,
+    int use_unit_offset,
+    CudaStream_t stream
+) {
+    k_rmsnorm_add<<<1, 256, 0, (cudaStream_t)stream>>>(x, in, weight, n, eps, use_unit_offset);
 }
 
 __global__ void k_rope(
@@ -2450,39 +2529,33 @@ __global__ void k_attention_forward(
     }
     __syncthreads();
 
-    // 2. Softmax: Find max score across valid_tokens
+    // 2. Softmax: Find max score across valid_tokens (warp shuffle reduction)
     float local_max = -1e30f;
     for (int i = tid; i < valid_tokens; i += blockDim.x) {
         if (s_scores[i] > local_max) local_max = s_scores[i];
     }
-    s_red[tid] = local_max;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            if (s_red[tid + s] > s_red[tid]) s_red[tid] = s_red[tid + s];
-        }
-        __syncthreads();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
     }
-    float max_val = s_red[0];
+    if ((tid & 31) == 0) s_red[tid >> 5] = local_max;
+    __syncthreads();
+    float max_val = fmaxf(s_red[0], s_red[1]);
 
-    // 3. Softmax: Exp & sum
+    // 3. Softmax: Exp & sum (warp shuffle reduction)
     float local_sum = 0.0f;
     for (int i = tid; i < valid_tokens; i += blockDim.x) {
         float ex = expf(s_scores[i] - max_val);
         s_scores[i] = ex;
         local_sum += ex;
     }
-    s_red[tid] = local_sum;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_red[tid] += s_red[tid + s];
-        }
-        __syncthreads();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
     }
-    float inv_sum = 1.0f / (s_red[0] + 1e-9f);
+    if ((tid & 31) == 0) s_red[tid >> 5] = local_sum;
+    __syncthreads();
+    float inv_sum = 1.0f / (s_red[0] + s_red[1] + 1e-9f);
 
     for (int i = tid; i < valid_tokens; i += blockDim.x) {
         s_scores[i] *= inv_sum;
@@ -2594,39 +2667,33 @@ __global__ void k_attention_forward_ind(
     }
     __syncthreads();
 
-    // 2. Softmax: Find max score across valid_tokens
+    // 2. Softmax: Find max score across valid_tokens (warp shuffle reduction)
     float local_max = -1e30f;
     for (int i = tid; i < valid_tokens; i += blockDim.x) {
         if (s_scores[i] > local_max) local_max = s_scores[i];
     }
-    s_red[tid] = local_max;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            if (s_red[tid + s] > s_red[tid]) s_red[tid] = s_red[tid + s];
-        }
-        __syncthreads();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
     }
-    float max_val = s_red[0];
+    if ((tid & 31) == 0) s_red[tid >> 5] = local_max;
+    __syncthreads();
+    float max_val = fmaxf(s_red[0], s_red[1]);
 
-    // 3. Softmax: Exp & sum
+    // 3. Softmax: Exp & sum (warp shuffle reduction)
     float local_sum = 0.0f;
     for (int i = tid; i < valid_tokens; i += blockDim.x) {
         float ex = expf(s_scores[i] - max_val);
         s_scores[i] = ex;
         local_sum += ex;
     }
-    s_red[tid] = local_sum;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_red[tid] += s_red[tid + s];
-        }
-        __syncthreads();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
     }
-    float inv_sum = 1.0f / (s_red[0] + 1e-9f);
+    if ((tid & 31) == 0) s_red[tid >> 5] = local_sum;
+    __syncthreads();
+    float inv_sum = 1.0f / (s_red[0] + s_red[1] + 1e-9f);
 
     for (int i = tid; i < valid_tokens; i += blockDim.x) {
         s_scores[i] *= inv_sum;

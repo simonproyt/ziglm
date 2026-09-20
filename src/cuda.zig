@@ -46,6 +46,7 @@ pub extern "c" fn cuda_embed_lookup(emb_weights: ?*const anyopaque, qtype: c_int
 pub extern "c" fn cuda_embed_lookup_batch(emb_weights: ?*const anyopaque, qtype: c_int, token_ids: [*]const c_int, out: [*]f32, n_tokens: c_int, dim: c_int, scale: f32, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rmsnorm(x: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rmsnorm_batched(x: [*]f32, weight: ?[*]const f32, out: [*]f32, head_dim: c_int, count: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
+pub extern "c" fn cuda_rmsnorm_add(x: [*]f32, in: [*]const f32, weight: ?[*]const f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_add_rmsnorm(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_add_rmsnorm_batched(x: [*]f32, residual: [*]const f32, weight: ?[*]const f32, out: [*]f32, n: c_int, batch_size: c_int, eps: f32, use_unit_offset: c_int, stream: CudaStream_t) void;
 pub extern "c" fn cuda_rope(q: ?[*]f32, k: ?[*]f32, pos: c_int, num_heads: c_int, num_kv_heads: c_int, head_dim: c_int, rotary_dim: c_int, freq_base: f32, stream: CudaStream_t) void;
@@ -402,6 +403,18 @@ pub const CudaDevice = struct {
         use_unit_offset: bool,
     ) void {
         cuda_rmsnorm_batched(d_x, d_weight, d_out, @intCast(head_dim), @intCast(count), eps, if (use_unit_offset) 1 else 0, self.stream);
+    }
+
+    pub fn rmsnormAdd(
+        self: *const CudaDevice,
+        d_x: [*]f32,
+        d_in: [*]const f32,
+        d_weight: ?[*]const f32,
+        n: usize,
+        eps: f32,
+        use_unit_offset: bool,
+    ) void {
+        cuda_rmsnorm_add(d_x, d_in, d_weight, @intCast(n), eps, if (use_unit_offset) 1 else 0, self.stream);
     }
 
     pub fn addRmsNorm(

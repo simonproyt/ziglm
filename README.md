@@ -2,9 +2,7 @@
 curently cpu and cuda only also i only been able to test it on linux so it might behave diffrent on diffrent oses
 
 #### Models tested
-- smollm2-360m
-- gemma 2 / gemma 4 and variants
-- llama 3 / mistral / qwen
+-  gemma 4 and variants
 
 ## System requirements 
 
@@ -13,7 +11,7 @@ in the current action pipeline i compile it for x86_64_v3 so if you have an olde
 you try to offload stuff to the gpu so i would recommend you to compile it yourself if you have an older cpu.
 
 #### for cuda inference:
-currently the kernels are being compiled with cuda 13.3 and kernels for every compute capability from touring and up is provided  so it should work on rtx 20/1650 and up.
+currently the kernels are being compiled with cuda 13.4 and kernels for every compute capability from touring and up is provided  so it should work on rtx 20/1650 and up.
 
 #### How to try it out
 1. first you need to clone the repo and get the zig compile for your os of choice but this has been only tested on linux so idk if it will work on anything else
@@ -125,11 +123,11 @@ flowchart TD
 </details>
 
 ## CUDA
-the current cuda backend is kinda experimental so i havent done a lot of benchmarking stuff yet so its probably unoptimized and i need to work on it
+the cuda speed kinda matches llama.cpp but its a bit slower but i thing thats enough for a solo developer project
 
 # Dependencies 
 - a zig compiler (if you want to compile everything from source)
 - nvcc / CUDA toolkit (for compiling CUDA GPU acceleration kernels)
-
+thats it no other dependencies needed everything except my benchmark script that needs standard unix utils
 
 more coming soontm
