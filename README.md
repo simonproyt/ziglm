@@ -14,12 +14,15 @@ you try to offload stuff to the gpu so i would recommend you to compile it yours
 currently the kernels are being compiled with cuda 13.4 and kernels for every compute capability from touring and up is provided  so it should work on rtx 20/1650 and up.
 
 #### How to try it out
-1. first you need to clone the repo and get the zig compile for your os of choice but this has been only tested on linux so idk if it will work on anything else
-2. you need to build it via 
+##### if you want to compile it yourself for the best performance:
+1. install the prerequisites (zig compiler and nvcc)
+2. clone the repo
+3. you need to build it via 
 ```sh 
 zig build -Doptimize=ReleaseFast -Dcpu=native
 
 ```
+##### if you dont want to do that and just want to try it out:
 or you can download the precompiled binary and cuda kernels from the releases tab but for the best cpu performance you need to compile it your self 
 
 3. now you can try out models that you downloaded 
@@ -130,4 +133,8 @@ the cuda speed kinda matches llama.cpp but its a bit slower but i thing thats en
 - nvcc / CUDA toolkit (for compiling CUDA GPU acceleration kernels)
 thats it no other dependencies needed everything except my benchmark script that needs standard unix utils
 
-more coming soontm
+# Benchmarks
+
+benchmark_final.svg
+
+![Benchmark Chart](benchmarks/benchmark_final.svg)

@@ -51,4 +51,3 @@ test {
     _ = backend;
     _ = cuda;
 }
-

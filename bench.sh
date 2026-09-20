@@ -414,11 +414,40 @@ done < "$TMP_DATA"
 echo "============================================================================="
 
 # -----------------------------------------------------------------------------
+# Title & Subtitle Setup
+# -----------------------------------------------------------------------------
+TESTED_ENGINES=()
+has_ziglm=0
+has_llama=0
+has_ollama=0
+for t in "${ACTIVE_TARGETS[@]}"; do
+    case "$t" in
+        ziglm*)  has_ziglm=1 ;;
+        llama*)  has_llama=1 ;;
+        ollama*) has_ollama=1 ;;
+    esac
+done
+[[ $has_ziglm -eq 1 ]] && TESTED_ENGINES+=("ziglm")
+[[ $has_llama -eq 1 ]] && TESTED_ENGINES+=("llama.cpp")
+[[ $has_ollama -eq 1 ]] && TESTED_ENGINES+=("Ollama")
+
+if [[ ${#TESTED_ENGINES[@]} -gt 0 ]]; then
+    BENCH_TITLE="Inference Benchmark: $(IFS=" vs "; echo "${TESTED_ENGINES[*]}")"
+else
+    BENCH_TITLE="LLM Inference Benchmark"
+fi
+
+if [[ $HAS_CUDA -eq 1 && -n "$GPU_NAME" ]]; then
+    SUBTITLE="Model: $(basename "$MODEL_PATH") | GPU: ${GPU_NAME} | Tokens: ${MAX_TOKENS} | Avg of ${NUM_RUNS} runs"
+else
+    SUBTITLE="Model: $(basename "$MODEL_PATH") | Tokens: ${MAX_TOKENS} | Avg of ${NUM_RUNS} runs"
+fi
+
+# -----------------------------------------------------------------------------
 # SVG Chart Generation
 # -----------------------------------------------------------------------------
 if [[ $DO_CHART -eq 1 ]]; then
-    SUBTITLE="Model: $(basename "$MODEL_PATH") | Tokens: ${MAX_TOKENS} | Avg of ${NUM_RUNS} runs"
-    awk -F'|' -v title="LLM Inference Benchmark: ziglm vs llama.cpp vs Ollama" -v subtitle="$SUBTITLE" '
+    awk -F'|' -v title="$BENCH_TITLE" -v subtitle="$SUBTITLE" '
     BEGIN {
       count = 0
       max_val = 1.0
@@ -495,7 +524,7 @@ fi
 # -----------------------------------------------------------------------------
 if [[ $DO_REPORT -eq 1 ]]; then
     {
-        echo "# Inference Benchmark: ziglm vs llama.cpp vs Ollama"
+        echo "# ${BENCH_TITLE}"
         echo ""
         echo "- **Date**: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "- **Model**: \`$(basename "$MODEL_PATH")\`"

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 850 389" width="850" height="389" style="background:#0f172a;font-family:-apple-system,BlinkMacSystemFont,\x27Segoe UI\x27,Roboto,sans-serif;">
+  <rect width="100%" height="100%" fill="#0f172a" rx="12"/>
+  <rect x="16" y="16" width="818" height="357" fill="#1e293b" rx="8" stroke="#334155" stroke-width="1"/>
+  <text x="40" y="50" fill="#f8fafc" font-size="18" font-weight="700">Inference Benchmark: ziglm llama.cpp</text>
+  <text x="40" y="72" fill="#94a3b8" font-size="12">Model: gemma-4-E2B_q4_0-it.gguf | GPU: Quadro RTX 3000 | Tokens: 64 | Avg of 3 runs</text>
+  <rect x="590" y="40" width="12" height="12" fill="#38bdf8" rx="3"/>
+  <text x="608" y="51" fill="#e2e8f0" font-size="12" font-weight="500">Prefill (tok/s)</text>
+  <rect x="710" y="40" width="12" height="12" fill="#34d399" rx="3"/>
+  <text x="728" y="51" fill="#e2e8f0" font-size="12" font-weight="500">Generation (tok/s)</text>
+  <line x1="160.0" y1="95" x2="160.0" y2="334" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="160.0" y="350" fill="#94a3b8" font-size="11" text-anchor="middle">0</text>
+  <line x1="260.0" y1="95" x2="260.0" y2="334" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="260.0" y="350" fill="#94a3b8" font-size="11" text-anchor="middle">50</text>
+  <line x1="360.0" y1="95" x2="360.0" y2="334" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="360.0" y="350" fill="#94a3b8" font-size="11" text-anchor="middle">100</text>
+  <line x1="460.0" y1="95" x2="460.0" y2="334" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="460.0" y="350" fill="#94a3b8" font-size="11" text-anchor="middle">150</text>
+  <line x1="560.0" y1="95" x2="560.0" y2="334" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="560.0" y="350" fill="#94a3b8" font-size="11" text-anchor="middle">200</text>
+  <line x1="660.0" y1="95" x2="660.0" y2="334" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="660.0" y="350" fill="#94a3b8" font-size="11" text-anchor="middle">250</text>
+  <line x1="760.0" y1="95" x2="760.0" y2="334" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="760.0" y="350" fill="#94a3b8" font-size="11" text-anchor="middle">300</text>
+  <text x="460.0" y="368" fill="#64748b" font-size="11" text-anchor="middle">Tokens / Second (higher is better)</text>
+  <text x="146" y="134" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">ziglm (GPU)</text>
+  <rect x="160" y="114" width="325.0" height="14" fill="#38bdf8" rx="3"/>
+  <text x="491.0" y="125" fill="#38bdf8" font-size="11" font-weight="600">162.5 t/s</text>
+  <rect x="160" y="132" width="202.0" height="14" fill="#34d399" rx="3"/>
+  <text x="368.0" y="143" fill="#34d399" font-size="11" font-weight="600">101.0 t/s</text>
+  <text x="146" y="190" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">llama.cpp (GPU)</text>
+  <rect x="160" y="170" width="569.8" height="14" fill="#38bdf8" rx="3"/>
+  <text x="735.8" y="181" fill="#38bdf8" font-size="11" font-weight="600">284.9 t/s</text>
+  <rect x="160" y="188" width="208.0" height="14" fill="#34d399" rx="3"/>
+  <text x="374.0" y="199" fill="#34d399" font-size="11" font-weight="600">104.0 t/s</text>
+  <text x="146" y="246" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">ziglm (CPU)</text>
+  <rect x="160" y="226" width="29.4" height="14" fill="#38bdf8" rx="3"/>
+  <text x="195.4" y="237" fill="#38bdf8" font-size="11" font-weight="600">14.7 t/s</text>
+  <rect x="160" y="244" width="24.0" height="14" fill="#34d399" rx="3"/>
+  <text x="190.0" y="255" fill="#34d399" font-size="11" font-weight="600">12.0 t/s</text>
+  <text x="146" y="302" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">llama.cpp (CPU)</text>
+  <rect x="160" y="282" width="77.4" height="14" fill="#38bdf8" rx="3"/>
+  <text x="243.4" y="293" fill="#38bdf8" font-size="11" font-weight="600">38.7 t/s</text>
+  <rect x="160" y="300" width="26.8" height="14" fill="#34d399" rx="3"/>
+  <text x="192.8" y="311" fill="#34d399" font-size="11" font-weight="600">13.4 t/s</text>
+</svg>

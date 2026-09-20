@@ -444,7 +444,6 @@ pub const CudaDevice = struct {
         cuda_add_rmsnorm_batched(d_x, d_residual, d_weight, d_out, @intCast(n), @intCast(batch_size), eps, if (use_unit_offset) 1 else 0, self.stream);
     }
 
-
     pub fn rope(
         self: *const CudaDevice,
         d_q: ?[*]f32,
@@ -750,4 +749,3 @@ pub const CudaDevice = struct {
         cuda_argmax(d_logits, @intCast(n), d_out_idx, self.stream);
     }
 };
-

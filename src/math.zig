@@ -787,12 +787,12 @@ fn gemmRangeWorker(ctx_ptr: ?*anyopaque, start_row: usize, end_row: usize, _: us
         for (start_row..end_row) |r| {
             const row_start = r * row_bytes;
             const row_data = weight_data[row_start .. row_start + row_bytes];
-            
+
             // Dequantize once for the chunk
             if (qtype != .F32) {
                 quant.dequantizeRow(qtype, row_data, temp_f32[0..cols], cols);
             }
-            
+
             for (b_start..b_end) |b| {
                 const x_slice = X[b * cols .. (b + 1) * cols];
                 if (qtype == .F32) {
